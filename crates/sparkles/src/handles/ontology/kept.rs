@@ -866,7 +866,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<KeptEntityRead> {
         query.validate(req)?;
-        self.check_pinned_at(&o.snapshot)?;
+        self.check_pinned_opened(o, req)?;
         self.kept_entity_at(req, &o.snapshot, query, opts)
     }
     fn kept_entity_at(
@@ -960,21 +960,6 @@ impl Ontologies {
         let mut items: Vec<sparkles_owl::Axiom> = Vec::new();
         let mut charged = 0u64;
         let charge = Charge::new(&opts);
-        // a taxonomy whose children are not in node order is read from a charged copy
-        let copied: Option<(Vec<usize>, u64)> = match about_node {
-            Some(n) if about_is_rep && !t.node(n).children.is_sorted() => {
-                let children = &t.node(n).children;
-                let bytes = (children.len() as u64 + 1).saturating_mul(8);
-                charged += charge.take(bytes)?;
-                let mut ids = Vec::with_capacity(children.len() + 1);
-                ids.push(n);
-                ids.extend(children.iter().copied());
-                ids.sort_unstable();
-                ids.dedup();
-                Some((ids, bytes))
-            }
-            _ => None,
-        };
         let mut work = 0usize;
         // one group's axioms, polling the request's controls inside large groups
         let mut visit = |i: usize| -> Result<()> {
@@ -1034,37 +1019,23 @@ impl Ontologies {
                 }
             }
             // the class's own group, and for a first class the groups of its direct
-            // children, which name it as their parent, merged in the taxonomy's order
+            // children, which name it as their parent, merged in the taxonomy's order.
+            // The children are in ascending node order, so the merge reads them in
+            // place, and each visit polls the request's controls.
             Some(n) if about_is_rep => {
-                if let Some((ids, _)) = &copied {
-                    for &i in ids {
-                        visit(i)?;
-                    }
-                } else {
-                    let mut own = Some(n);
-                    let mut prev = None;
-                    let mut rest = t.node(n).children.iter().copied().peekable();
-                    loop {
-                        let next = match (own, rest.peek().copied()) {
-                            (Some(a), Some(b)) if b < a => rest.next(),
-                            (Some(_), _) => own.take(),
-                            (None, _) => rest.next(),
-                        };
-                        let Some(i) = next else { break };
-                        if prev != Some(i) {
-                            visit(i)?;
-                        }
-                        prev = Some(i);
-                    }
+                let mut own = Some(n);
+                let mut rest = t.node(n).children.iter().copied().peekable();
+                loop {
+                    let next = match (own, rest.peek().copied()) {
+                        (Some(a), Some(b)) if b < a => rest.next(),
+                        (Some(_), _) => own.take(),
+                        (None, _) => rest.next(),
+                    };
+                    let Some(i) = next else { break };
+                    visit(i)?;
                 }
             }
             Some(n) => visit(n)?,
-        }
-        // the copy is gone once the page is built
-        if let Some((ids, bytes)) = copied {
-            drop(ids);
-            charge.give_back(bytes);
-            charged -= bytes;
         }
         answer.axioms = Some(items);
         answer.total = Some(total);
@@ -1365,7 +1336,8 @@ const POLL_EVERY: usize = 1024;
 
 /// Count one step of a kept axiom scan and poll the request's controls every
 /// [`POLL_EVERY`] steps, so that a large group cannot outlast a cancellation.
-fn poll(opts: &QueryOptions, work: &mut usize) -> Result<()> {
+/// Check the request's controls once every [`POLL_EVERY`] steps of a long read.
+pub(super) fn poll(opts: &QueryOptions, work: &mut usize) -> Result<()> {
     #[cfg(test)]
     SCAN_STEPS.with(|n| {
         let steps = n.get() + 1;
@@ -1426,14 +1398,6 @@ impl Charge {
         }
         self.used.set(used);
         Ok(bytes)
-    }
-    /// Give back `bytes` of what [`take`](Self::take) charged, once they are freed.
-    fn give_back(&self, bytes: u64) {
-        let bytes = bytes.min(self.used.get());
-        if let Some(g) = &self.grant {
-            g.release(bytes);
-        }
-        self.used.set(self.used.get() - bytes);
     }
     fn release(&self) {
         if let Some(g) = &self.grant {

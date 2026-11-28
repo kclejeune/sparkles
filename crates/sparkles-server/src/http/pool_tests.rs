@@ -603,17 +603,24 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     let (status, headers, body) = get(&s.app, KEPT).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(headers.contains_key(header::RETRY_AFTER));
+    // the pool's refusal answers before the route, and is not cached either
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let j: J = serde_json::from_str(&body).unwrap();
     assert_eq!(j["budget"], "server-memory");
     drop(held);
     let (status, _, body) = get(&s.app, KEPT).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(pool(&s).granted(), 0);
-    // the asserted listing is not admitted to the pool
+    // the asserted listing is not admitted to the pool, and keeps its own caching
     let before = pool(&s).stats().admitted;
-    let (status, _, body) = get(&s.app, "/$/ontology/ds/axioms").await;
+    let (status, headers, body) = get(&s.app, "/$/ontology/ds/axioms").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(pool(&s).stats().admitted, before);
+    assert!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
     // a page past the request's memory limit cannot pass on a retry
     let dir = tempfile::tempdir().unwrap();
     let mut state = AppState::with_memory(

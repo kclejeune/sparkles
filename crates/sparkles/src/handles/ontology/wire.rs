@@ -1274,8 +1274,10 @@ fn call_on(handle: &super::Ontologies, op: &str, args: &J, opts: &QueryOptions) 
         }
         "axioms" if kept_selected(a)? => {
             let q = kept_axiom_query_of(a)?;
-            let answer = handle.kept_axioms(&req, &q, opts)?;
-            kept_axioms_body(name, &answer, &r)
+            // one deadline for the scan and the rendering of its rows
+            let opts = handle.anchored(opts)?;
+            let answer = handle.kept_axioms(&req, &q, &opts)?;
+            kept_axioms_body(name, &answer, &r, &opts)
         }
         "axioms" => {
             let q = AxiomQuery {
@@ -2385,8 +2387,16 @@ pub fn kept_entity_json(e: &super::kept::KeptEntityRead) -> Result<J> {
     Ok(v)
 }
 /// The JSON of a kept-classification axiom listing. `axioms` and `total` are null
-/// unless the status is available, and `entity` is the status of an `about` class.
-pub fn kept_axioms_body(name: &str, k: &super::kept::KeptAxioms, r: &Renderer) -> Result<J> {
+/// unless the status is available, and `entity` is the status of an `about` class. The
+/// rendering of each row polls `opts`, so that a stop ends even a page whose one
+/// equivalence names every class of an inconsistent ontology. Pass the options the
+/// listing read with, anchored to one deadline ([`Ontologies::anchored`](super::Ontologies::anchored)).
+pub fn kept_axioms_body(
+    name: &str,
+    k: &super::kept::KeptAxioms,
+    r: &Renderer,
+    opts: &QueryOptions,
+) -> Result<J> {
     let mut v =
         serde_json::to_value(&k.read).map_err(|e| bad(format!("kept classification: {e}")))?;
     if let J::Object(m) = &mut v {
@@ -2394,8 +2404,23 @@ pub fn kept_axioms_body(name: &str, k: &super::kept::KeptAxioms, r: &Renderer) -
     }
     v["dataset"] = json!(name);
     v["source"] = json!("keptClassification");
+    let mut work = 0usize;
+    let mut tick = |_: usize| super::kept::poll(opts, &mut work);
     v["axioms"] = match &k.axioms {
-        Some(list) => J::Array(list.iter().map(|ax| axiom_json(ax, None, r)).collect()),
+        Some(list) => {
+            let mut rows = Vec::with_capacity(list.len());
+            for ax in list {
+                // the form of `axiom_json` without a graph
+                let ofn = r.axiom_controlled(ax, &mut tick)?;
+                let axiom = sparkles_owl::json::axiom_controlled(ax, &mut tick)?;
+                rows.push(json!({
+                    "type": ax.axiom_type().name(),
+                    "ofn": ofn,
+                    "axiom": axiom,
+                }));
+            }
+            J::Array(rows)
+        }
         None => J::Null,
     };
     v["total"] = json!(k.total);
@@ -2403,6 +2428,47 @@ pub fn kept_axioms_body(name: &str, k: &super::kept::KeptAxioms, r: &Renderer) -
     v["limit"] = json!(k.limit);
     v["next"] = json!(k.next_offset);
     Ok(v)
+}
+/// `j` serialized as JSON, checking `opts` every 64 KiB of output, so that a stop ends
+/// the serialization of a large answer such as a kept axiom page.
+pub fn json_bytes_controlled(j: &J, opts: &QueryOptions) -> Result<Vec<u8>> {
+    struct Controlled<'a> {
+        out: Vec<u8>,
+        opts: &'a QueryOptions,
+        since: usize,
+        stopped: Option<Error>,
+    }
+    impl std::io::Write for Controlled<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.since += b.len();
+            if self.since >= 64 << 10 {
+                self.since = 0;
+                if let Err(e) = super::check(self.opts) {
+                    self.stopped = Some(e);
+                    return Err(std::io::Error::other("stopped"));
+                }
+            }
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    super::check(opts)?;
+    let mut w = Controlled {
+        out: Vec::new(),
+        opts,
+        since: 0,
+        stopped: None,
+    };
+    match serde_json::to_writer(&mut w, j) {
+        Ok(()) => Ok(w.out),
+        Err(e) => Err(w
+            .stopped
+            .take()
+            .unwrap_or_else(|| bad(format!("JSON: {e}")))),
+    }
 }
 pub fn kept_query_of(a: &Map<String, J>) -> Result<super::kept::KeptQuery> {
     use super::kept::{KeptQuery, Part};

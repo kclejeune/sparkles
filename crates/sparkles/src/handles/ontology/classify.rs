@@ -390,15 +390,22 @@ impl Ontologies {
         // a pinned read of an older commit reuses that commit's kept result, and on a
         // miss classifies without replacing the head's
         let keep = shared && self.may_replace_kept(&snap);
-        let held = if shared && !keep {
+        // a pinned run that the head passed while it waited for the flight takes the
+        // older commit's path too
+        let kept = if keep {
+            self.classify_kept(&o, req, c, &opts)?
+        } else {
+            None
+        };
+        let held = if shared && kept.is_none() {
             self.kept_publication_at(req, &o, c.el_only)
         } else {
             None
         };
-        let (publication, reused) = if let Some(p) = held {
+        let (publication, reused) = if let Some(k) = kept {
+            k
+        } else if let Some(p) = held {
             (p, true)
-        } else if keep {
-            self.classify_kept(&o, req, c, &opts)?
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
             // the assertion triples that map to no axiom
@@ -514,14 +521,15 @@ impl Ontologies {
             .then_some(p)
     }
 
-    /// A classification through the dataset's kept classifier.
+    /// A classification through the dataset's kept classifier, or `None` when the
+    /// handle's pin is no longer the head once the flight is held.
     fn classify_kept(
         &self,
         o: &Opened,
         req: &OntologyRequest,
         c: &ClassifyRequest,
         opts: &QueryOptions,
-    ) -> Result<(Arc<KeptClassification>, bool)> {
+    ) -> Result<Option<(Arc<KeptClassification>, bool)>> {
         // Preserve the legacy no-work idle cache hit, including its past-compute-
         // deadline behavior. An active flight still waits under caller controls;
         // GET/frame name and page work has its own read checks.
@@ -539,10 +547,10 @@ impl Ontologies {
                     && p.source.commit == o.snapshot.commit
                     && p.source.el_only == c.el_only
             }) {
-                return Ok((p, true));
+                return Ok(Some((p, true)));
             }
         }
-        self.with_kept(o, req, c.el_only, opts, "classify", |e| {
+        self.with_kept_flight(o, req, c.el_only, opts, "classify", |e| {
             if let Some(p) = &e.result
                 && p.source.commit == o.snapshot.commit
                 && p.source.el_only == c.el_only
@@ -618,9 +626,9 @@ impl Ontologies {
         })
     }
 
-    /// One owned computing flight. Readers never take this lock or construct an
-    /// entry. Cancellation before mutation preserves the old state; mutating errors
-    /// and unwinds discard it. Publication changes are finalized as one pair.
+    /// [`with_kept_flight`](Self::with_kept_flight) through a handle with no pin, whose
+    /// flight always runs.
+    #[cfg(test)]
     pub(super) fn with_kept<T>(
         &self,
         o: &Opened,
@@ -630,9 +638,33 @@ impl Ontologies {
         kind: &'static str,
         f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
     ) -> Result<T> {
+        assert!(self.pinned.is_none());
+        self.with_kept_flight(o, req, el_only, opts, kind, f)
+            .map(|out| out.expect("an unpinned flight always runs"))
+    }
+
+    /// One owned computing flight. Readers never take this lock or construct an
+    /// entry. Cancellation before mutation preserves the old state; mutating errors
+    /// and unwinds discard it. Publication changes are finalized as one pair. A pinned
+    /// handle checks once it holds the flight that its pin is still the head, since a
+    /// newer commit can be classified while it waits, and answers `None` without
+    /// touching the kept state when it is not.
+    pub(super) fn with_kept_flight<T>(
+        &self,
+        o: &Opened,
+        req: &OntologyRequest,
+        el_only: bool,
+        opts: &QueryOptions,
+        kind: &'static str,
+        f: impl FnOnce(&mut CacheEntry) -> Result<(T, bool)>,
+    ) -> Result<Option<T>> {
         check(opts)?;
         let key = InputKey::of(self, req, &o.snapshot);
         let state = self.ds.state();
+        #[cfg(test)]
+        if let Some(before) = BEFORE_FLIGHT.with(|h| h.borrow_mut().take()) {
+            before();
+        }
         let lock = loop {
             if let Some(g) = state
                 .classify_flight
@@ -649,11 +681,15 @@ impl Ontologies {
             check(opts)?;
         };
         check(opts)?;
+        if !self.may_replace_kept(&o.snapshot) {
+            drop(lock);
+            return Ok(None);
+        }
         let mut flight = KeptFlight::begin(state, lock, key, el_only, o.snapshot.commit, kind);
         match f(flight.entry()) {
             Ok((out, keep)) => {
                 flight.finish(keep);
-                Ok(out)
+                Ok(Some(out))
             }
             Err(err) => {
                 let preserve = !flight.entry().mutated;
@@ -854,6 +890,9 @@ thread_local! {
     /// Makes the next admission on this thread time out, as a full pool would.
     pub(super) static FORCE_PARTIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FLIGHT_WAIT_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    /// Runs once on this thread just before the next kept flight takes its lock.
+    #[allow(clippy::type_complexity)]
+    pub(super) static BEFORE_FLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static REFUSE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Makes the next kept classification on this thread answer as one whose modules'
     /// pass the deadline stopped.

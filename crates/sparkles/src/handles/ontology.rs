@@ -185,6 +185,10 @@ pub struct Opened {
     /// them and the dataset has them; `None` reads the asserted axioms only
     pub inferences: Option<Inferences>,
     inner: Arc<Inner>,
+    /// the snapshot the ontology was opened at, before the caller's grants masked it
+    source: Arc<Snapshot>,
+    /// the view [`snapshot`](Self::snapshot) was set to when the ontology was opened
+    view: Arc<Snapshot>,
 }
 
 /// The materialized inferences an open ontology read (spec F21 §7): the profile of the
@@ -954,44 +958,81 @@ impl Ontologies {
     /// so a pinned snapshot stays readable after retention prunes its commit. A request
     /// whose `at` names anything other than `commit:N` of the snapshot is refused, and
     /// so are edits, entity removals, classifications that write a taxonomy, diffs and
-    /// entity searches. Every read refuses a snapshot of another dataset or branch
-    /// before it reads a cache, and [`open_at`](Self::open_at) and
-    /// [`kept_entity_at_opened`](Self::kept_entity_at_opened) refuse a snapshot or an
-    /// opened ontology at another state than the pin.
+    /// entity searches. Every read refuses a snapshot of another dataset or branch, or
+    /// of a separately opened copy of this dataset, before it reads a cache. The
+    /// methods that take a state, [`open_at`](Self::open_at), [`head_at`](Self::head_at),
+    /// [`kept_entity_at_opened`](Self::kept_entity_at_opened) and
+    /// [`dl_query_opened`](Self::dl_query_opened), check the request's `at` the same way
+    /// and refuse any snapshot other than the pinned one, or an ontology opened from
+    /// another, even at the same commit.
     pub fn at_snapshot(mut self, snap: Arc<Snapshot>) -> Ontologies {
         self.pinned = Some(snap);
         self
     }
 
-    /// The pinned snapshot, once it is known to be a state of this handle's dataset and
-    /// branch, whose caches key their entries by commit alone.
+    /// The pinned snapshot, once it is known to be a state of this handle's own branch in
+    /// its open dataset family, whose caches key their entries by commit alone. A
+    /// snapshot of a separately opened copy is refused even when its persisted UUIDs and
+    /// commit number are the same.
     pub(crate) fn pin(&self) -> Result<Option<&Arc<Snapshot>>> {
         let Some(snap) = &self.pinned else {
             return Ok(None);
         };
-        let store = self.ds.store();
-        if snap.dataset_id != store.owner_dataset_id() || snap.branch_id != store.branch_id() {
+        if !self.ds.store().holds_state(snap) {
             return Err(Error::invalid(
-                "a pinned ontology read takes a snapshot of its own dataset and branch",
+                "a pinned ontology read takes a snapshot of its own open dataset and branch",
             ));
         }
         Ok(Some(snap))
     }
 
-    /// Refuse a read at `snap` through a pinned handle unless `snap` is a view of the
-    /// pinned state: the same dataset, branch and commit.
-    pub(crate) fn check_pinned_at(&self, snap: &Snapshot) -> Result<()> {
-        if let Some(pin) = self.pin()?
-            && (snap.dataset_id != pin.dataset_id
-                || snap.branch_id != pin.branch_id
-                || snap.commit != pin.commit)
-        {
-            return Err(Error::invalid(format!(
-                "a pinned ontology read answers at commit:{} of its own dataset and branch",
+    /// Refuse a request through a handle pinned to `pin` whose `at` names anything other
+    /// than `commit:N` of the pin.
+    fn check_pinned_selector(pin: &Snapshot, at: Option<&crate::history::At>) -> Result<()> {
+        match at {
+            None => Ok(()),
+            Some(crate::history::At::Commit(n)) if *n == pin.commit => Ok(()),
+            Some(_) => Err(Error::invalid(format!(
+                "a pinned ontology read answers at commit:{}: leave out 'at' or name that commit",
                 pin.commit
-            )));
+            ))),
+        }
+    }
+
+    /// Refuse a read of `req` at `snap` through a pinned handle unless `snap` is the
+    /// pinned snapshot itself and `req.at` names no other state. Another snapshot is
+    /// refused even at the same commit, since a view such as
+    /// [`Snapshot::with_overlay`] keeps the commit while its data differs.
+    pub(crate) fn check_pinned_at(
+        &self,
+        snap: &Arc<Snapshot>,
+        req: &OntologyRequest,
+    ) -> Result<()> {
+        if let Some(pin) = self.pin()? {
+            Self::check_pinned_selector(pin, req.at.as_ref())?;
+            if !Arc::ptr_eq(snap, pin) {
+                return Err(Error::invalid(format!(
+                    "a pinned ontology read answers only at its own snapshot of commit:{}",
+                    pin.commit
+                )));
+            }
         }
         Ok(())
+    }
+
+    /// [`check_pinned_at`](Self::check_pinned_at) for an ontology the caller opened: it
+    /// must have been opened from the pinned snapshot and still read the view it was
+    /// opened with.
+    pub(crate) fn check_pinned_opened(&self, o: &Opened, req: &OntologyRequest) -> Result<()> {
+        if self.pinned.is_none() {
+            return Ok(());
+        }
+        if !Arc::ptr_eq(&o.snapshot, &o.view) {
+            return Err(Error::invalid(
+                "a pinned ontology read takes an ontology opened through it, with its own snapshot",
+            ));
+        }
+        self.check_pinned_at(&o.source, req)
     }
 
     /// Refuse a read through a pinned handle that cannot answer at the pin.
@@ -1285,16 +1326,8 @@ impl Ontologies {
         let defaults = self.ds.with_query_defaults(opts);
         let opts = crate::overview::one_deadline(&defaults)?.into_owned();
         if let Some(snap) = self.pin()? {
-            return match &req.at {
-                None => Ok((snap.clone(), opts)),
-                Some(crate::history::At::Commit(n)) if *n == snap.commit => {
-                    Ok((snap.clone(), opts))
-                }
-                Some(_) => Err(Error::invalid(format!(
-                    "a pinned ontology read answers at commit:{}: leave out 'at' or name that commit",
-                    snap.commit
-                ))),
-            };
+            Self::check_pinned_selector(snap, req.at.as_ref())?;
+            return Ok((snap.clone(), opts));
         }
         let snap = match &req.at {
             None => self.ds.store().snapshot(),
@@ -1332,7 +1365,20 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
-        self.check_pinned_at(snap)?;
+        self.check_pinned_at(snap, req)?;
+        self.open_unchecked(snap, req, opts)
+    }
+
+    /// [`open_at`](Self::open_at) without the pin's checks, for a view that a read
+    /// through this handle derived from the snapshot [`state`](Self::state) gave it,
+    /// such as one masked by the caller's grants.
+    pub(crate) fn open_unchecked(
+        &self,
+        snap: &Arc<Snapshot>,
+        req: &OntologyRequest,
+        opts: &QueryOptions,
+    ) -> Result<Opened> {
+        req.validate()?;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
@@ -1353,7 +1399,7 @@ impl Ontologies {
                 let e = cache.remove(i);
                 let mut opened = Opened {
                     ontology: e.ontology.clone(),
-                    snapshot: view,
+                    snapshot: view.clone(),
                     graphs: e.graphs.clone(),
                     requested: e.requested,
                     imports: e.imports.clone(),
@@ -1362,6 +1408,8 @@ impl Ontologies {
                     cached: true,
                     inferences: None,
                     inner: e.inner.clone(),
+                    source: snap.clone(),
+                    view,
                 };
                 cache.push(e);
                 drop(cache);
@@ -1404,7 +1452,7 @@ impl Ontologies {
         }
         let mut opened = Opened {
             ontology,
-            snapshot: view,
+            snapshot: view.clone(),
             graphs,
             requested,
             imports: resolved.imports,
@@ -1413,6 +1461,8 @@ impl Ontologies {
             cached: false,
             inferences: None,
             inner,
+            source: snap.clone(),
+            view,
         };
         opened.inferences = self.inferences(&opened, record.as_ref());
         Ok(opened)

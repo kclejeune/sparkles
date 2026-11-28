@@ -1991,10 +1991,11 @@ query class's rate and concurrency limits, as it admits a SPARQL query. A page p
 request's limit or the whole pool is `507`, and one that the busy pool cannot take is
 `503`. `elOnly` reads the kept EL-only classification. The selector takes each parameter
 once, apart from `graph`, and `inferences` and `assertions` only as `true` or `false`. It
-refuses `inferences=true`, `assertions=true` and `format=ofn`. Every answer of the route
-to a request that names `classification`, its own refusals included, is
-`Cache-Control: no-store`. The rate limiter and the pool admission answer before the
-route, and their refusals do not carry the header.
+refuses `inferences=true`, `assertions=true` and `format=ofn`. Every answer to a `GET`
+that names `classification` is `Cache-Control: no-store`. This includes the route's own
+refusals and those of authentication, the rate limiter and the pool admission, which
+answer before the route. A stop or a deadline ends the page while it is scanned, rendered
+or serialized, even when one equivalence of an inconsistent ontology names every class.
 
 `GET /$/ontology/{ds}/entities` lists the entities the ontology declares or, in a lenient
 read, types by their use, as `{kind, iri}` in IRI order, 100 at a time by default and at
@@ -2195,8 +2196,8 @@ page form of the kept read, and are null unless the class is present in an avail
 and `elOnly` and `resultId` select the result as the kept read does. The asserted accessors
 beside it are unchanged. The selector takes each parameter once, apart from `graph`, and
 `inferences` and `assertions` only as `true` or `false`. It refuses `inferences=true`.
-Every answer of the route to a request that names `classification`, its own refusals
-included, is `Cache-Control: no-store`.
+Every answer to a `GET` that names `classification` is `Cache-Control: no-store`, including
+the refusals of authentication and the rate limiter, which answer before the route.
 
 ```json
 { "dataset": "uni", "commit": 12, "iri": "http://ex.org/Professor", "kinds": ["Class"],

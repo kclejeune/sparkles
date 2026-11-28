@@ -1016,9 +1016,10 @@ axioms, totals and pages, and a restricted view or synthetic snapshot reports
 `unsupportedScope` without observing the shared slot. The selector refuses `inferences`,
 the listing also refuses `assertions` and `format=ofn`, kept pages take limits from 1 to
 1,000, and a continuation is pinned by `resultId` and `at=commit:N`. The routes' answers to
-a request that names the selector are `Cache-Control: no-store`, their own refusals
-included, while rate-limit and pool-admission refusals come before the route. A kept HTTP
-read stops when its client disconnects. The reads cover named classes. Property and
+a `GET` that names the selector are `Cache-Control: no-store`, including the refusals of
+authentication, the rate limiter and the pool admission that come before the route. A
+kept HTTP read stops when its client disconnects, and the listing polls the request's
+controls while it scans the taxonomy, renders its rows and serializes the page. The reads cover named classes. Property and
 individual entailments stay with items 609 and 622, and justifications with F24's
 remaining phases.
 
@@ -1026,13 +1027,17 @@ remaining phases.
 historical view holds. Every read of the handle answers at that snapshot without
 resolving history again, so a pinned memory snapshot keeps answering after its commit
 has left the history. The pinned snapshot counts as the commit that a kept continuation
-or a materialized read names. A read refuses a pinned snapshot of another dataset or branch
-before it reads a cache, and `open_at` and `kept_entity_at_opened` refuse a snapshot or an
-opened ontology of another state. A
-request whose `at` names another state is refused, and so are edits, entity removals,
-classifications that write, diffs and entity searches. A classification pinned to a commit
-older than the head reuses that commit's kept result while the slot holds it, and
-otherwise classifies without replacing the head's. The FFI's `FfiReadTxn::ontology_call`
+or a materialized read names. A read refuses a pinned snapshot of another dataset or branch, or
+of a separately opened copy of the dataset with the same persisted UUIDs, before it reads
+a cache. The methods that take a state, `open_at`, `head_at`, `kept_entity_at_opened` and
+`dl_query_opened`, refuse every snapshot other than the pinned one, even a view of the
+same commit with other data, and an ontology opened from another. A request whose `at`
+names another state is refused at every entry, and so are edits, entity removals,
+classifications that write, diffs and entity searches. A classification or DL class query
+pinned to a commit older than the head reuses that commit's kept result while the slot
+holds it, and otherwise runs without replacing the head's. A pinned run checks again once
+it holds the classifier's flight, so a head that was classified while it waited keeps its
+result. The FFI's `FfiReadTxn::ontology_call`
 answers through such a handle only the kept reads of `axioms` and `entity`,
 `keptClassification`, the materialized `hierarchy`, `individuals` and `term` reads, and
 the frame projection of `classify` without a target, and checks those selectors before
@@ -1045,10 +1050,14 @@ and materialized state describe commits and not pending writes. Library tests in
 `kept/tests.rs` cover misses that admit and map nothing, the pages and their bound, the
 listing's order, filters and continuations against `Taxonomy::axioms`, the memory refusal,
 restricted scopes, mismatches, a pinned snapshot after its commit was pruned, pins of another
-dataset or branch, pinned diffs and searches, a pinned classification beside the head's
-kept result, import remaps, pool refusal kinds, cancellation inside a large group and the
-pinned FFI variants. Route tests cover both selectors, their refusals and `no-store`,
-strict selectors, and pool admission with its `503` and `507`, and the JVM's `OntologyTest`
+dataset or branch or of a separately opened copy, conflicting selectors and same-commit
+views at the explicit entries, pinned diffs and searches, a pinned classification beside
+the head's kept result, a pinned classification and DL query that the head passes while
+they wait for the flight, import remaps, pool refusal kinds, cancellation inside a large
+group, a large child list and the rendering of a large equivalence, and the pinned FFI
+variants. Route tests cover both selectors, their refusals and `no-store`, including
+authentication and pool-admission refusals, strict selectors, and pool admission with its
+`503` and `507`, and the JVM's `OntologyTest`
 covers pinned views and read transactions after a later commit and the refusal in a write
 transaction without a flush. The Python and Node.js bindings do not take the selector
 and are item 1325.

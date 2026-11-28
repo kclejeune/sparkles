@@ -728,11 +728,23 @@ pub(crate) struct ErrorJson(pub(crate) J);
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     use header::HeaderValue;
     // Outside authentication/admission too: an availability read can change at
-    // the same data commit, including a previously denied or failed request.
+    // the same data commit, including a previously denied or failed request. An axiom
+    // or entity read that names `classification` reads the kept result too, and its
+    // refusals by authentication, the rate limiter and the pool are not cached either,
+    // while the asserted reads of those routes keep their own caching.
     let kept_read = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
-        .is_some_and(|p| p.as_str() == "/$/ontology/{ds}/classification");
+        .is_some_and(|p| match p.as_str() {
+            "/$/ontology/{ds}/classification" => true,
+            "/$/ontology/{ds}/axioms" | "/$/ontology/{ds}/entity" => {
+                matches!(*req.method(), Method::GET | Method::HEAD)
+                    && Params::from_query(req.uri())
+                        .get("classification")
+                        .is_some()
+            }
+            _ => false,
+        });
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     if kept_read {

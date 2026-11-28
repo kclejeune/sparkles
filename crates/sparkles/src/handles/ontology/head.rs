@@ -108,6 +108,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Head> {
         req.validate()?;
+        self.check_pinned_at(snap, req)?;
         // the view, the graphs and the inferences as `open_at` reads them
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {

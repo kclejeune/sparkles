@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A node of the taxonomy: equivalent classes, sorted by IRI, and the direct
-/// superclasses and subclasses as node indices.
+/// superclasses and subclasses as node indices. The subclasses are in ascending node
+/// order, which readers that merge them with other nodes in taxonomy order rely on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     pub classes: Vec<Class>,
@@ -502,6 +503,7 @@ pub(super) fn build(
         }
         nodes[j + 2].parents = ps;
     }
+    debug_assert!(children_ascend(&nodes));
     Ok((Taxonomy { nodes, at }, bytes))
 }
 
@@ -1942,6 +1944,7 @@ pub(super) fn build_from_rows(
         }
         nodes[j + 2].parents = ps;
     }
+    debug_assert!(children_ascend(&nodes));
     drop(parents_hdr_debit);
 
     let tax = Taxonomy { nodes, at };
@@ -1954,6 +1957,13 @@ pub(super) fn build_from_rows(
     }
     tax_debit.transfer(owned);
     Ok((tax, owned))
+}
+
+/// Whether every node lists its subclasses in strictly ascending node order.
+fn children_ascend(nodes: &[Node]) -> bool {
+    nodes
+        .iter()
+        .all(|n| n.children.windows(2).all(|w| w[0] < w[1]))
 }
 
 #[cfg(test)]
@@ -2002,6 +2012,29 @@ mod tests {
             build(&k, true, 1, false, &|| false, &|b| b <= below),
             Err(Halt::Memory(_))
         ));
+    }
+
+    #[test]
+    fn every_node_lists_its_subclasses_in_ascending_node_order() {
+        // a class with many direct subclasses whose IRIs sort against their creation,
+        // and subclasses with several direct parents
+        let mut axioms = Vec::new();
+        for i in 0..300 {
+            let sub = c(&format!("S{:03}", 299 - i));
+            axioms.push(Axiom::sub_class_of(sub.clone(), c("P")));
+            if i % 3 == 0 {
+                axioms.push(Axiom::sub_class_of(sub, c("Q")));
+            }
+        }
+        axioms.push(Axiom::sub_class_of(c("P"), c("R")));
+        axioms.push(Axiom::sub_class_of(c("Q"), c("R")));
+        let k = saturated(&axioms);
+        for threads in [1, 4] {
+            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+            assert!(children_ascend(t.nodes()));
+            let p = t.node_of(&c("P")).unwrap();
+            assert_eq!(t.node(p).children.len(), 300);
+        }
     }
 
     #[test]

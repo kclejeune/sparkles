@@ -312,18 +312,19 @@ async fn axioms_read(
         let (cancel, _guard) = cancel_on_drop();
         opts.cancel = Some(cancel);
         return blocking(move || {
-            let found = ds
-                .dataset
-                .ontology()
+            let handle = ds.dataset.ontology();
+            // one deadline for the scan, the rendering and the serialization, each of
+            // which polls the request's controls
+            let opts = handle.anchored(&opts).map_err(ontology_error)?;
+            let found = handle
                 .kept_axioms(&req, &query, &opts)
                 .map_err(ontology_error)?;
-            let body = onto::wire::kept_axioms_body(&ds.name, &found, &renderer(&ds))
+            let body = onto::wire::kept_axioms_body(&ds.name, &found, &renderer(&ds), &opts)
                 .map_err(ontology_error)?;
-            Ok(with_commit(
-                Json(body).into_response(),
-                &ds,
-                found.read.commit,
-            ))
+            let bytes = onto::wire::json_bytes_controlled(&body, &opts).map_err(ontology_error)?;
+            drop(body);
+            let resp = ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+            Ok(with_commit(resp, &ds, found.read.commit))
         })
         .await;
     }

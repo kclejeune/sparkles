@@ -433,6 +433,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<DlQueryAnswer> {
         let start = Instant::now();
+        self.check_pinned_opened(&o, req)?;
         if req.inferences {
             return Err(Error::invalid(
                 "a DL query reasons over the asserted axioms: leave out 'inferences'",
@@ -581,11 +582,11 @@ impl Ontologies {
         if q.answers.classes() {
             let keep =
                 opts.graphs.is_none() && o.snapshot.cacheable && self.may_replace_kept(&o.snapshot);
-            let (consistent, d, excluded) = if keep {
-                answer.incremental = true;
-                // the kept saturation reads the defining axiom beside the ontology's, and
-                // the next run over it lets the axiom go
-                self.with_kept(o, req, q.el_only, opts, "dlQuery", |e| {
+            // the kept saturation reads the defining axiom beside the ontology's, and
+            // the next run over it lets the axiom go. A pinned run that the head passed
+            // while it waited for the flight runs on its own.
+            let kept = if keep {
+                self.with_kept_flight(o, req, q.el_only, opts, "dlQuery", |e| {
                     // the threads come first: a wait that ends at the deadline leaves the
                     // kept state as it was
                     let par = admit(q.threads, opts)?;
@@ -597,11 +598,20 @@ impl Ontologies {
                     Ok(((c, d, ex), keep))
                 })?
             } else {
-                let mut axioms = logical_axioms(&o.ontology);
-                axioms.push(&ax.kind);
-                let par = admit(q.threads, opts)?;
-                let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par)?;
-                (c, d, ex)
+                None
+            };
+            let (consistent, d, excluded) = match kept {
+                Some(k) => {
+                    answer.incremental = true;
+                    k
+                }
+                None => {
+                    let mut axioms = logical_axioms(&o.ontology);
+                    axioms.push(&ax.kind);
+                    let par = admit(q.threads, opts)?;
+                    let (c, d, ex, _) = describe(&mut Saturation::new(), &axioms, None, par)?;
+                    (c, d, ex)
+                }
             };
             answer.consistent = Some(consistent);
             answer.satisfiable = Some(d.satisfiable);

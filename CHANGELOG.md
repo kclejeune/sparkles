@@ -12,14 +12,17 @@ pages of the class's direct parents, children and equivalents. The axiom listing
 the `SubClassOf` and `EquivalentClasses` axioms that the kept taxonomy infers, in the order
 of a classification's `format=ofn`, walking the retained taxonomy and charging each page's
 rows to the memory budget and the server's query memory pool, which admits the HTTP
-listing. A miss classifies nothing and answers null pages, and every answer of the routes
-to a request that names the selector, their own refusals included, is
-`Cache-Control: no-store`.
+listing. A miss classifies nothing and answers null pages, and every answer to a `GET`
+that names the selector is `Cache-Control: no-store`, including the refusals of
+authentication, the rate limiter and the pool that come before the route. A stop or a
+deadline ends a listing while it scans, renders or serializes the page.
 
 `Ontologies::at_snapshot` and `FfiReadTxn::ontology_call` answer reads at a snapshot that a
 read transaction or a historical view holds. They refuse a snapshot of another dataset or
-branch, and a pinned classification of an older commit never replaces the head's kept
-result. On the JVM, `keptClassification`, the new
+branch or of a separately opened copy of the dataset. The methods that take a state accept
+only the pinned snapshot, and the request's `at` only at its commit. A pinned
+classification or DL query of an older commit never replaces the head's kept result,
+including a head that was classified while the pinned run waited for the flight. On the JVM, `keptClassification`, the new
 `keptAxioms` and `keptEntity`, the frame projection and the materialized hierarchy,
 individual and term reads now answer a dataset returned by `at()` and an active read
 transaction at their own commit, where they threw `JenaTransactionException` before. They

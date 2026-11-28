@@ -1487,6 +1487,18 @@ impl Store {
         Arc::ptr_eq(&self.family, &other.family)
     }
 
+    /// Whether `snap` is a state of this store's own branch in this open dataset family.
+    /// A snapshot of a separately opened copy is not, even when its persisted dataset
+    /// and branch UUIDs and its commit number are the same as this store's.
+    pub fn holds_state(&self, snap: &Snapshot) -> bool {
+        snap.dataset_id == self.owner_dataset_id()
+            && snap.branch_id == self.branch_id()
+            && snap
+                .managed
+                .as_ref()
+                .is_some_and(|m| Arc::ptr_eq(m, &self.family.managed))
+    }
+
     /// Whether this is a branch store (not a dataset's own store).
     pub fn is_branch(&self) -> bool {
         self.branching.ident.is_some()

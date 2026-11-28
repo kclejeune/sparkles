@@ -2466,6 +2466,115 @@ fn a_pin_refuses_another_dataset_or_branch_and_leaves_ordinary_reads_alone() {
     );
 }
 
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let t = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &t);
+        } else {
+            std::fs::copy(e.path(), &t).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_pin_refuses_an_independently_opened_copy_at_the_same_commit() {
+    // two copies of one closed dataset, each with one different ontology commit, share
+    // the persisted dataset and branch ids and the commit number but not their data
+    let dir = tempfile::tempdir().unwrap();
+    let (a_root, b_root) = (dir.path().join("a"), dir.path().join("b"));
+    {
+        let ds = Dataset::open(&a_root).unwrap();
+        ds.update(&format!("{BASE} INSERT DATA {{ {TAXONOMY} }}"))
+            .unwrap();
+    }
+    copy_dir(&a_root, &b_root);
+    let a = Dataset::open(&a_root).unwrap();
+    let b = Dataset::open(&b_root).unwrap();
+    a.update(&format!(
+        "{BASE} INSERT DATA {{ :X a owl:Class ; rdfs:subClassOf :A }}"
+    ))
+    .unwrap();
+    b.update(&format!(
+        "{BASE} INSERT DATA {{ :Y a owl:Class ; rdfs:subClassOf :B }}"
+    ))
+    .unwrap();
+    let (mine, theirs) = (a.store().snapshot(), b.store().snapshot());
+    assert_eq!(mine.dataset_id, theirs.dataset_id);
+    assert_eq!(mine.branch_id, theirs.branch_id);
+    assert_eq!(mine.commit, theirs.commit);
+    classify(&b);
+    let refused = |r: Result<()>| assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    // a cold cache of the receiving copy takes nothing of the other copy's data
+    let pinned = a.ontology().at_snapshot(theirs.clone());
+    refused(pinned.open(&req(), &opts()).map(drop));
+    refused(pinned.open_at(&theirs, &req(), &opts()).map(drop));
+    refused(
+        pinned
+            .kept_classification(&req(), &KeptQuery::default(), &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .kept_axioms(&req(), &KeptAxiomQuery::default(), &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .classify(&req(), &ClassifyRequest::default(), &opts())
+            .map(drop),
+    );
+    refused(
+        super::super::wire::call_at(
+            &a,
+            theirs.clone(),
+            "keptClassification",
+            &json!({}),
+            &opts(),
+        )
+        .map(drop),
+    );
+    empty_slot(&a);
+    assert!(a.state().ontology_cache.lock().is_empty());
+    let own = a.ontology().open(&req(), &opts()).unwrap();
+    let classes = own.ontology.classes();
+    assert!(classes.iter().any(|c| c.as_str() == iri("X")));
+    assert!(classes.iter().all(|c| c.as_str() != iri("Y")));
+    // a warm cache of the receiving copy answers no pinned read of the other copy
+    let kept = classify(&a);
+    refused(pinned.open(&req(), &opts()).map(drop));
+    refused(
+        pinned
+            .kept_classification(&req(), &KeptQuery::default(), &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .kept_entity(&req(), &KeptEntityQuery::new(iri("Y")), &opts())
+            .map(drop),
+    );
+    assert_eq!(result(&a).unwrap().id, kept.id);
+    // each copy's own pin answers
+    let r = a
+        .ontology()
+        .at_snapshot(mine)
+        .kept_classification(&req(), &KeptQuery::default(), &opts())
+        .unwrap();
+    assert_eq!(r.status, Status::Available);
+    assert!(
+        b.ontology()
+            .at_snapshot(theirs)
+            .open(&req(), &opts())
+            .unwrap()
+            .ontology
+            .classes()
+            .iter()
+            .any(|c| c.as_str() == iri("Y"))
+    );
+}
+
 #[test]
 fn a_pinned_handle_refuses_diffs_searches_and_reads_at_other_states() {
     let ds = ds(TAXONOMY);
@@ -2508,6 +2617,113 @@ fn a_pinned_handle_refuses_diffs_searches_and_reads_at_other_states() {
             .kept_entity_at_opened(&req(), &own, &KeptEntityQuery::new(iri("A")), &opts())
             .is_ok()
     );
+    let refused = |r: Result<()>| assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    // a request whose `at` names another state is refused at every entry that takes a
+    // state, with the pin's own snapshot too
+    let at_head = OntologyRequest {
+        at: Some(At::Commit(head.commit)),
+        ..req()
+    };
+    let mut q = super::super::dl_query::DlQueryRequest::new(sparkles_owl::ClassExpression::Class(
+        sparkles_owl::Class::new(iri("B")),
+    ));
+    q.answers.instances = false;
+    refused(pinned.open_at(&held, &at_head, &opts()).map(drop));
+    refused(pinned.head_at(&held, &at_head, &opts()).map(drop));
+    refused(
+        pinned
+            .kept_entity_at_opened(&at_head, &own, &KeptEntityQuery::new(iri("A")), &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .dl_query_opened(own.clone(), &at_head, &q, &opts())
+            .map(drop),
+    );
+    // the pin's own commit named in `at` is answered
+    let at_pin = OntologyRequest {
+        at: Some(At::Commit(held.commit)),
+        ..req()
+    };
+    assert!(pinned.open_at(&held, &at_pin, &opts()).is_ok());
+    assert!(pinned.head_at(&held, &at_pin, &opts()).is_ok());
+    assert!(
+        pinned
+            .dl_query_opened(own.clone(), &req(), &q, &opts())
+            .is_ok()
+    );
+    // a view of the pin's commit with other data is not the pin
+    let id = |local: &str| held.lookup_iri(&iri(local)).unwrap();
+    let sub_class_of = held
+        .lookup_iri("http://www.w3.org/2000/01/rdf-schema#subClassOf")
+        .unwrap();
+    let overlay = Arc::new(
+        held.with_overlay(
+            &[[id("C"), sub_class_of, id("D"), crate::id::Id::DEFAULT_GRAPH]],
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(overlay.commit, held.commit);
+    assert_eq!(
+        (overlay.dataset_id, overlay.branch_id),
+        (held.dataset_id, held.branch_id)
+    );
+    refused(pinned.open_at(&overlay, &req(), &opts()).map(drop));
+    refused(pinned.head_at(&overlay, &req(), &opts()).map(drop));
+    let altered = ds.ontology().open_at(&overlay, &req(), &opts()).unwrap();
+    refused(
+        pinned
+            .kept_entity_at_opened(&req(), &altered, &KeptEntityQuery::new(iri("C")), &opts())
+            .map(drop),
+    );
+    refused(
+        pinned
+            .dl_query_opened(altered.clone(), &req(), &q, &opts())
+            .map(drop),
+    );
+    // an opened ontology whose snapshot was replaced is refused
+    let mut swapped = own.clone();
+    swapped.snapshot = overlay.clone();
+    refused(
+        pinned
+            .kept_entity_at_opened(&req(), &swapped, &KeptEntityQuery::new(iri("C")), &opts())
+            .map(drop),
+    );
+    // and a pin on such a view does not take the committed snapshot of its commit
+    let on_overlay = ds.ontology().at_snapshot(overlay.clone());
+    refused(on_overlay.open_at(&held, &req(), &opts()).map(drop));
+    let committed = ds.ontology().open_at(&held, &req(), &opts()).unwrap();
+    refused(
+        on_overlay
+            .kept_entity_at_opened(&req(), &committed, &KeptEntityQuery::new(iri("A")), &opts())
+            .map(drop),
+    );
+}
+
+#[test]
+fn a_pinned_kept_entity_read_under_triple_rules_answers_through_its_masked_view() {
+    let ds = ds(&format!("{TAXONOMY} :B :secret true ."));
+    classify(&ds);
+    let snap = ds.store().snapshot();
+    let pinned = ds.ontology().at_snapshot(snap.clone());
+    let restricted = crate::handles::ontology::tests::hiding("http://ex.org/secret");
+    let o = pinned.open(&req(), &restricted).unwrap();
+    assert!(!Arc::ptr_eq(&o.snapshot, &snap), "the rules mask the view");
+    let k = pinned
+        .kept_entity_at_opened(&req(), &o, &KeptEntityQuery::new(iri("B")), &restricted)
+        .unwrap();
+    assert_eq!(k.read.reason, Some("unsupportedScope"));
+    // and through the pinned wire's combined entity read
+    let w = super::super::wire::call_at(
+        &ds,
+        snap,
+        "entity",
+        &json!({"iri": iri("B"), "classification": "kept"}),
+        &restricted,
+    )
+    .unwrap();
+    assert_eq!(w["classification"]["reason"], "unsupportedScope", "{w}");
 }
 
 #[test]
@@ -2557,6 +2773,83 @@ fn a_pinned_classification_of_an_older_commit_never_evicts_the_heads_kept_result
         .unwrap();
     assert!(c.retained);
     assert_eq!(c.publication.id, head.id);
+}
+
+/// Arrange that, once the next kept flight on this thread has made its first check and
+/// before it takes the flight's lock, `ds` commits a new class and classifies the new
+/// head, whose publication the returned cell then holds.
+fn advance_before_the_next_flight(
+    ds: &Dataset,
+) -> std::rc::Rc<std::cell::RefCell<Option<Arc<KeptClassification>>>> {
+    let newer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let (ds, cell) = (ds.clone(), newer.clone());
+    super::super::classify::BEFORE_FLIGHT.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            ds.update(&format!(
+                "{BASE} INSERT DATA {{ :F a owl:Class ; rdfs:subClassOf :B }}"
+            ))
+            .unwrap();
+            *cell.borrow_mut() = Some(classify(&ds));
+        }));
+    });
+    newer
+}
+
+#[test]
+fn a_pinned_classification_that_the_head_passes_while_it_waits_keeps_the_newer_result() {
+    let ds = ds(TAXONOMY);
+    let held = ds.store().snapshot();
+    let pinned = ds.ontology().at_snapshot(held.clone());
+    // the pin is the head when the run checks, and the head moves on before the flight
+    let newer = advance_before_the_next_flight(&ds);
+    let c = pinned
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    let newer = newer
+        .borrow()
+        .clone()
+        .expect("the head classified before the flight");
+    assert_ne!(newer.source.commit, held.commit);
+    assert_eq!(c.publication.source.commit, held.commit);
+    assert!(!c.retained);
+    assert_ne!(c.publication.id, newer.id);
+    assert_eq!(result(&ds).unwrap().id, newer.id);
+    let live = read(&ds, &req(), &KeptQuery::default());
+    assert_eq!(live.status, Status::Available);
+    assert_eq!(live.commit, newer.source.commit);
+    assert_eq!(live.result.unwrap().result_id, newer.id);
+}
+
+#[test]
+fn a_pinned_dl_query_that_the_head_passes_while_it_waits_keeps_the_newer_result() {
+    // inside OWL 2 EL, so that the query takes the kept saturation
+    let ds = ds(":A a owl:Class . :B a owl:Class ; rdfs:subClassOf :A . \
+        :D a owl:Class ; rdfs:subClassOf :B .");
+    let held = ds.store().snapshot();
+    let pinned = ds.ontology().at_snapshot(held.clone());
+    let mut q = super::super::dl_query::DlQueryRequest::new(sparkles_owl::ClassExpression::Class(
+        sparkles_owl::Class::new(iri("B")),
+    ));
+    q.answers.instances = false;
+    let newer = advance_before_the_next_flight(&ds);
+    let answer = pinned.dl_query(&req(), &q, &opts()).unwrap();
+    let newer = newer
+        .borrow()
+        .clone()
+        .expect("the head classified before the flight");
+    assert_ne!(newer.source.commit, held.commit);
+    // the query answered at its pin on its own, without the kept saturation
+    assert!(!answer.incremental);
+    assert_eq!(answer.opened.snapshot.commit, held.commit);
+    let subclasses = answer.subclasses.unwrap();
+    assert!(
+        subclasses.iter().all(|c| c.as_str() != iri("F")),
+        "{subclasses:?}"
+    );
+    assert_eq!(result(&ds).unwrap().id, newer.id);
+    let live = read(&ds, &req(), &KeptQuery::default());
+    assert_eq!(live.status, Status::Available);
+    assert_eq!(live.commit, newer.source.commit);
 }
 
 #[test]
@@ -2745,6 +3038,122 @@ fn a_kept_axiom_scan_stops_inside_a_large_group() {
         let steps = SCAN_STEPS.with(|n| n.get());
         assert!(steps <= 16 + POLL_EVERY + 1, "{about:?}: {steps} steps");
     }
+}
+
+#[test]
+fn a_kept_listing_about_a_class_with_many_children_reads_them_in_place_and_stops() {
+    let children = 5000;
+    let mut body = String::from(":P a owl:Class .");
+    for i in 0..children {
+        body.push_str(&format!(" :K{i:04} a owl:Class ; rdfs:subClassOf :P ."));
+    }
+    let ds = ds(&body);
+    let p = classify(&ds);
+    let t = &p.classification.taxonomy;
+    let node = t.node_of(&sparkles_owl::Class::new(iri("P"))).unwrap();
+    assert_eq!(t.node(node).children.len(), children);
+    assert!(t.node(node).children.windows(2).all(|w| w[0] < w[1]));
+    // the class's own row and every child's row, in the taxonomy's order
+    let about = KeptAxiomQuery {
+        about: Some(iri("P")),
+        limit: 1000,
+        ..Default::default()
+    };
+    let page = ds.ontology().kept_axioms(&req(), &about, &opts()).unwrap();
+    assert_eq!(page.total, Some(children + 1));
+    let rows = page.axioms.unwrap();
+    let firsts: Vec<String> = rows
+        .iter()
+        .map(|ax| match &ax.kind {
+            sparkles_owl::AxiomKind::SubClassOf(sparkles_owl::ClassExpression::Class(c), _) => {
+                c.as_str().to_string()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let mut sorted = firsts.clone();
+    sorted.sort();
+    assert_eq!(firsts, sorted, "the node order is the IRI order here");
+    assert_eq!(firsts[0], iri("K0000"));
+    // a stop ends the merge of the children within one polling interval
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = QueryOptions {
+        cancel: Some(cancel.clone()),
+        ..opts()
+    };
+    SCAN_STEPS.with(|n| n.set(0));
+    CANCEL_AT_STEP.with(|c| c.set(Some(2000)));
+    let r = ds.ontology().kept_axioms(&req(), &about, &stopping);
+    CANCEL_AT_STEP.with(|c| c.set(None));
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let steps = SCAN_STEPS.with(|n| n.get());
+    assert!(steps <= 2000 + POLL_EVERY + 1, "{steps} steps");
+}
+
+#[test]
+fn rendering_a_large_kept_equivalence_stops_with_the_request() {
+    let n = 3000;
+    let mut body = String::from(":C0 a owl:Class .");
+    for i in 1..n {
+        body.push_str(&format!(
+            " :C{i} a owl:Class ; owl:equivalentClass :C{} .",
+            i - 1
+        ));
+    }
+    let ds = ds(&body);
+    classify(&ds);
+    // even a page of one row names every class of the group
+    let page = ds
+        .ontology()
+        .kept_axioms(
+            &req(),
+            &KeptAxiomQuery {
+                limit: 1,
+                ..Default::default()
+            },
+            &opts(),
+        )
+        .unwrap();
+    let axioms = page.axioms.as_ref().unwrap();
+    assert_eq!(axioms.len(), 1);
+    assert!(
+        matches!(&axioms[0].kind, sparkles_owl::AxiomKind::EquivalentClasses(cs) if cs.len() == n)
+    );
+    let r = super::super::wire::renderer(&ds);
+    // the polled rendering is the listing's usual row
+    let body = super::super::wire::kept_axioms_body("ds", &page, &r, &opts()).unwrap();
+    assert_eq!(
+        body["axioms"][0],
+        super::super::wire::axiom_json(&axioms[0], None, &r)
+    );
+    // a stop raised while the row renders ends the rendering within one interval
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = QueryOptions {
+        cancel: Some(cancel.clone()),
+        ..opts()
+    };
+    for at in [16, 2 * POLL_EVERY + 7] {
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        SCAN_STEPS.with(|s| s.set(0));
+        CANCEL_AT_STEP.with(|c| c.set(Some(at)));
+        let stopped = super::super::wire::kept_axioms_body("ds", &page, &r, &stopping);
+        CANCEL_AT_STEP.with(|c| c.set(None));
+        assert!(
+            matches!(stopped, Err(Error::Cancelled)),
+            "{at}: {stopped:?}"
+        );
+        let steps = SCAN_STEPS.with(|s| s.get());
+        assert!(steps <= at + POLL_EVERY + 1, "{at}: {steps} steps");
+    }
+    // the serialization is the plain one, and refuses a stopped request
+    let bytes = super::super::wire::json_bytes_controlled(&body, &opts()).unwrap();
+    assert!(bytes.len() > 64 << 10);
+    assert_eq!(bytes, serde_json::to_vec(&body).unwrap());
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        super::super::wire::json_bytes_controlled(&body, &stopping),
+        Err(Error::Cancelled)
+    ));
 }
 
 #[test]

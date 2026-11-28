@@ -82,6 +82,46 @@ async fn kept_entity_and_axiom_reads_never_disclose_shared_state_to_a_restricted
     assert_eq!(full.json()["status"], "available", "{}", full.text());
 }
 
+#[tokio::test]
+async fn authentication_refusals_of_kept_reads_are_never_cached() {
+    let (_dir, app) = server();
+    // a dataset the reader has no grant on answers as missing before the route runs
+    for uri in [
+        "/$/ontology/other/axioms?classification=kept",
+        "/$/ontology/other/entity?iri=http%3A%2F%2Fex%2FA&classification=kept",
+        "/$/ontology/other/classification",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    // an anonymous kept read is refused before the route too
+    let denied = call(
+        &app,
+        "GET",
+        "/$/ontology/ont/axioms?classification=kept",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers[header::CACHE_CONTROL], "no-store");
+    // the asserted reads keep their own caching
+    for uri in [
+        "/$/ontology/other/axioms",
+        "/$/ontology/other/entity?iri=http%3A%2F%2Fex%2FA",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+        assert!(
+            r.headers
+                .get(header::CACHE_CONTROL)
+                .is_none_or(|v| v.as_bytes() != b"no-store"),
+            "{uri}"
+        );
+    }
+}
+
 const DATA: &str = r#"@prefix : <http://ex/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .

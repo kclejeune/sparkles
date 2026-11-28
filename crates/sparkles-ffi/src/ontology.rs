@@ -51,7 +51,7 @@ impl FfiReadTxn {
     /// and `entity` with `classification: "kept"`, `hierarchy`, `individuals` and
     /// `term` with `inferences: true`, and `classify` with `projection: "frame"` and no
     /// target. A request whose `at` names another state is refused, and so is a snapshot
-    /// of another dataset or branch.
+    /// of another dataset or branch or of a separately opened copy of the dataset.
     pub fn ontology_call(
         &self,
         op: String,
