@@ -403,6 +403,7 @@ fn consumer_evidence_permission_error_is_not_retried() {
                 lifts: vec![],
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             }],
             ..Default::default()
         }),

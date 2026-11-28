@@ -1277,6 +1277,7 @@ async fn cross_dataset_claims_proposal_holds_referenced_dataset_over_http() {
                 lifts: Vec::new(),
                 branches: None,
                 server_models: false,
+                views: Vec::new(),
             }],
             ..Default::default()
         }),

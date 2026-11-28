@@ -187,6 +187,8 @@ impl Runtime {
         entry.cell = Some(cell);
         entry.access = access;
         entry.error = None;
+        // decisions on who reads the view follow its principal's current grants
+        self.auth.clear();
         Ok(())
     }
 
@@ -321,6 +323,7 @@ impl Runtime {
             let epoch = host.epoch();
             if self.host_epoch.swap(epoch, Ordering::AcqRel) != epoch {
                 // grants may have changed: resolve every view's principal again
+                self.auth.clear();
                 for (name, e) in reg.views.iter_mut() {
                     e.error = None;
                     if let Some(c) = e.cell.take() {

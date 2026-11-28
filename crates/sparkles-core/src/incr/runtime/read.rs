@@ -352,6 +352,8 @@ impl Runtime {
         let wait = Instant::now() + self.opts.read().view_wait;
         let until = r.deadline.map_or(wait, |d| d.min(wait));
         let mut final_check = false;
+        // a read is audited once for each decision, however often it waits for the view
+        let mut last: Option<ViewDecision> = None;
         loop {
             let round_start = self.round_epoch();
             check()?;
@@ -408,11 +410,14 @@ impl Runtime {
                     ));
                 }
                 if let Some(cell) = cell {
-                    if !covers(r.caller, access.as_ref()) {
-                        return Err(crate::incr::error(
-                            "view-access",
-                            format!("the view {:?} reads data your grants do not cover", r.name),
-                        ));
+                    // decided before any wait, evaluation or allocation for the read
+                    let decided = self.decide_cached(r.name, r.caller, access.as_ref());
+                    if last != Some(decided.0) {
+                        self.audit(r.name, r.caller, ViewOp::Read, decided);
+                    }
+                    last = Some(decided.0);
+                    if !decided.0.allowed() {
+                        return Err(super::auth::refused(r.name));
                     }
                     // The mode generation, reading and status are checked against the
                     // current runtime mode generation under the state lock so a delayed

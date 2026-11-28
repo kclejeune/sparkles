@@ -12,8 +12,10 @@
 //! only the visible triples.
 
 pub mod authority;
+mod contain;
 pub(crate) mod preparation;
 pub mod triples;
+pub use contain::Gap;
 pub(crate) use preparation::sort_by as sort_by_prepared;
 pub(crate) use preparation::{
     Buffer as PreparationBuffer, Map as PreparationMap, Text as PreparationText,
@@ -630,6 +632,51 @@ pub struct GraphAccess {
     pub write: Graphs,
     /// protections that hide some triples of the graphs read or written (`None`: none)
     pub triples: Option<Arc<TripleRules>>,
+    /// the incremental views that grants name explicitly (`view:{name}`), which the
+    /// caller reads whatever their inputs (spec F13 §6.1). It changes no read of the
+    /// store.
+    pub views: ViewGrants,
+}
+
+/// The views a caller is granted by name, an explicit declassification of each (spec
+/// F13 §6.1), with the identity that audit records of their reads name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ViewGrants {
+    /// view names (sorted, without duplicates)
+    names: Arc<[String]>,
+    /// the caller as audit records name it, such as a user or a token id (never a
+    /// credential)
+    audit_id: Option<Arc<str>>,
+}
+
+impl ViewGrants {
+    /// The views `names`, granted to the caller that `audit_id` names in audit records.
+    pub fn new(names: impl IntoIterator<Item = String>, audit_id: Option<&str>) -> ViewGrants {
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort_unstable();
+        names.dedup();
+        ViewGrants {
+            names: names.into(),
+            audit_id: audit_id.map(Arc::from),
+        }
+    }
+
+    /// Whether view `name` is granted by name.
+    pub fn grants(&self, name: &str) -> bool {
+        self.names
+            .binary_search_by(|n| n.as_str().cmp(name))
+            .is_ok()
+    }
+
+    /// The views granted by name.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The caller as audit records name it.
+    pub fn audit_id(&self) -> Option<&str> {
+        self.audit_id.as_deref()
+    }
 }
 
 impl GraphAccess {
@@ -639,6 +686,7 @@ impl GraphAccess {
             read: Graphs::All,
             write: Graphs::All,
             triples: None,
+            views: Default::default(),
         }
     }
 
@@ -648,6 +696,7 @@ impl GraphAccess {
             read,
             write,
             triples: None,
+            views: Default::default(),
         }
     }
 
@@ -665,6 +714,7 @@ impl GraphAccess {
             read,
             write,
             triples: (!rules.rules.is_empty()).then(|| Arc::new(rules)),
+            views: Default::default(),
         }
     }
 
@@ -685,6 +735,7 @@ impl GraphAccess {
             read: self.read.bound(snap, bound),
             write: self.write.bound(snap, bound),
             triples: self.triples.clone(),
+            views: self.views.clone(),
         })
     }
 
@@ -735,7 +786,49 @@ impl GraphAccess {
             read: settle(&self.read),
             write: settle(&self.write),
             triples: self.triples.clone(),
+            views: self.views.clone(),
         })
+    }
+
+    /// This view with every guard keeping all its graphs out, decided or not, and bound
+    /// to no snapshot. It reads no more than this view at any snapshot, and is the same
+    /// at every snapshot, so that decisions about it can be kept across commits.
+    pub fn guards_closed(self: &Arc<Self>) -> Arc<GraphAccess> {
+        let has = |g: &Graphs| matches!(g, Graphs::Only(r) if !r.guards.is_empty());
+        if !has(&self.read) && !has(&self.write) {
+            return self.clone();
+        }
+        let close = |g: &Graphs| match g {
+            Graphs::Only(r) => {
+                let mut r = r.clone();
+                for g in &mut r.guards {
+                    g.decide = None;
+                    g.exempt.clear();
+                    g.bound_to = None;
+                }
+                r.normalize();
+                Graphs::Only(r)
+            }
+            Graphs::All => Graphs::All,
+        };
+        Arc::new(GraphAccess {
+            read: close(&self.read),
+            write: close(&self.write),
+            triples: self.triples.clone(),
+            views: self.views.clone(),
+        })
+    }
+
+    /// Whether every quad that `other` reads, this view reads as well, judged from the
+    /// grant sets alone (spec F13 §6.1). Both views are compared [`settled`](Self::settled),
+    /// so a guard exempts nothing. The answer is `Ok` only when the rules prove the
+    /// containment, and otherwise names the first [`Gap`] found: an inclusion that the
+    /// comparison cannot prove counts as a gap.
+    pub fn read_contains(
+        self: &Arc<Self>,
+        other: &Arc<GraphAccess>,
+    ) -> std::result::Result<(), Gap> {
+        contain::read_contains(&self.settled(), &other.settled())
     }
 
     /// Whether some protection hides triples from reads.
@@ -1152,6 +1245,7 @@ mod tests {
             read: g.clone(),
             write: Graphs::Only(GraphRule::new(["http://ex/a/1", "http://ex/z"], &[])),
             triples: None,
+            views: Default::default(),
         };
         assert!(a.writable(Some(&n("http://ex/a/1"))));
         // writable only when readable too

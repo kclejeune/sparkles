@@ -220,6 +220,7 @@ fn prepare_input(
         read,
         write,
         triples: original.triples.clone(),
+        views: original.views.clone(),
     });
     let mut hides = false;
     if let Some(rules) = &access.triples {

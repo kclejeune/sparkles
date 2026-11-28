@@ -410,6 +410,7 @@ fn a16_hidden_graphs_stay_hidden() {
             lifts: Vec::new(),
             server_models: false,
             branches: None,
+            views: Vec::new(),
         }],
         ..Default::default()
     });

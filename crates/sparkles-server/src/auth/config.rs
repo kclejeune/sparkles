@@ -30,7 +30,8 @@ pub struct GrantCfg {
     /// absent: every graph
     #[serde(default)]
     pub graphs: Option<Vec<String>>,
-    /// endpoint names; absent: every endpoint
+    /// endpoint names, and `view:{name}` for an incremental view the grant
+    /// declassifies (spec F13 §6.1); absent: every endpoint
     #[serde(default)]
     pub endpoints: Option<Vec<String>>,
     /// names of `[[protections]]` this grant lifts in its graphs, at its level
@@ -208,8 +209,20 @@ impl GrantCfg {
             lifts: self.lifts.clone(),
             branches: self.branches.clone(),
             server_models: self.server_models,
+            views: self
+                .endpoints
+                .iter()
+                .flatten()
+                .filter_map(|e| view_entry(e))
+                .map(str::to_string)
+                .collect(),
         }
     }
+}
+
+/// The view an endpoint entry `view:{name}` names.
+fn view_entry(e: &str) -> Option<&str> {
+    e.strip_prefix("view:")
 }
 
 /// A graph entry of a grant: the default graph's name, or an absolute IRI that may
@@ -297,11 +310,23 @@ fn check_restricted(what: &str, grants: &[GrantCfg], protections: &BTreeSet<&str
                 );
             }
             for e in es {
+                if let Some(v) = view_entry(e) {
+                    if !sparkles::incr::views::valid_name(v) {
+                        bail!(
+                            "{what}: the grant on '{}' names '{e}', which is not a view name \
+                             (view:{{name}} names one view exactly, with letters, digits, '_' \
+                             and '-')",
+                            g.dataset
+                        );
+                    }
+                    continue;
+                }
                 if super::Endpoint::parse(e).is_none() {
                     let known: Vec<&str> =
                         super::Endpoint::ALL.iter().map(|e| e.as_str()).collect();
                     bail!(
-                        "{what}: the grant on '{}' names an unknown endpoint '{e}' (known: {})",
+                        "{what}: the grant on '{}' names an unknown endpoint '{e}' (known: {}, \
+                         view:{{name}})",
                         g.dataset,
                         known.join(", ")
                     );

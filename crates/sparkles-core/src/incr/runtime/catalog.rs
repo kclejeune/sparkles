@@ -104,6 +104,7 @@ impl Runtime {
                 views::remove(root, name)?;
             }
             let old = reg.views.remove(name).expect("checked above");
+            self.auth.clear();
             if let Some(c) = old.cell {
                 need_gc = c.release_view(name, &mut deferred.retired) == 0;
                 deferred.cells.push(c);
@@ -223,11 +224,17 @@ impl Runtime {
 
     /// Whether a reader with `caller` may read view `name`'s rows and what they
     /// disclose, such as their count.
+    /// It writes no audit record, so that listings may ask it for every view; a read
+    /// asks [`authorize_view`](Self::authorize_view).
     pub fn readable_by(&self, name: &str, caller: Option<&Arc<GraphAccess>>) -> bool {
-        let reg = self.reg.lock();
-        reg.views
-            .get(name)
-            .is_some_and(|e| covers(caller, e.access.as_ref()))
+        let view = {
+            let reg = self.reg.lock();
+            match reg.views.get(name) {
+                Some(e) => e.cell.as_ref().and(e.access.clone()),
+                None => return false,
+            }
+        };
+        self.decide_cached(name, caller, view.as_ref()).0.allowed()
     }
 
     /// View `name` with its state.

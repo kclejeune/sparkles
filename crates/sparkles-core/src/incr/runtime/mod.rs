@@ -45,6 +45,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 mod attach;
+mod auth;
 mod catalog;
 mod cell;
 mod internal;
@@ -71,6 +72,9 @@ use key::*;
 use registry::*;
 use worker::*;
 
+pub use auth::{
+    AUTH_CACHE_ENTRIES, ViewAccessEvent, ViewAllow, ViewAuthStats, ViewDecision, ViewOp, decide,
+};
 pub(crate) use cell::{Cell, Slot};
 use internal::InternalCell;
 pub use internal::InternalCircuit;
@@ -217,6 +221,12 @@ pub trait Host: Send + Sync {
     fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
         crate::sparql::AggregateErrors::default()
     }
+    /// Record a decision on reading a view (spec F13 §6.1) in the audit log. The
+    /// default writes it to the `sparkles::audit` target without naming the dataset.
+    /// The runtime calls it without holding its locks.
+    fn view_access(&self, event: &ViewAccessEvent<'_>) {
+        event.log(None)
+    }
 }
 
 /// A host without access control: every principal reads every quad, and stored
@@ -272,6 +282,8 @@ pub struct Runtime {
     closed: AtomicBool,
     /// the host's epoch the attached views resolved their principals under
     host_epoch: AtomicU64,
+    /// who may read which view (spec F13 §6.1), by caller and view
+    auth: auth::AuthCache,
     /// Serializes worker store acquisition and rounds with shutdown. Reentrancy
     /// allows a worker store wrapper to close the runtime from its destructor.
     worker: ReentrantMutex<()>,
@@ -351,6 +363,7 @@ impl Runtime {
             last_checkpoint: Mutex::new(Instant::now()),
             closed: AtomicBool::new(false),
             host_epoch: AtomicU64::new(0),
+            auth: Default::default(),
             worker: ReentrantMutex::new(()),
             worker_round: AtomicBool::new(false),
             deferred_close: AtomicBool::new(false),

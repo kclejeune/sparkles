@@ -256,6 +256,10 @@ pub struct Restricted {
     pub branches: Option<Vec<String>>,
     /// the `serverModels` permission of C18 §9.6
     pub server_models: bool,
+    /// the incremental views the grant names in its endpoints as `view:{name}`, each
+    /// declassified for the grantee (spec F13 §6.1). Naming a view opens no endpoint,
+    /// so a grant that names only views reaches its dataset through no endpoint.
+    pub views: Vec<String>,
 }
 
 impl Restricted {
@@ -378,6 +382,17 @@ impl Grants {
 
     pub fn has(&self, p: ServerPerm) -> bool {
         self.server.contains(&ServerPerm::ServerAdmin) || self.server.contains(&p)
+    }
+
+    /// The views of `ds` that grants name as `view:{name}`: those of every grant on
+    /// `ds` and its branch, whatever its endpoints, since a grant reads at least.
+    pub fn views(&self, ds: &str) -> Vec<String> {
+        let (name, branch) = split_branch(ds);
+        self.restricted
+            .iter()
+            .filter(|r| glob(&r.dataset, name) && branch_covered(&r.branches, branch))
+            .flat_map(|r| r.views.iter().cloned())
+            .collect()
     }
 
     /// Whether calls on `ds` may use the server's model providers where a tool makes
@@ -602,6 +617,15 @@ impl Access {
             return None;
         }
         Some(a)
+    }
+
+    /// The views of `ds` that grants name (`view:{name}`), while every scope still
+    /// reaches `ds` at `read`.
+    pub fn views(&self, ds: &str) -> Vec<String> {
+        if self.scopes.iter().any(|s| s.level(ds).is_none()) {
+            return Vec::new();
+        }
+        self.grants.views(ds)
     }
 
     pub fn has(&self, p: ServerPerm) -> bool {
@@ -956,7 +980,17 @@ impl Principal {
         let view = if self.is_local() {
             None
         } else {
-            self.access.view(&qualified, e, self.caller())
+            self.access.view(&qualified, e, self.caller()).map(|mut v| {
+                // a principal whose reads hide graphs whatever its grants say reads
+                // no view by name either
+                let names = match &self.hidden {
+                    Some(_) => Vec::new(),
+                    None => self.access.views(&qualified),
+                };
+                let id = self.id();
+                v.views = sparkles::access::ViewGrants::new(names, Some(id.as_str()));
+                v
+            })
         };
         // reports graphs are readable only when the guard proves the view covers what
         // their builds read; an unrestricted view has nothing to prove
@@ -1209,6 +1243,7 @@ mod every_branch_tests {
             lifts: Vec::new(),
             branches: branches.map(|b| b.iter().map(|s| s.to_string()).collect()),
             server_models: false,
+            views: Vec::new(),
         }
     }
 

@@ -102,6 +102,14 @@ impl Host for ServerHost {
         }
         0
     }
+
+    fn view_access(&self, event: &sparkles::incr::ViewAccessEvent<'_>) {
+        #[cfg(feature = "auth")]
+        let dataset = Some(self.dataset.as_str());
+        #[cfg(not(feature = "auth"))]
+        let dataset = None;
+        event.log(dataset);
+    }
 }
 
 /// Start the views of a dataset the server opens, with the server's principals.
@@ -236,6 +244,8 @@ pub(super) async fn put_view(
     tracing::info!(
         target: "sparkles::audit",
         event = "view_defined",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = who.as_str()
@@ -290,6 +300,8 @@ pub(super) async fn delete_view(
     tracing::info!(
         target: "sparkles::audit",
         event = "view_deleted",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = p.id().as_str()
@@ -312,6 +324,8 @@ pub(super) async fn rebuild(
     tracing::info!(
         target: "sparkles::audit",
         event = "view_rebuilt",
+        op = "manage",
+        decision = "allow",
         dataset = ds.name.as_str(),
         view = name.as_str(),
         principal = p.id().as_str()

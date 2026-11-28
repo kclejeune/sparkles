@@ -133,6 +133,7 @@ fn update_check_graph_id_propagates_memory_error_instead_of_default_graph() {
         read: Graphs::All,
         write: default_only,
         triples: None,
+        views: Default::default(),
     };
     assert!(access.writable(None));
     assert!(!access.writable(Some(&Term::NamedNode(NamedNode::new_unchecked(&graph_iri)))));
@@ -170,6 +171,7 @@ fn update_check_graph_id_propagates_memory_error_for_compacted_vocab_graph() {
             ..Default::default()
         }),
         triples: None,
+        views: Default::default(),
     };
     let _held = hold_all_but(&ctx, 100);
     let err = super::update::check_graph_id(&access, &ctx, graph_id);
@@ -270,6 +272,7 @@ fn update_delete_and_insert_triple_templates_and_unknown_graph_id() {
             ..Default::default()
         }),
         triples: None,
+        views: Default::default(),
     };
     assert!(super::update::check_graph_id(&default_only, &ctx, Id::DEFAULT_GRAPH).is_ok());
     for (label, bad_id) in [

@@ -247,13 +247,31 @@ impl Views {
         self.rt().list(&self.ds.inner.store)
     }
 
-    /// View `name` with its state, or `None`.
     /// Whether a reader with `access` may read view `name`'s rows and what they
-    /// disclose, such as their count (`None`: every graph).
+    /// disclose, such as their count (`None`: every graph). It writes no audit
+    /// record.
     pub fn readable_by(&self, name: &str, access: Option<&Arc<GraphAccess>>) -> bool {
         self.rt().readable_by(name, access)
     }
 
+    /// Whether a reader with `access` may `op` view `name` (spec F13 §6.1), recorded
+    /// in the audit log as [`ViewAccessEvent`](crate::incr::ViewAccessEvent)
+    /// describes. Surfaces that read or watch a view for a caller ask this first.
+    pub fn authorize(
+        &self,
+        name: &str,
+        access: Option<&Arc<GraphAccess>>,
+        op: crate::incr::ViewOp,
+    ) -> Result<crate::incr::ViewDecision> {
+        self.rt().authorize_view(name, access, op)
+    }
+
+    /// The counters of the cache of decisions on who reads which view.
+    pub fn auth_stats(&self) -> crate::incr::ViewAuthStats {
+        self.rt().view_auth_stats()
+    }
+
+    /// View `name` with its state, or `None`.
     pub fn get(&self, name: &str) -> Option<ViewInfo> {
         self.rt().get(&self.ds.inner.store, name).ok()
     }

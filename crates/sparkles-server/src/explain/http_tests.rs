@@ -350,6 +350,7 @@ fn principal(name: &str, server_models: bool, graphs: Option<Vec<String>>) -> Pr
             lifts: Vec::new(),
             branches: None,
             server_models,
+            views: Vec::new(),
         }],
         ..Default::default()
     });

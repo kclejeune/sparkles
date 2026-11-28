@@ -804,6 +804,7 @@ fn service_describe_restrict_and_vector_strict_decode() {
         }),
         write: Graphs::All,
         triples: None,
+        views: Default::default(),
     });
     // Control: short graph IRI fits under 16 KiB headroom
     let mut ctx_ok = Ctx::new(store_g.snapshot());
@@ -1755,6 +1756,7 @@ fn dataset_spec_restrict_checked_is_atomic_on_named_refusal() {
         }),
         write: Graphs::All,
         triples: None,
+        views: Default::default(),
     });
     let big_g = format!("http://example.org/graph/{}", "g".repeat(16 * 1024));
     let small_g = "http://example.org/graph/small";

@@ -83,6 +83,7 @@ fn destination_only() -> QueryOptions {
             read: Graphs::All,
             write: Graphs::Only(GraphRule::new(["urn:graph:out"], &[])),
             triples: None,
+            views: Default::default(),
         })),
         ..Default::default()
     }
