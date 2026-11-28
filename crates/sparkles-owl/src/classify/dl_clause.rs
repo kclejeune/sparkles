@@ -706,6 +706,41 @@ impl Lits {
         })
     }
 
+    /// [`Lits::complementary`], telling `read` of each literal of `head` that it tests,
+    /// those of the inner search for an equality's inequality included, `None` once read
+    /// answers false.
+    pub(super) fn complementary_with(
+        &self,
+        head: &[Lit],
+        inv: impl Fn(Role) -> Option<Role> + Copy,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        for &l in head {
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            super::dl_rules::meter_probe::visit(1);
+            if !matches!(l.kind(), EQ | XL) {
+                continue;
+            }
+            let XLit::Eq(s, t) = self.view(l, inv) else {
+                continue;
+            };
+            for &m in head {
+                if !read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                if matches!(m.kind(), NE | XL) && self.view(m, inv) == XLit::Ne(s, t) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
     /// The general form of any literal, canonical as [`XLit::canon`] makes it.
     pub fn view(&self, l: Lit, inv: impl Fn(Role) -> Option<Role>) -> XLit {
         use RTerm::Fx;

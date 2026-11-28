@@ -3508,6 +3508,27 @@ impl Found {
         guard.release_to(self.held_bytes());
         true
     }
+    /// [`Found::push_admitted`] with a `make` that reads through a meter and may stop:
+    /// `make` gets the guard to read through, and a `None` from it releases the admission
+    /// down to what the conclusions here hold and answers false.
+    pub(super) fn try_push_admitted<S: Sink>(
+        &mut self,
+        side_bytes: usize,
+        make: impl FnOnce(&Guard<'_, S>) -> Option<Side>,
+        guard: &mut Guard<'_, S>,
+    ) -> bool {
+        if !self.reserve_one_admitted(1, side_bytes, guard) {
+            return false;
+        }
+        let Some(s) = make(guard) else {
+            guard.release_to(self.held_bytes());
+            return false;
+        };
+        debug_assert_eq!(side_cap_bytes(&s), side_bytes);
+        self.push(s);
+        guard.release_to(self.held_bytes());
+        true
+    }
     /// Pre-admits `Found::prods` geometric growth (including realloc overlap) plus
     /// `prod_bytes` (the forthcoming `lists` and `base` payloads built after admission)
     /// plus `prune_scratch` on top of `self.held_bytes() + extra_live` (any live caller
@@ -3738,6 +3759,9 @@ pub(super) fn tr_ctx(st: &State, root: bool) -> String {
 /// both sides are sorted without repeats, as the sides of [`fold`] and of stored clauses
 /// are, and by a search of each literal otherwise.
 fn prune(l: &mut Vec<Side>) {
+    // the pruning that no meter reads, which item 1280's harness leaves out of its count
+    #[cfg(test)]
+    let _quiet = meter_probe::quiet();
     let done = prune_with(l, &mut |_| true);
     debug_assert!(done);
 }
@@ -3750,8 +3774,27 @@ pub(super) fn prune_with<F: FnMut(usize) -> bool>(l: &mut Vec<Side>, read: &mut 
     if l.len() < 2 {
         return true;
     }
-    let sig = |x: &[Lit]| x.iter().fold(0u64, |s, l| s | l.sig_bit());
-    let strict = |x: &[Lit]| x.windows(2).all(|w| w[0] < w[1]);
+    // the signature of a side and whether its literals are sorted without repeats, which
+    // read each literal twice, once for its bit and once for its comparison with the
+    // literal before it, `None` once read answers false
+    let look = |x: &[Lit], read: &mut F| -> Option<(u64, bool)> {
+        let (mut sig, mut strict) = (0u64, true);
+        for (i, l) in x.iter().enumerate() {
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            meter_probe::visit(1);
+            sig |= l.sig_bit();
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            meter_probe::visit(1);
+            strict &= i == 0 || x[i - 1] < *l;
+        }
+        Some((sig, strict))
+    };
     // whether `a` is within `b`, `None` once read answers false
     let within =
         |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool), read: &mut F| -> Option<bool> {
@@ -3774,12 +3817,13 @@ pub(super) fn prune_with<F: FnMut(usize) -> bool>(l: &mut Vec<Side>, read: &mut 
     l.sort_by_key(|s| s.0.len() + s.1.len());
     let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
     for s in l.drain(..) {
-        // the signature and the test of order read each literal of the side twice
-        if !read(2 * (s.0.len() + s.1.len())) {
+        let Some((s0, sorted0)) = look(&s.0, read) else {
             return false;
-        }
-        let (s0, s1) = (sig(&s.0), sig(&s.1));
-        let sorted = strict(&s.0) && strict(&s.1);
+        };
+        let Some((s1, sorted1)) = look(&s.1, read) else {
+            return false;
+        };
+        let sorted = sorted0 && sorted1;
         let s = (s, s0, s1, sorted);
         let mut inside = false;
         for k in &keep {
@@ -4912,7 +4956,10 @@ pub(super) enum Bill {
 /// reads past a check count toward the next one, so that the meter never counts more than
 /// `METER_CHECK` reads between two checks, however wide one step is. A step counts its
 /// reads before it makes them, so a check that stops the meter comes before the work it
-/// counts. The count since the last check lives in the activation's sink when it has one
+/// counts. A step that scans or copies many literals counts them one at a time or in spans
+/// that end short of the next check ([`Meter::span`], [`Meter::scan`], [`Meter::extend`]),
+/// so that it also makes no more than `METER_CHECK` reads between two checks. The count
+/// since the last check lives in the activation's sink when it has one
 /// ([`Sink::meter_reads`]), so that the meters of one activation share one cadence and
 /// many short scans cannot read without a check. A meter charges its own reads to the work
 /// bound only as its [`Bill`] says, and its charge is the same whatever the cadence, a
@@ -4945,6 +4992,21 @@ fn meter_upto(at: &std::cell::Cell<usize>, n: &mut usize) -> bool {
     #[cfg(test)]
     meter_probe::check(k + room);
     true
+}
+
+/// The reads of `want` that a step may count on the count `at` and then make before it
+/// counts again: those that stay short of the next check, or one when the next read reaches
+/// it. A step that reads in such spans meets the checks where a step that counts each read
+/// before it makes it meets them, so that no more than [`METER_CHECK`] reads are made
+/// between two checks.
+#[inline]
+fn span_at(at: &std::cell::Cell<usize>, want: usize) -> usize {
+    let room = METER_CHECK.saturating_sub(at.get());
+    if room > 1 {
+        want.min(room - 1)
+    } else {
+        want.min(1)
+    }
 }
 
 impl Meter {
@@ -5010,17 +5072,19 @@ impl Meter {
         }
         #[cfg(test)]
         meter_probe::read(n);
-        if self.bill != Bill::Nothing {
-            self.unbilled.set(self.unbilled.get().saturating_add(n));
-        }
         let mut n = n;
-        while meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n) {
+        loop {
+            let before = n;
+            let hit = meter_upto(out.meter_reads().unwrap_or(&self.own), &mut n);
+            self.unbill(before - n);
+            if !hit {
+                return true;
+            }
             self.charge(out);
             if !self.verdict(out.go_on()) {
                 return false;
             }
         }
-        true
     }
 
     /// Counts `n` reads of a check that a `poll` makes, which takes the conclusions to
@@ -5031,15 +5095,86 @@ impl Meter {
         }
         #[cfg(test)]
         meter_probe::read(n);
-        if self.bill != Bill::Nothing {
-            self.unbilled.set(self.unbilled.get().saturating_add(n));
-        }
         let mut n = n;
-        while meter_upto(&self.own, &mut n) {
+        loop {
+            let before = n;
+            let hit = meter_upto(&self.own, &mut n);
+            self.unbill(before - n);
+            if !hit {
+                return true;
+            }
             let w = self.take_bill();
             if !self.verdict(poll(w)) {
                 return false;
             }
+        }
+    }
+
+    /// Adds `n` reads made up to a check, or to the end of a count, to the reads not
+    /// charged yet, so that a check that stops the meter charges none of the reads after it.
+    #[inline]
+    fn unbill(&self, n: usize) {
+        if self.bill != Bill::Nothing {
+            self.unbilled.set(self.unbilled.get().saturating_add(n));
+        }
+    }
+
+    /// Counts the next span of a step of `want` reads ([`span_at`]) and gives its length,
+    /// `None` once a check of the bounds stopped the meter. The step makes the span's reads
+    /// before it asks for the next span.
+    #[inline]
+    pub(super) fn span<S: Sink + ?Sized>(&self, want: usize, out: &S) -> Option<usize> {
+        let n = span_at(out.meter_reads().unwrap_or(&self.own), want);
+        self.read(n, out).then_some(n)
+    }
+
+    /// Visits the elements of `src` in spans, a read each, until `f` answers false:
+    /// `Some(true)` when it visited them all, `Some(false)` when `f` ended the visit, and
+    /// `None` once a check of the bounds stopped the meter.
+    #[inline]
+    pub(super) fn scan<T, S: Sink + ?Sized>(
+        &self,
+        src: &[T],
+        out: &S,
+        mut f: impl FnMut(&T) -> bool,
+    ) -> Option<bool> {
+        let mut rest = src;
+        while !rest.is_empty() {
+            let n = self.span(rest.len(), out)?;
+            let (now, later) = rest.split_at(n);
+            for x in now {
+                #[cfg(test)]
+                meter_probe::visit(1);
+                if !f(x) {
+                    return Some(false);
+                }
+            }
+            rest = later;
+        }
+        Some(true)
+    }
+
+    /// Copies `src` onto the end of `dst` in spans, a read for each element, false once a
+    /// check of the bounds stopped the meter. The caller gave `dst` its capacity.
+    #[inline]
+    pub(super) fn extend<T: Copy, S: Sink + ?Sized>(
+        &self,
+        dst: &mut Vec<T>,
+        src: &[T],
+        out: &S,
+    ) -> bool {
+        let mut rest = src;
+        while !rest.is_empty() {
+            let Some(n) = self.span(rest.len(), out) else {
+                return false;
+            };
+            let (now, later) = rest.split_at(n);
+            #[cfg(test)]
+            let had = dst.len();
+            dst.extend_from_slice(now);
+            #[cfg(test)]
+            meter_probe::visit(dst.len() - had);
+            rest = later;
         }
         true
     }
@@ -5095,6 +5230,20 @@ pub(super) mod meter_probe {
         static CHECKS: Cell<usize> = const { Cell::new(0) };
         static MOST: Cell<usize> = const { Cell::new(0) };
         static REFUSED: Cell<usize> = const { Cell::new(0) };
+        static SINCE: Cell<usize> = const { Cell::new(0) };
+        static GAP: Cell<usize> = const { Cell::new(0) };
+        static QUIET: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Leaves the reads that a step makes without a meter out of [`visit`]'s count until the
+    /// answer drops.
+    pub(in crate::classify) fn quiet() -> impl Drop {
+        struct Quiet(bool);
+        impl Drop for Quiet {
+            fn drop(&mut self) {
+                QUIET.with(|c| c.set(self.0));
+            }
+        }
+        Quiet(QUIET.with(|c| c.replace(true)))
     }
     pub(in crate::classify) fn read(n: usize) {
         READS.with(|c| c.set(c.get() + n));
@@ -5102,6 +5251,26 @@ pub(super) mod meter_probe {
     pub(in crate::classify) fn check(k: usize) {
         CHECKS.with(|c| c.set(c.get() + 1));
         MOST.with(|c| c.set(c.get().max(k)));
+        SINCE.with(|c| c.set(0));
+    }
+    /// Counts `n` reads that a metered step made at the point where it made them, the
+    /// literals it visited or the elements it copied.
+    pub(in crate::classify) fn visit(n: usize) {
+        if QUIET.with(|c| c.get()) {
+            return;
+        }
+        let k = SINCE.with(|c| {
+            let k = c.get() + n;
+            c.set(k);
+            k
+        });
+        GAP.with(|c| c.set(c.get().max(k)));
+    }
+    /// Clears and gives back the most reads that metered steps made between two checks,
+    /// as [`visit`] counted them at the point of use.
+    pub(in crate::classify) fn take_gap() -> usize {
+        SINCE.with(|c| c.set(0));
+        GAP.with(|c| c.replace(0))
     }
     pub(in crate::classify) fn refused() {
         REFUSED.with(|c| c.set(c.get() + 1));

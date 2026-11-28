@@ -1269,7 +1269,9 @@ fn for_each_partner_of(
 /// store order without allocating an intermediate partner buffer or interning missing
 /// literals, calling `f` with `(partner_body, partner_head, without_lit, fact)`. Each
 /// entry of the store's index that it reads is a read of `meter` (item 1280), and the visit
-/// is false once a check of the bounds stopped the meter.
+/// is false once a check of the bounds stopped the meter. The visit `f` reads the
+/// partner's literals that it touches through the same meter, as the `_read` helpers below
+/// do, and answers false once the meter stopped, which ends the visit false.
 fn for_each_partner_at<S: Sink>(
     ix: &Index,
     st: &State,
@@ -1277,11 +1279,10 @@ fn for_each_partner_at<S: Sink>(
     meter: &Meter,
     a: Ex,
     u: u32,
-    mut f: impl FnMut(&[Lit], &[Lit], Option<Lit>, bool),
+    mut f: impl FnMut(&[Lit], &[Lit], Option<Lit>, bool) -> bool,
 ) -> bool {
     if a == TOP {
-        f(&[], &[], None, true);
-        return true;
+        return f(&[], &[], None, true);
     }
     let Some(d) = dl(st) else {
         return true;
@@ -1295,15 +1296,179 @@ fn for_each_partner_at<S: Sink>(
             return false;
         }
         let s = &d.store.clauses[i as usize];
-        if !s.dead && !s.gbody {
-            // the visit reads the partner's literals, which may be many
-            if !meter.read(s.c.body().len() + s.c.head().len(), out) {
-                return false;
-            }
-            f(s.c.body(), s.c.head(), Some(l), s.fact);
+        if !s.dead && !s.gbody && !f(s.c.body(), s.c.head(), Some(l), s.fact) {
+            return false;
         }
     }
     true
+}
+
+/// [`restricted_parts`], reading each literal it tests through `meter` in spans, `None`
+/// once a check of the bounds stopped the meter.
+#[allow(clippy::too_many_arguments)]
+fn restricted_parts_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    lits: &super::dl_clause::Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    prem_body: &[Lit],
+    part_body: &[Lit],
+    prem_head: &[Lit],
+    part_head: &[Lit],
+    without: Option<Lit>,
+    add: Option<Lit>,
+) -> Option<bool> {
+    if !ground_restrict() || (prem_body.is_empty() && part_body.is_empty()) {
+        return Some(false);
+    }
+    let g = |l: Lit| l.kind() == XL && no_xy(lits.view(l, inv));
+    for x in [prem_body, part_body, prem_head] {
+        if !meter.scan(x, out, |&l| g(l))? {
+            return Some(false);
+        }
+    }
+    if !meter.scan(part_head, out, |&l| Some(l) == without || g(l))? {
+        return Some(false);
+    }
+    Some(add.is_none_or(g))
+}
+
+/// [`routable_unit_parts`], reading each head literal it tests through `meter` in spans,
+/// `None` once a check of the bounds stopped the meter.
+#[allow(clippy::too_many_arguments)]
+fn routable_unit_parts_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    ix: &Index,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    prem_body: &[Lit],
+    part_body: &[Lit],
+    prem_head: &[Lit],
+    part_head: &[Lit],
+    without: Option<Lit>,
+    add: Option<Lit>,
+) -> Option<bool> {
+    if !prem_body.is_empty() || !part_body.is_empty() {
+        return Some(false);
+    }
+    let Some(r) = dl(st).and_then(|x| x.root.as_deref()) else {
+        return Some(false);
+    };
+    let inv = inv_of(ix, dix(ix));
+    let mut unit_lit: Option<Lit> = None;
+    // false when the literal makes the conclusion no routable unit
+    let mut step = |l: Lit| -> bool {
+        if l.kind() != XL {
+            return false;
+        }
+        match lits.view(l, inv) {
+            XLit::Atom(TOP, _) => false,
+            XLit::Atom(BOTTOM, _) => true,
+            _ => match unit_lit {
+                None => {
+                    unit_lit = Some(l);
+                    true
+                }
+                Some(prev) => prev == l,
+            },
+        }
+    };
+    if !meter.scan(prem_head, out, |&l| step(l))?
+        || !meter.scan(part_head, out, |&l| Some(l) == without || step(l))?
+        || !add.is_none_or(&mut step)
+    {
+        return Some(false);
+    }
+    let Some(l) = unit_lit else {
+        return Some(false);
+    };
+    let (ts, n) = terms_of(lits.view(l, inv));
+    if n == 0 {
+        return Some(false);
+    }
+    for &t in &ts[..n] {
+        match t {
+            RTerm::C(u) | RTerm::Fc(_, u) => {
+                if !r.edged.contains(&u) {
+                    return Some(false);
+                }
+            }
+            RTerm::X | RTerm::Y | RTerm::Fx(_) => return Some(false),
+        }
+    }
+    Some(true)
+}
+
+/// The literals of `part_head` other than `without`, read through `meter` in spans, `None`
+/// once a check of the bounds stopped the meter.
+fn head_extra_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    part_head: &[Lit],
+    without: Option<Lit>,
+) -> Option<usize> {
+    let mut extra = 0usize;
+    meter.scan(part_head, out, |&l| {
+        extra += usize::from(Some(l) != without);
+        true
+    })?;
+    Some(extra)
+}
+
+/// [`side_parts_bytes`], reading the partner's head through `meter` in spans: `None` once a
+/// check of the bounds stopped the meter, and `Some(None)` on an overflow of the size.
+fn side_parts_bytes_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    prem: &Side,
+    part_body: &[Lit],
+    part_head: &[Lit],
+    without: Option<Lit>,
+    add: Option<Lit>,
+) -> Option<Option<usize>> {
+    let extra = head_extra_read(meter, out, part_head, without)?;
+    Some((|| {
+        let b_len = prem.0.len().checked_add(part_body.len())?;
+        let h_len = prem
+            .1
+            .len()
+            .checked_add(extra)?
+            .checked_add(usize::from(add.is_some()))?;
+        side_exact_bytes(b_len, h_len)
+    })())
+}
+
+/// [`merge_parts`], copying and counting through `meter` in spans, with the same exact
+/// capacities, `None` once a check of the bounds stopped the meter.
+fn merge_parts_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    prem: &Side,
+    part_body: &[Lit],
+    part_head: &[Lit],
+    without: Option<Lit>,
+    add: Option<Lit>,
+) -> Option<Side> {
+    let mut b = Vec::with_capacity(prem.0.len() + part_body.len());
+    if !meter.extend(&mut b, &prem.0, out) || !meter.extend(&mut b, part_body, out) {
+        return None;
+    }
+    let extra = head_extra_read(meter, out, part_head, without)?;
+    let mut h = Vec::with_capacity(prem.1.len() + extra + usize::from(add.is_some()));
+    if !meter.extend(&mut h, &prem.1, out) {
+        return None;
+    }
+    meter.scan(part_head, out, |&l| {
+        if Some(l) != without {
+            h.push(l);
+        }
+        true
+    })?;
+    if let Some(a) = add {
+        h.push(a);
+    }
+    Some((b, h))
 }
 
 /// Zero-allocation equivalent of [`restricted`] over borrowed `prem` and partner slices.
@@ -1529,6 +1694,7 @@ pub(super) fn push_partners_admitted<S: Sink>(
     let mut any_partner = false;
     if !for_each_partner_at(ix, st, out, &meter, partner_ex, u, |_, _, _, _| {
         any_partner = true;
+        true
     }) {
         mark_interrupted(st);
         return false;
@@ -1559,35 +1725,48 @@ pub(super) fn push_partners_admitted<S: Sink>(
         u,
         |pb, ph, without, fact| {
             if overflow {
-                return;
+                return true;
             }
-            let lits = &out.dl().lits;
-            if restricted_parts(lits, inv, &prem.0, pb, &prem.1, ph, without, add_lit) {
-                return;
-            }
-            if given_fact
-                && fact
-                && routable_unit_parts(ix, st, lits, &prem.0, pb, &prem.1, ph, without, add_lit)
+            let o: &Guard<'_, S> = out;
+            let lits = &o.dl().lits;
+            let r = &meter;
+            match restricted_parts_read(r, o, lits, inv, &prem.0, pb, &prem.1, ph, without, add_lit)
             {
-                if super::dl_rules::tracing() {
-                    trace_shared_parts(
-                        ix, st, lits, found.rule, &prem.0, pb, &prem.1, ph, without, add_lit,
-                    );
-                }
-                return;
+                None => return false,
+                Some(true) => return true,
+                Some(false) => {}
             }
-            let Some(bytes) = side_parts_bytes(prem, pb, ph, without, add_lit)
-                .and_then(|b| side_bytes.checked_add(b))
-            else {
+            if given_fact && fact {
+                match routable_unit_parts_read(
+                    r, o, ix, st, lits, &prem.0, pb, &prem.1, ph, without, add_lit,
+                ) {
+                    None => return false,
+                    Some(true) => {
+                        if super::dl_rules::tracing() {
+                            trace_shared_parts(
+                                ix, st, lits, found.rule, &prem.0, pb, &prem.1, ph, without,
+                                add_lit,
+                            );
+                        }
+                        return true;
+                    }
+                    Some(false) => {}
+                }
+            }
+            let Some(b) = side_parts_bytes_read(r, o, prem, pb, ph, without, add_lit) else {
+                return false;
+            };
+            let Some(bytes) = b.and_then(|b| side_bytes.checked_add(b)) else {
                 overflow = true;
-                return;
+                return true;
             };
             let Some(next_count) = add_count.checked_add(1) else {
                 overflow = true;
-                return;
+                return true;
             };
             add_count = next_count;
             side_bytes = bytes;
+            true
         },
     );
     if !go {
@@ -1614,17 +1793,29 @@ pub(super) fn push_partners_admitted<S: Sink>(
         partner_ex,
         u,
         |pb, ph, without, fact| {
-            let lits = &out.dl().lits;
-            if restricted_parts(lits, inv, &prem.0, pb, &prem.1, ph, without, add_lit) {
-                return;
-            }
-            if given_fact
-                && fact
-                && routable_unit_parts(ix, st, lits, &prem.0, pb, &prem.1, ph, without, add_lit)
+            let o: &Guard<'_, S> = out;
+            let lits = &o.dl().lits;
+            let r = &meter;
+            match restricted_parts_read(r, o, lits, inv, &prem.0, pb, &prem.1, ph, without, add_lit)
             {
-                return;
+                None => return false,
+                Some(true) => return true,
+                Some(false) => {}
             }
-            found.push(merge_parts(prem, pb, ph, without, add_lit));
+            if given_fact && fact {
+                match routable_unit_parts_read(
+                    r, o, ix, st, lits, &prem.0, pb, &prem.1, ph, without, add_lit,
+                ) {
+                    None => return false,
+                    Some(true) => return true,
+                    Some(false) => {}
+                }
+            }
+            let Some(m) = merge_parts_read(r, o, prem, pb, ph, without, add_lit) else {
+                return false;
+            };
+            found.push(m);
+            true
         },
     );
     out.release_to(found.held_bytes());
@@ -2057,20 +2248,30 @@ fn hyper_at<S: Sink>(
                     let go =
                         for_each_partner_at(ix, st, out, &meter, a, u, |pb, ph, without, _| {
                             if overflow {
-                                return;
+                                return true;
                             }
-                            let Some(sb) = side_parts_bytes(&empty_side, pb, ph, without, None)
-                                .and_then(|b| sides_bytes.checked_add(b))
-                            else {
+                            let Some(b) = side_parts_bytes_read(
+                                &meter,
+                                out,
+                                &empty_side,
+                                pb,
+                                ph,
+                                without,
+                                None,
+                            ) else {
+                                return false;
+                            };
+                            let Some(sb) = b.and_then(|b| sides_bytes.checked_add(b)) else {
                                 overflow = true;
-                                return;
+                                return true;
                             };
                             let Some(nc) = count.checked_add(1) else {
                                 overflow = true;
-                                return;
+                                return true;
                             };
                             count = nc;
                             sides_bytes = sb;
+                            true
                         });
                     if !go {
                         mark_interrupted(st);
@@ -2144,22 +2345,21 @@ fn hyper_at<S: Sink>(
                 } else {
                     let mut count = 0usize;
                     let mut v = Vec::new();
-                    let go =
-                        for_each_partner_at(ix, st, out, &meter, a, u, |_, _, _, _| count += 1)
-                            && {
-                                v.reserve_exact(count);
-                                for_each_partner_at(
-                                    ix,
-                                    st,
-                                    out,
-                                    &meter,
-                                    a,
-                                    u,
-                                    |pb, ph, without, _| {
-                                        v.push(merge_parts(&empty_side, pb, ph, without, None));
-                                    },
-                                )
+                    let go = for_each_partner_at(ix, st, out, &meter, a, u, |_, _, _, _| {
+                        count += 1;
+                        true
+                    }) && {
+                        v.reserve_exact(count);
+                        for_each_partner_at(ix, st, out, &meter, a, u, |pb, ph, without, _| {
+                            let Some(m) =
+                                merge_parts_read(&meter, out, &empty_side, pb, ph, without, None)
+                            else {
+                                return false;
                             };
+                            v.push(m);
+                            true
+                        })
+                    };
                     if !go {
                         drop((v, lists, h_lits));
                         out.release_to(found.held_bytes());
@@ -2544,9 +2744,9 @@ pub(super) fn join_body<S: Sink>(
         return true;
     }
     let inv = inv_of(ix, dix(ix));
-    // each body literal tested, each index entry read and each literal of a premise that
-    // the restriction and the copy read is a read of the meter (item 1280), and a stop is
-    // false
+    // each body literal tested, each index entry read and each literal that the restriction,
+    // the size of the head and the copy read is a read of the meter (item 1280), in spans
+    // that meet its checks as they go, and a stop is false
     let meter = Meter::checks();
     // a body has no repeats, so the residual body of each of its literals is one shorter
     let rest_b_len = c.body().len().saturating_sub(1);
@@ -2565,12 +2765,11 @@ pub(super) fn join_body<S: Sink>(
             }
             let s = &x.store.clauses[i as usize];
             if !s.dead && !s.gbody && !is_marker(&s.c) {
-                let width = s.c.body().len() + s.c.head().len() + rest_b_len + rest_h_len;
-                if !meter.read(width, &*out) {
-                    return false;
-                }
-                if super::dl_rules::join_restricted_parts(
-                    &out.dl().lits,
+                let o: &Guard<'_, S> = out;
+                match join_restricted_parts_read(
+                    &meter,
+                    o,
+                    &o.dl().lits,
                     inv,
                     s.c.body(),
                     s.c.body(),
@@ -2580,25 +2779,38 @@ pub(super) fn join_body<S: Sink>(
                     Some(l),
                     c.head(),
                 ) {
-                    continue;
+                    None => return false,
+                    Some(true) => continue,
+                    Some(false) => {}
                 }
-                let s_h_len = s.c.head().iter().filter(|&&m| m != l).count();
+                let Some(s_h_len) = head_extra_read(&meter, o, s.c.head(), Some(l)) else {
+                    return false;
+                };
                 let Some(bytes) =
                     side_exact_bytes(s.c.body().len() + rest_b_len, s_h_len + rest_h_len)
                 else {
                     out.speculative_overflow();
                     return false;
                 };
-                if !found.push_admitted(
+                let skip = |v: &mut Vec<Lit>, src: &[Lit], o: &Guard<'_, S>| {
+                    meter.scan(src, o, |&m| {
+                        if m != l {
+                            v.push(m);
+                        }
+                        true
+                    })
+                };
+                if !found.try_push_admitted(
                     bytes,
-                    || {
+                    |o| {
                         let mut b = Vec::with_capacity(s.c.body().len() + rest_b_len);
-                        b.extend_from_slice(s.c.body());
-                        b.extend(c.body().iter().copied().filter(|&m| m != l));
+                        if !meter.extend(&mut b, s.c.body(), o) {
+                            return None;
+                        }
+                        skip(&mut b, c.body(), o)?;
                         let mut h = Vec::with_capacity(s_h_len + rest_h_len);
-                        h.extend(s.c.head().iter().copied().filter(|&m| m != l));
-                        h.extend_from_slice(c.head());
-                        (b, h)
+                        skip(&mut h, s.c.head(), o)?;
+                        meter.extend(&mut h, c.head(), o).then_some((b, h))
                     },
                     out,
                 ) {
@@ -2608,6 +2820,44 @@ pub(super) fn join_body<S: Sink>(
         }
     }
     true
+}
+
+/// [`super::dl_rules::join_restricted_parts`], reading each literal it tests through
+/// `meter` in spans, `None` once a check of the bounds stopped the meter.
+#[allow(clippy::too_many_arguments)]
+fn join_restricted_parts_read<S: Sink + ?Sized>(
+    meter: &Meter,
+    out: &S,
+    lits: &super::dl_clause::Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    hb: &[Lit],
+    b1: &[Lit],
+    b2: &[Lit],
+    without_b2: Option<Lit>,
+    h1: &[Lit],
+    without_h1: Option<Lit>,
+    h2: &[Lit],
+) -> Option<bool> {
+    let g = |l: Lit| l.kind() == XL && no_xy(lits.view(l, inv));
+    match super::dl_rules::join_exempt() {
+        1 => return Some(false),
+        // whether `hb` holds a ground literal, which a scan ends at
+        2 if meter.scan(hb, out, |&l| !g(l))? => return Some(false),
+        _ => {}
+    }
+    if !ground_restrict() {
+        return Some(false);
+    }
+    let has_body = !b1.is_empty() || !meter.scan(b2, out, |&l| Some(l) == without_b2)?;
+    if !has_body {
+        return Some(false);
+    }
+    Some(
+        meter.scan(b1, out, |&l| g(l))?
+            && meter.scan(b2, out, |&l| Some(l) == without_b2 || g(l))?
+            && meter.scan(h1, out, |&l| Some(l) == without_h1 || g(l))?
+            && meter.scan(h2, out, |&l| g(l))?,
+    )
 }
 
 /// The constants of a literal, inside `f_e(u)` included.
@@ -3797,25 +4047,42 @@ fn m_note<S: Sink>(
             return false;
         }
     }
-    let cf = cf_of(ix, out);
-    if cf.is_some_and(|cf| ground_body(cf, &prem.0)) {
-        return true;
+    // M-return-cf's test of the premise's body reads each of its literals through the
+    // replay's meter
+    let meter = Meter::checks();
+    if let Some(cf) = cf_of(ix, out) {
+        let out: &S = out;
+        match ground_body_with(cf, &prem.0, &mut |n| meter.read(n, out)) {
+            None => {
+                mark_interrupted(st);
+                return false;
+            }
+            Some(true) => return true,
+            Some(false) => {}
+        }
     }
-    m_late(ix, st, l, prem, out)
+    m_late(ix, st, l, prem, &meter, out)
 }
 
 /// M-return's late premise `prem`, whose maximal literal is `l`: the clauses the root
 /// returned with l in their bodies are resolved with it in batches, each drained before the
 /// next is made, so that the many returns of a literal are never prepared whole. A batch
 /// closes after [`M_POLL`] returns or once its products hold [`RECORD_SLACK`] bytes. Each
-/// return's premise lists are read through one [`Meter`] for the whole replay and admitted
+/// return's premise lists are read through `meter`, which [`m_note`] also reads the
+/// premise's body through, one meter for the whole replay, and admitted
 /// before they are built ([`ret_found`]), and [`m_flush`] checks the run's bounds before it
 /// drains a batch. A stop, a refusal or a drain that stopped ends the replay with the store
 /// interrupted, as [`drain`] leaves it, and the function is false. The conclusions are
 /// charged as `drain` charges them, and the tables of a product that is not ground are
 /// charged by the product as they grow.
-fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S) -> bool {
-    let meter = Meter::checks();
+fn m_late<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    l: Lit,
+    prem: &Side,
+    meter: &Meter,
+    out: &mut S,
+) -> bool {
     let mut guard = Guard::new(out);
     let mut batch = Found::default();
     batch.rule = "mret";
@@ -3833,7 +4100,7 @@ fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S)
             break;
         };
         let c = guard.dl().table.get(cid).clone();
-        if !ret_found(ix, st, &c, Some((l, prem)), &meter, &mut batch, &mut guard) {
+        if !ret_found(ix, st, &c, Some((l, prem)), meter, &mut batch, &mut guard) {
             drop(batch);
             guard.release_to(0);
             mark_interrupted(st);
@@ -4694,11 +4961,12 @@ fn ret_lists<S: Sink>(
                 Some(prem) => (1, side_exact_bytes(prem.0.len(), prem.1.len())),
                 None => {
                     let (mut n, mut b) = (0usize, Some(0usize));
-                    if !ret_premises(st, l, cf, &mut read, &mut |s| {
+                    if !ret_premises(st, l, cf, &mut read, &mut |s, h_len, _| {
                         n += 1;
                         b = b.and_then(|b| {
-                            super::dl_rules::side_bytes(s, l).and_then(|x| b.checked_add(x))
+                            side_exact_bytes(s.body().len(), h_len).and_then(|x| b.checked_add(x))
                         });
+                        true
                     }) {
                         return false;
                     }
@@ -4753,15 +5021,24 @@ fn ret_lists<S: Sink>(
         }
         match is_fixed(l) {
             Some(prem) => {
-                // the copy of the fixed premise reads its literals
-                if !read(prem.0.len() + prem.1.len()) {
+                // the copy of the fixed premise reads each of its literals
+                let Some(b) = copy_read(&prem.0, &mut read) else {
                     return false;
-                }
-                lists.push(vec![prem.clone()]);
+                };
+                let Some(h) = copy_read(&prem.1, &mut read) else {
+                    return false;
+                };
+                lists.push(vec![(b, h)]);
             }
             None => {
                 let mut v = Vec::with_capacity(n);
-                if !ret_premises(st, l, cf, &mut read, &mut |s| v.push(side(s, l))) {
+                if !ret_premises(st, l, cf, &mut read, &mut |s, h_len, read| {
+                    let Some(p) = side_read(s, l, h_len, read) else {
+                        return false;
+                    };
+                    v.push(p);
+                    true
+                }) {
                     return false;
                 }
                 debug_assert_eq!(v.len(), n, "the store did not change between the reads");
@@ -4769,7 +5046,11 @@ fn ret_lists<S: Sink>(
             }
         }
     }
-    let base: Side = (Vec::new(), c.head().to_vec());
+    // the copy of the head reads each of its literals
+    let Some(head) = copy_read(c.head(), &mut read) else {
+        return false;
+    };
+    let base: Side = (Vec::new(), head);
     debug_assert_eq!(
         super::dl_rules::prod_inner_bytes(lists.capacity(), &lists, &base),
         prod_bytes
@@ -4777,18 +5058,23 @@ fn ret_lists<S: Sink>(
     found.products_read(lists, base, &mut read)
 }
 
+/// What [`ret_premises`] gives each premise it keeps to: the premise, the number of its
+/// head's literals other than the literal resolved on, and the read to copy it through.
+type KeepPremise<'s, 'k> = dyn FnMut(&'s Clause, usize, &mut dyn FnMut(usize) -> bool) -> bool + 'k;
+
 /// Visits M-return's premises on the body literal `l` of a returned clause: the context's
 /// processed clauses other than markers where l is maximal, selected ones included, and with
 /// `cf`, M-return-cf ([`MREPAIR_CF`]), only those whose body has no ground literal
-/// ([`ground_body`]). It tells `read` of each index entry, of each literal it tests, and of
-/// the literals of each premise it keeps, which the caller sizes or copies, and is false
-/// once read answers false.
+/// ([`ground_body_with`]). It tells `read` of each index entry and of each literal it tests, and
+/// gives `keep` each premise with the number of its head's literals other than l and the
+/// same `read`, for a copy that reads each literal it copies ([`side_read`]). It is false
+/// once read answers false or `keep` answers false.
 fn ret_premises<'s>(
     st: &'s State,
     l: Lit,
     cf: Option<Cf>,
     read: &mut dyn FnMut(usize) -> bool,
-    keep: &mut dyn FnMut(&'s Clause),
+    keep: &mut KeepPremise<'s, '_>,
 ) -> bool {
     let Some(d) = dl(st) else { return true };
     for &i in d.store.by_xl.get(&l).into_iter().flatten() {
@@ -4799,15 +5085,18 @@ fn ret_premises<'s>(
         if s.dead {
             continue;
         }
-        // the clause l → l, whose premise is l's own unit
-        let mut rest = false;
+        // the clause l → l, whose premise is l's own unit, and the head's literals other
+        // than l, which size the premise's side
+        let mut h_len = 0usize;
         for &m in s.c.head() {
             if !read(1) {
                 return false;
             }
-            rest |= m != l;
+            #[cfg(test)]
+            super::dl_rules::meter_probe::visit(1);
+            h_len += usize::from(m != l);
         }
-        if !rest && s.c.body() == [l] {
+        if h_len == 0 && s.c.body() == [l] {
             continue;
         }
         if let Some(cf) = cf {
@@ -4817,13 +5106,58 @@ fn ret_premises<'s>(
                 Some(false) => {}
             }
         }
-        // the caller sizes or copies the premise, which reads each of its literals
-        if !read(s.c.body().len() + s.c.head().len()) {
+        if !keep(&s.c, h_len, read) {
             return false;
         }
-        keep(&s.c);
     }
     true
+}
+
+/// [`side`] of `c` without `l`, whose head holds `h_len` literals other than l, telling
+/// `read` of each literal that the copy reads, `None` once read answers false.
+fn side_read(
+    c: &Clause,
+    l: Lit,
+    h_len: usize,
+    read: &mut dyn FnMut(usize) -> bool,
+) -> Option<Side> {
+    let mut b = Vec::with_capacity(c.body().len());
+    for &m in c.body() {
+        if !read(1) {
+            return None;
+        }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
+        b.push(m);
+    }
+    let mut h = Vec::with_capacity(h_len);
+    for &m in c.head() {
+        if !read(1) {
+            return None;
+        }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
+        if m != l {
+            h.push(m);
+        }
+    }
+    debug_assert_eq!(h.len(), h_len);
+    Some((b, h))
+}
+
+/// A copy of `src` with its exact length as capacity, telling `read` of each literal it
+/// copies, `None` once read answers false.
+fn copy_read(src: &[Lit], read: &mut dyn FnMut(usize) -> bool) -> Option<Vec<Lit>> {
+    let mut v = Vec::with_capacity(src.len());
+    for &m in src {
+        if !read(1) {
+            return None;
+        }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
+        v.push(m);
+    }
+    Some(v)
 }
 
 /// The premises of M-return's resolution on each literal of `body`, for the diagnostic,
@@ -4838,7 +5172,13 @@ fn ret_lists_with(
     let mut lists = Vec::with_capacity(body.len());
     for &l in body {
         let mut v = Vec::new();
-        if !ret_premises(st, l, cf, read, &mut |s| v.push(side(s, l))) {
+        if !ret_premises(st, l, cf, read, &mut |s, h_len, read| {
+            let Some(p) = side_read(s, l, h_len, read) else {
+                return false;
+            };
+            v.push(p);
+            true
+        }) {
             return None;
         }
         lists.push(v);
@@ -4857,12 +5197,7 @@ fn cf_of<'a, S: Sink + ?Sized>(ix: &'a Index, out: &'a S) -> Option<Cf<'a>> {
 
 /// Whether a premise's body holds a ground literal, for M-return-cf: an interned literal
 /// whose terms are constants or function terms of constants, so that it mentions neither x
-/// nor y.
-fn ground_body(cf: Cf, body: &[Lit]) -> bool {
-    ground_body_with(cf, body, &mut |_| true).expect("a read that never stops")
-}
-
-/// [`ground_body`], telling `read` of each literal it tests, `None` once read answers false.
+/// nor y. It tells `read` of each literal it tests and is `None` once read answers false.
 fn ground_body_with(
     (ix, lits): Cf,
     body: &[Lit],
@@ -4873,6 +5208,8 @@ fn ground_body_with(
         if !read(1) {
             return None;
         }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
         if l.kind() == XL && super::dl_rules::no_xy(lits.view(l, inv)) {
             return Some(true);
         }
@@ -5265,6 +5602,26 @@ impl<'a> Reads<'a> {
     }
 }
 
+/// Keeps the literals of `v` that `keep` keeps, in their order, reading each literal it
+/// tests through `rd`, `None` once a check of the bounds stopped the diagnostic.
+fn retain_read(v: &mut Vec<Lit>, rd: &mut Reads, keep: impl Fn(Lit) -> bool) -> Option<()> {
+    let mut w = 0;
+    for r in 0..v.len() {
+        if !rd.read(1) {
+            return None;
+        }
+        #[cfg(test)]
+        super::dl_rules::meter_probe::visit(1);
+        let l = v[r];
+        if keep(l) {
+            v[w] = l;
+            w += 1;
+        }
+    }
+    v.truncate(w);
+    Some(())
+}
+
 /// Whether the context holds every product of `lists` with the head `head`: each is a
 /// tautology or a live clause of the context subsumes it.
 fn products_held(
@@ -5286,45 +5643,47 @@ fn products_held(
         if !rd.read(WORK_READS) {
             return None;
         }
-        // the copy of the base's head reads each of its literals
-        if !rd.read(head.len()) {
-            return None;
-        }
+        // the copy of the base's head and of each chosen premise reads each of its literals
         let mut body: Vec<Lit> = Vec::new();
-        let mut hd: Vec<Lit> = head.to_vec();
+        let mut hd: Vec<Lit> = Vec::with_capacity(head.len());
+        let copy = |v: &mut Vec<Lit>, src: &[Lit], rd: &mut Reads| -> Option<()> {
+            for &m in src {
+                if !rd.read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                v.push(m);
+            }
+            Some(())
+        };
+        copy(&mut hd, head, rd)?;
         for (l, &i) in lists.iter().zip(&at) {
-            // each literal of a chosen premise is a read
-            for &m in &l[i].0 {
-                if !rd.read(1) {
-                    return None;
-                }
-                body.push(m);
-            }
-            for &m in &l[i].1 {
-                if !rd.read(1) {
-                    return None;
-                }
-                hd.push(m);
-            }
+            copy(&mut body, &l[i].0, rd)?;
+            copy(&mut hd, &l[i].1, rd)?;
         }
-        // the normalization of the assembled clause and its test of a tautology read each
-        // of its literals
-        if !rd.read(body.len() + hd.len()) {
-            return None;
-        }
-        body.retain(|l| !(l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()))));
-        body.retain(|&l| !is(l, TOP));
-        hd.retain(|&l| !is(l, BOTTOM));
+        // the normalization of the assembled clause reads each of its literals as it filters
+        // them, and its test of a tautology reads each literal it compares, the nested
+        // search for an equality's inequality included
+        let true_x = |l: Lit| l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()));
+        retain_read(&mut body, rd, |l| !true_x(l) && !is(l, TOP))?;
+        retain_read(&mut hd, rd, |l| !is(l, BOTTOM))?;
         body.sort_unstable();
         body.dedup();
         hd.sort_unstable();
         hd.dedup();
-        let taut = lits.complementary(&hd, inv)
-            || hd.iter().any(|&l| {
-                (l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom())))
-                    || is(l, TOP)
-                    || body.binary_search(&l).is_ok()
-            });
+        let mut taut = lits.complementary_with(&hd, inv, &mut |n| rd.read(n))?;
+        for &l in &hd {
+            if taut {
+                break;
+            }
+            if !rd.read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            super::dl_rules::meter_probe::visit(1);
+            taut = true_x(l) || is(l, TOP) || body.binary_search(&l).is_ok();
+        }
         // a fact that derive sent the root ([`super::dl_rules::derive`]) is held
         let promoted = body.is_empty() && x.promoted.contains(hd.as_slice());
         if !taut && !promoted {
@@ -6182,8 +6541,10 @@ pub(super) mod tests {
     /// Item 1280's harness: one run of a metered step on a fixture of size `n`, which
     /// answers the reads it must make at least and the checks of the bounds that its sink
     /// counted. The harness grows `n` eight times over and asserts that the meters never
-    /// count more than `most` reads between two checks, that every read the fixture needs
-    /// was counted, and that the sink saw a check for every `METER_CHECK` reads.
+    /// count more than `most` reads between two checks, that the metered steps never make
+    /// more than `METER_CHECK` reads between two checks, as they count them where they make
+    /// them ([`super::super::dl_rules::meter_probe::visit`]), that every read the fixture
+    /// needs was counted, and that the sink saw a check for every `METER_CHECK` reads.
     fn meter_grows(
         what: &str,
         most: usize,
@@ -6193,11 +6554,17 @@ pub(super) mod tests {
         let mut last = 0;
         for n in sizes {
             let _ = super::super::dl_rules::meter_probe::take();
+            let _ = super::super::dl_rules::meter_probe::take_gap();
             let (need, polls) = run(n);
             let (reads, checks, between) = super::super::dl_rules::meter_probe::take();
+            let made = super::super::dl_rules::meter_probe::take_gap();
             assert!(
                 between <= most,
                 "{what} at {n}: {between} reads between two checks, past {most}"
+            );
+            assert!(
+                made <= METER_CHECK,
+                "{what} at {n}: {made} reads made between two checks"
             );
             assert!(
                 reads >= need,
@@ -6335,7 +6702,9 @@ pub(super) mod tests {
                     out.refuse = true;
                     out.after = k;
                 }
+                let _ = super::super::dl_rules::meter_probe::take_refused();
                 m_offer(&ix, &mut st, id, &c, &mut out);
+                let refused = super::super::dl_rules::meter_probe::take_refused();
                 let sent = out
                     .sent
                     .iter()
@@ -6346,18 +6715,23 @@ pub(super) mod tests {
                     sent,
                     dl(&st).unwrap().store.interrupted,
                     out.held,
+                    refused,
                 )
             };
-            let (granted, sent, cut, _) = offer(None);
+            let (granted, sent, cut, _, _) = offer(None);
             assert!(
                 !cut && sent == 1200 && granted >= 4,
                 "mode {mode}: {granted}"
             );
             for k in 0..granted {
-                let (_, sent, cut, held) = offer(Some(k));
+                let (_, sent, cut, held, refused) = offer(Some(k));
                 assert!(
                     cut && sent < 1200 && held == 0,
                     "mode {mode} at {k}: {sent}"
+                );
+                assert_eq!(
+                    refused, 0,
+                    "mode {mode} at {k}: reads asked of a stopped meter"
                 );
             }
         }
@@ -6432,12 +6806,13 @@ pub(super) mod tests {
             meter_grows("returned body", METER_CHECK, [512, 1024, 2048, 4096], |n| {
                 (4 * n, meter_ret_found(mode, n, 1, 1))
             });
-            // one premise of n literals, sized and copied once in each pass
+            // one premise of n literals, sized from the count of its head and copied in
+            // spans of the meter's cadence
             meter_grows(
                 "one wide premise",
                 METER_CHECK,
                 [512, 1024, 2048, 4096],
-                |n| (2 * n, meter_ret_found(mode, 1, 1, n)),
+                |n| (n, meter_ret_found(mode, 1, 1, n)),
             );
             // a late premise on the last of n body literals, the first of which has no
             // premise: the search for its literal reads the body
@@ -6646,10 +7021,74 @@ pub(super) mod tests {
         };
         meter_grows(
             "stored clauses",
-            METER_CHECK + WORK_READS,
+            METER_CHECK,
             [1024, 2048, 4096, 8192],
             |n| (n, held(n)),
         );
+        // A product whose head holds `n` distinct equalities and no inequality: the test of
+        // a tautology searches the head for each equality's inequality, `n * n` reads that
+        // meet the checks as they go.
+        let eqs = |n: usize, stop: Option<usize>| {
+            let run = DlRun::new(false, Default::default());
+            let ix = probe_ix(Sig::new()).0;
+            let mut st = State::default();
+            let _ = ds(&mut st);
+            let head: Vec<Lit> = (1..=n as Ex)
+                .map(|f| {
+                    match Lit::eq(
+                        super::super::dl_clause::Term::Fun(f),
+                        super::super::dl_clause::Term::Y,
+                    ) {
+                        Made::Lit(l) => l,
+                        _ => panic!("an equality"),
+                    }
+                })
+                .collect();
+            let lists = [vec![unit()]];
+            let polls = std::cell::Cell::new(0);
+            let mut poll = |_| {
+                polls.set(polls.get() + 1);
+                stop.is_none_or(|k| polls.get() <= k)
+            };
+            let mut rd = Reads::new(&mut poll);
+            let got = products_held(&ix, &st, &lists, &head, &run.lits, &mut rd);
+            if got.is_some() {
+                assert!(rd.end());
+            }
+            (got, polls.get())
+        };
+        meter_grows("equality head", METER_CHECK, [256, 512, 1024, 2048], |n| {
+            let (got, polls) = eqs(n, None);
+            assert_eq!(
+                got,
+                Some(false),
+                "{n}: no tautology and nothing subsumes it"
+            );
+            (n * n, polls)
+        });
+        // a stop at the first check inside the test of a tautology ends it there
+        let n = 4096;
+        // a choice, the copy of the head and its normalization come before the test
+        let before = WORK_READS + 2 * n;
+        let k = before / METER_CHECK;
+        use super::super::dl_rules::meter_probe;
+        let _ = meter_probe::take();
+        let _ = meter_probe::take_gap();
+        let (got, polls) = eqs(n, Some(k));
+        let refused = meter_probe::take_refused();
+        let (reads, _, most) = meter_probe::take();
+        let made = meter_probe::take_gap();
+        assert_eq!(got, None, "the stop ends the test");
+        assert_eq!(polls, k + 1, "no check after the stop");
+        assert_eq!(
+            reads,
+            (k + 1) * METER_CHECK,
+            "the stop falls inside the test"
+        );
+        assert!(reads > before && reads < before + n * n);
+        assert_eq!(most, METER_CHECK);
+        assert!(made <= METER_CHECK, "{made} reads made between two checks");
+        assert_eq!(refused, 0, "reads asked of a stopped meter");
     }
 
     #[test]
@@ -6711,6 +7150,217 @@ pub(super) mod tests {
             assert!(found.one_sides().is_empty());
             (n, out.polls.get())
         });
+    }
+
+    /// A context in which the literal `A(u)` has one stored premise `K_0(x) ∧ ... ∧
+    /// K_{n-1}(x) → A(u)`, and the ontology clause D ∧ A → H, with the classes A and D, the
+    /// constant u and the literal A(u).
+    fn wide_partner(n: usize) -> (Index, DlRun, State, Ex, Ex, u32, Lit) {
+        let mut sig = Sig::new();
+        let [a, d, h] = ["A", "D", "H"].map(|n| sig.class(n));
+        let ks: Vec<Ex> = (0..n).map(|i| sig.class(&format!("K{i}"))).collect();
+        let u = sig.ind("u");
+        sig.dl.clauses.push((vec![d, a], vec![h]));
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let ga = glit(&run, &ix, a, u);
+        let mut st = State::default();
+        let body: Vec<Lit> = ks.iter().map(|&k| Lit::x(k)).collect();
+        let id = ds(&mut st).store.clauses.len() as u32;
+        assert!(ds(&mut st).store.add(Clause::new(body, vec![ga])).is_some());
+        ds(&mut st).store.by_xl.entry(ga).or_default().push(id);
+        let RTerm::C(cu) = c(u, &ix) else {
+            unreachable!()
+        };
+        (ix, run, st, a, d, cu, ga)
+    }
+
+    #[test]
+    fn a_wide_step_makes_no_more_than_a_check_s_reads_between_two_checks() {
+        // Each step here reads one premise or head of n literals, which it scans or copies
+        // in spans of the meter's cadence: the harness counts the reads where the step makes
+        // them, so that a step that counted its reads before it made them all would fail.
+        let prem: Side = (vec![Lit::x(0)], vec![]);
+        // the pruning of two sides of n literals, through a meter on a sink
+        let run = DlRun::new(false, Default::default());
+        meter_grows(
+            "a wide side's pruning",
+            METER_CHECK,
+            [1024, 2048, 4096, 8192],
+            |n| {
+                let side =
+                    |o: u32| -> Side { ((0..n as u32).map(|i| Lit::x(o + i)).collect(), vec![]) };
+                let mut l = vec![side(0), side(1 << 20)];
+                let out = Stops::new(&run);
+                let meter = Meter::checks();
+                assert!(super::super::dl_rules::prune_with(&mut l, &mut |k| meter.read(k, &out)));
+                assert_eq!(l.len(), 2);
+                (4 * n, out.polls.get())
+            },
+        );
+        // Hyper's partner of n body literals, through the push of partners and through Hyper
+        meter_grows(
+            "a wide partner pushed",
+            METER_CHECK,
+            [1024, 2048, 4096, 8192],
+            |n| {
+                let (ix, run, mut st, a, _, u, _) = wide_partner(n);
+                let mut out = Stops::new(&run);
+                let mut found = Found::default();
+                {
+                    let mut g = Guard::new(&mut out);
+                    assert!(push_partners_admitted(
+                        &ix, &mut st, &mut g, a, u, None, false, &prem, &mut found,
+                    ));
+                    assert_eq!(g.bytes(), found.held_bytes());
+                }
+                assert_eq!(found.one_sides().len(), 1);
+                (n, out.polls.get())
+            },
+        );
+        meter_grows(
+            "a wide partner of Hyper",
+            METER_CHECK,
+            [1024, 2048, 4096, 8192],
+            |n| {
+                let (ix, run, mut st, _, d, u, _) = wide_partner(n);
+                let mut out = Stops::new(&run);
+                let mut found = Found::default();
+                {
+                    let mut g = Guard::new(&mut out);
+                    assert!(hyper_at(
+                        &ix, &mut st, &mut g, d, u, &prem, &mut found, false
+                    ));
+                    assert_eq!(g.bytes(), found.held_bytes());
+                }
+                assert_eq!(found.products_len(), 1);
+                (n, out.polls.get())
+            },
+        );
+        // Join's premise of n body literals on the ground literal of a given clause
+        let join = |n: usize, after: Option<usize>| {
+            let mut sig = Sig::new();
+            let [b, z] = ["B", "Z"].map(|n| sig.class(n));
+            let ks: Vec<Ex> = (0..n).map(|i| sig.class(&format!("K{i}"))).collect();
+            let u = sig.ind("u");
+            let (ix, _) = probe_ix(sig);
+            let run = DlRun::new(false, Default::default());
+            let gb = glit(&run, &ix, b, u);
+            let mut st = State::default();
+            let body: Vec<Lit> = ks.iter().map(|&k| Lit::x(k)).collect();
+            let id = ds(&mut st).store.clauses.len() as u32;
+            assert!(ds(&mut st).store.add(Clause::new(body, vec![gb])).is_some());
+            ds(&mut st).store.by_xl.entry(gb).or_default().push(id);
+            let target = Clause::new(vec![gb], vec![Lit::x(z)]);
+            let mut out = Stops::new(&run);
+            if let Some(k) = after {
+                out.refuse = true;
+                out.after = k;
+            }
+            let mut found = Found::default();
+            let _ = super::super::dl_rules::meter_probe::take_refused();
+            let go = {
+                let mut g = Guard::new(&mut out);
+                let go = join_body(&ix, &st, &target, &mut found, &mut g);
+                assert_eq!(g.bytes(), found.held_bytes(), "held with the guard");
+                go
+            };
+            let refused = super::super::dl_rules::meter_probe::take_refused();
+            (
+                go,
+                found.one_sides().len(),
+                out.polls.get(),
+                out.held,
+                refused,
+            )
+        };
+        meter_grows(
+            "a wide premise of Join",
+            METER_CHECK,
+            [1024, 2048, 4096, 8192],
+            |n| {
+                let (go, sides, polls, held, _) = join(n, None);
+                assert!(go && sides == 1 && held == 0, "{n}");
+                (n, polls)
+            },
+        );
+        // a refusal at each check, the copy's among them, leaves nothing held or pushed
+        let n = 3 * METER_CHECK;
+        let (_, _, granted, _, _) = join(n, None);
+        assert!(granted >= 3, "{granted}");
+        for k in 0..granted {
+            let (go, sides, _, held, refused) = join(n, Some(k));
+            assert!(
+                !go && sides == 0 && held == 0 && refused == 0,
+                "Join at {k}"
+            );
+        }
+        for mode in MODES {
+            // a returned clause whose head holds n literals, which the product's base copies
+            meter_grows(
+                "a wide returned head",
+                METER_CHECK,
+                [1024, 2048, 4096, 8192],
+                |n| {
+                    let mut sig = Sig::new();
+                    let [a, k] = ["A", "K"].map(|n| sig.class(n));
+                    let hs: Vec<Ex> = (0..n).map(|i| sig.class(&format!("H{i}"))).collect();
+                    let u = sig.ind("u");
+                    let (ix, _) = probe_ix(sig);
+                    let mut run = DlRun::new(false, Default::default());
+                    run.mrepair = mode;
+                    let ga = glit(&run, &ix, a, u);
+                    let head: Vec<Lit> = hs.iter().map(|&h| glit(&run, &ix, h, u)).collect();
+                    let mut st = State::default();
+                    let id = ds(&mut st).store.clauses.len() as u32;
+                    assert!(
+                        ds(&mut st)
+                            .store
+                            .add(Clause::new(vec![Lit::x(k)], vec![ga]))
+                            .is_some()
+                    );
+                    ds(&mut st).store.by_xl.entry(ga).or_default().push(id);
+                    let c = Clause::new(vec![ga], head);
+                    let mut out = Stops::new(&run);
+                    let mut found = Found::default();
+                    let meter = Meter::checks();
+                    {
+                        let mut g = Guard::new(&mut out);
+                        assert!(ret_found(&ix, &st, &c, None, &meter, &mut found, &mut g));
+                    }
+                    assert_eq!(found.products_len(), 1, "mode {mode}");
+                    (n, out.polls.get())
+                },
+            );
+            if mode & MREPAIR_CF == 0 {
+                continue;
+            }
+            // M-send's late premise with a body of n literals, none ground, which
+            // M-return-cf tests before the replay
+            meter_grows(
+                "a wide late premise",
+                METER_CHECK,
+                [1024, 2048, 4096, 8192],
+                |n| {
+                    let mut sig = Sig::new();
+                    let [a, k] = ["A", "K"].map(|n| sig.class(n));
+                    let u = sig.ind("u");
+                    let (ix, root) = probe_ix(sig);
+                    let mut run = DlRun::new(false, Default::default());
+                    run.mrepair = mode;
+                    let ga = glit(&run, &ix, a, u);
+                    let mut st = State::default();
+                    let _ = ds(&mut st);
+                    let late: Side = ((1..=n as Ex).map(Lit::x).collect(), vec![]);
+                    let mut out = Stops::new(&run);
+                    assert!(
+                        m_note(&ix, root, k, &mut st, ga, &late, &mut out),
+                        "mode {mode}"
+                    );
+                    (n, out.polls.get())
+                },
+            );
+        }
     }
 
     /// A context in which the literal `A(u)` has `n` stored premises `K_i(x) → A(u)`, none a
@@ -7228,7 +7878,10 @@ pub(super) mod tests {
             // product's tables as they grow, and releases everything.
             let stored = dl(&st).unwrap().store.clauses.len();
             let mut out = Stops::new(&run);
-            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert_eq!(
                 dl(&st).unwrap().store.clauses.len() - stored,
                 16,
@@ -7245,7 +7898,10 @@ pub(super) mod tests {
             let stored = dl(&st).unwrap().store.clauses.len();
             let mut out = Stops::new(&run);
             out.budget = Some(held_one - 1);
-            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                !m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert_eq!(
                 dl(&st).unwrap().store.clauses.len(),
                 stored,
@@ -7259,7 +7915,10 @@ pub(super) mod tests {
             let (ix, run, mut st, la, prem) = setup(&[0, 4, 4], true);
             let stored = dl(&st).unwrap().store.clauses.len();
             let mut out = Stops::new(&run);
-            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert_eq!(
                 dl(&st).unwrap().store.clauses.len() - stored,
                 32,
@@ -7278,13 +7937,19 @@ pub(super) mod tests {
             let sizes = 3 * std::mem::size_of::<usize>();
             let (ix, run, mut st, la, prem) = setup(&[0, 4, 0], false);
             let mut out = Stops::new(&run);
-            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert_eq!(out.asked, sizes, "mode {mode}");
             assert_eq!(out.polls.get(), 2, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
             let mut out = Stops::new(&run);
             out.refuse = true;
-            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                !m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert_eq!(out.asked, sizes, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
             assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
@@ -7295,20 +7960,65 @@ pub(super) mod tests {
             let stored = dl(&st).unwrap().store.clauses.len();
             let mut out = Stops::new(&run);
             out.budget = Some(4 << 20);
-            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(
+                !m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
             assert!(!out.overflow, "mode {mode}");
             assert!(out.peak < 16 << 20, "mode {mode}: {}", out.peak);
             assert_eq!(out.held, 0, "mode {mode}");
             assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
             assert_eq!(dl(&st).unwrap().store.clauses.len(), stored, "mode {mode}");
 
-            // 6. Interruption during drain releases the batch's admission.
+            // 6. Interruption during drain releases the batch's admission. The checks of
+            // the preparation, the sizes' buffer and the product's admission, and m_flush's
+            // check before the drain are granted, and the next check refuses, which is
+            // fold's first charge inside the drain.
             let (ix, run, mut st, la, prem) = setup(&[0, 16, 17], false);
+            let c0 = run
+                .table
+                .get(rst(&mut st, &Stops::new(&run)).mr().rets[&la][0])
+                .clone();
+            let (prep_polls, prep_asked) = {
+                let mut probe = Found::default();
+                let mut o = Stops::new(&run);
+                {
+                    let mut g = Guard::new(&mut o);
+                    let meter = Meter::checks();
+                    assert!(
+                        ret_found(&ix, &st, &c0, Some((la, &prem)), &meter, &mut probe, &mut g),
+                        "mode {mode}"
+                    );
+                    assert_eq!(probe.products_len(), 1, "mode {mode}");
+                    drop(probe);
+                    g.release_to(0);
+                }
+                (o.polls.get(), o.asked)
+            };
+            let granted = prep_polls + 1;
+            let stored = dl(&st).unwrap().store.clauses.len();
             let mut out = Stops::new(&run);
             out.refuse = true;
-            // grant the lists' admission and m_flush's check, refuse fold's first charge
-            out.after = 2;
-            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            out.after = granted;
+            assert!(
+                !m_late(&ix, &mut st, la, &prem, &Meter::checks(), &mut out),
+                "mode {mode}"
+            );
+            assert_eq!(
+                out.polls.get(),
+                granted + 1,
+                "mode {mode}: the refused check follows the flush's"
+            );
+            assert!(
+                out.asked > prep_asked,
+                "mode {mode}: the drain asked for memory, {} against {prep_asked}",
+                out.asked
+            );
+            assert_eq!(
+                dl(&st).unwrap().store.clauses.len(),
+                stored,
+                "mode {mode}: the refused charge comes before the first conclusion"
+            );
             assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
             assert_eq!(
                 out.held, 0,
@@ -8574,7 +9284,8 @@ pub(super) mod tests {
         //    must exclude the gbody-cut clause.
         let mut ga_count = 0usize;
         for_each_partner_at(&ix, &st, &out, &Meter::checks(), a, u, |_, _, _, _| {
-            ga_count += 1
+            ga_count += 1;
+            true
         });
         assert_eq!(
             ga_count, 0,
@@ -8582,7 +9293,8 @@ pub(super) mod tests {
         );
         let mut gb_count = 0usize;
         for_each_partner_at(&ix, &st, &out, &Meter::checks(), b, u, |_, _, _, _| {
-            gb_count += 1
+            gb_count += 1;
+            true
         });
         assert_eq!(
             gb_count, 1,

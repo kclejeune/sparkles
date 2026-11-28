@@ -18,8 +18,10 @@ work. The new reads charge nothing to the work bound, so the counts of derived c
 not change. A returned clause admits the buffer of its lists' sizes before it makes it and its
 premise lists exactly before it builds them, and its product that is not ground charges its
 own tables as they grow in place of the upfront bound, which could exceed them more than a
-thousand times. A test harness grows each input dimension of the metered steps and asserts at
-most 1,024 reads between two checks. Item 1319 follows the scans that the meter does not
+thousand times. Scans and copies of a wide premise, side or head read in spans that meet the
+checks as they go, and the diagnostic's search of a head for an equality's inequality reads
+through its meter. A test harness grows each input dimension of the metered steps and asserts
+at most 1,024 reads counted and at most 1,024 reads made between two checks. Item 1319 follows the scans that the meter does not
 read.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
