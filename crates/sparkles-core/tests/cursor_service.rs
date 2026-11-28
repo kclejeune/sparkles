@@ -1872,12 +1872,14 @@ fn eager_service_charges_json_staging_and_streams_long_whitespace_prefix() {
 
     // 1. Long leading whitespace prefix before a small head-first response succeeds under
     // a tight eager budget.
-    let mut ws_parts: Vec<Part> = (0..16).map(|_| Part::Bytes(vec![b' '; 16 << 10])).collect();
-    ws_parts.push(Part::Bytes(
-        br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#
-            .to_vec(),
-    ));
-    let ep_ws = Endpoint::start(Arc::new(move || (200, ws_parts.clone())));
+    let ep_ws = Endpoint::start(Arc::new(|| {
+        let mut ws_parts: Vec<Part> = (0..16).map(|_| Part::Bytes(vec![b' '; 16 << 10])).collect();
+        ws_parts.push(Part::Bytes(
+            br#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:ok"}}]}}"#
+                .to_vec(),
+        ));
+        (200, ws_parts)
+    }));
     let q_ws = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep_ws.url);
     let rows = eager(&snap, &q_ws, &tight).unwrap();
     assert_eq!(rows.len(), 1);
