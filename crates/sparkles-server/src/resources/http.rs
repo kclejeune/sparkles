@@ -48,6 +48,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(crate::linked_data::http::recipes),
         )
         .route("/$/resources/{id}/install/{ds}", post(install))
+        .merge(super::manager::routes())
 }
 
 impl From<Error> for ApiError {
@@ -74,7 +75,7 @@ fn bad(m: impl Into<String>) -> ApiError {
     err_code(StatusCode::BAD_REQUEST, "bad-resource", m)
 }
 
-fn writable(st: &AppState) -> ApiResult<()> {
+pub(crate) fn writable(st: &AppState) -> ApiResult<()> {
     if st.read_only {
         return Err(err_code(
             StatusCode::FORBIDDEN,
@@ -103,6 +104,7 @@ const RESOURCE_MEMBERS: &[&str] = &[
     "namespaces",
     "graphs",
     "dataset",
+    "iriPolicy",
 ];
 const VERSION_MEMBERS: &[&str] = &[
     "version",
@@ -514,7 +516,7 @@ fn names_version(iri: &str, version: &str) -> bool {
 }
 
 /// Where a graph's header disagrees with the record of the current version.
-pub(super) fn disagreements(r: &Resource, h: &BTreeMap<&str, Option<String>>) -> Vec<String> {
+pub(crate) fn disagreements(r: &Resource, h: &BTreeMap<&str, Option<String>>) -> Vec<String> {
     let mut out = Vec::new();
     let cur = r.current();
     if let Some(cur) = cur {
@@ -591,6 +593,13 @@ async fn header_read(
         }
         let mut graphs = Vec::new();
         for l in &r.input.graphs {
+            if !p.can_at(
+                &l.dataset,
+                crate::auth::Endpoint::Query,
+                crate::auth::Level::Read,
+            ) {
+                continue;
+            }
             let ds = match crate::http::dataset(&st, &l.dataset) {
                 Ok(ds) => ds,
                 Err(_) => {
@@ -657,7 +666,7 @@ async fn header_read(
 
 /// The namespaces of a vocabulary and of the vocabularies its current version imports,
 /// transitively. Each pinned version is expanded once, so shared imports cost one visit.
-pub(super) fn bundle(c: &CatalogFile, r: &Resource) -> Vec<(String, String, String)> {
+pub(crate) fn bundle(c: &CatalogFile, r: &Resource) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut resources = BTreeSet::new();
     let mut pins = BTreeSet::new();
@@ -751,7 +760,7 @@ fn plan_install(st: &AppState, target: &crate::state::Dataset, id: &str) -> ApiR
 
 /// Test hooks that run once between an install's plan and its write, by dataset.
 #[cfg(test)]
-pub(super) static BEFORE_INSTALL_WRITE: parking_lot::Mutex<
+pub(crate) static BEFORE_INSTALL_WRITE: parking_lot::Mutex<
     BTreeMap<String, Box<dyn FnOnce() + Send>>,
 > = parking_lot::Mutex::new(BTreeMap::new());
 

@@ -12,9 +12,16 @@
 //! the NOTICE, [`rdf`] describes the catalog in DCAT 3, PROV-O, SPDX, VANN and VoID, and
 //! [`http`] serves the routes.
 
+#[cfg(feature = "auth")]
+pub(crate) mod cli;
+pub(crate) mod harvest;
 pub mod http;
 pub mod license;
+pub(crate) mod load;
+pub(crate) mod manager;
+pub(crate) mod mint;
 pub mod rdf;
+pub(crate) mod recipe;
 pub mod report;
 #[cfg(test)]
 mod tests;
@@ -207,6 +214,8 @@ pub struct ResourceInput {
     /// the server dataset a dataset resource describes
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iri_policy: Option<mint::Policy>,
 }
 
 /// A resource as the catalog keeps it.
@@ -490,6 +499,9 @@ pub fn check_input(r: &ResourceInput) -> Result<()> {
                 n.prefix, n.iri
             )));
         }
+    }
+    if let Some(policy) = &r.iri_policy {
+        mint::validate(r, policy)?;
     }
     let mut locations = BTreeSet::new();
     for l in &r.graphs {
@@ -792,6 +804,8 @@ fn uses_format_2(c: &CatalogFile) -> bool {
 
 /// The catalog of a server: its file, or memory for a server without a data directory.
 pub struct Resources {
+    loads: load::MemoryManifests,
+    pub(crate) stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     path: Option<PathBuf>,
     /// the catalog in memory without a file; with one, the lock of read-modify-write
     mem: Mutex<CatalogFile>,
@@ -800,7 +814,14 @@ pub struct Resources {
 impl Resources {
     /// The catalog of a data directory, or one in memory when `dir` is empty.
     pub fn in_dir(dir: &Path) -> Resources {
+        if !dir.as_os_str().is_empty()
+            && let Err(e) = load::clean_staging(dir)
+        {
+            tracing::warn!(target: "sparkles::resources", error = %e, "cannot clean source load staging");
+        }
         Resources {
+            loads: Default::default(),
+            stop: Default::default(),
             path: (!dir.as_os_str().is_empty()).then(|| dir.join(FILE)),
             mem: Mutex::new(CatalogFile::default()),
         }
@@ -835,6 +856,18 @@ impl Resources {
             .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
         let found = sparkles::formats::check_settings(FILE, &raw)
             .map_err(|e| Error::Unreadable(format!("{}: {e}", path.display())))?;
+        if found < 3
+            && raw["resources"].as_array().is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|resource| resource.get("iriPolicy").is_some())
+            })
+        {
+            return Err(Error::Unreadable(format!(
+                "{}: iriPolicy requires format 3",
+                path.display()
+            )));
+        }
         if found == 1 && raw_has_format_2_members(&raw) {
             return Err(Error::Unreadable(format!(
                 "{}: versionIri and snapshot require format 2",
@@ -869,7 +902,13 @@ impl Resources {
         let out = f(&mut c)?;
         c.resources.sort_by(|a, b| a.id.cmp(&b.id));
         check(&c)?;
-        let format = if uses_format_2(&c) { 2 } else { 1 };
+        let format = if c.resources.iter().any(|r| r.input.iri_policy.is_some()) {
+            3
+        } else if uses_format_2(&c) {
+            2
+        } else {
+            1
+        };
         let bytes = sparkles::formats::settings_to_vec_at(FILE, &c, format)
             .map_err(|e| Error::Io(e.to_string()))?;
         if bytes.len() > MAX_FILE_BYTES {

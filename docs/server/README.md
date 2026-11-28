@@ -46,6 +46,22 @@ The server maintains a catalog of external sources, vocabularies, and datasets i
 * **Licence tracking and obligation propagation.** SPDX expressions classify into open, attribution, share-alike, and restricted tiers, with missing licences forbidding redistribution. Obligations propagate through imports and graph sources to each dataset graph, generating a `NOTICE` file. Restricted terms require recorded administrator acceptance. The licence gate warns by default and refuses only under `serve --license-policy enforce`. Export and publication routes do not consult the licence gate.
 * **Vocabulary namespaces.** Each vocabulary owns its namespaces and prefixes uniquely within the server. Vocabulary headers can be read from dataset graphs and compared against the catalog, and one request installs a vocabulary's prefixes and imported prefixes into a dataset.
 
+Open **Datasets → Sources** to register a URL with a checksum, assemble a recipe
+and load its named graphs into an existing or new dataset. The same page can install
+pinned vocabulary bundles and reload graphs from a prior source-load commit. If a
+dataset was created before a load failed, the dataset remains available for retry.
+The [source manager API](../API.md#source-manager), `sparkles source --help` and the
+`catalog_*` MCP tools use the same source pins and authorization. Start with the
+[curated resource records](../examples/resource-catalog/README.md) or preview
+public catalog metadata with `sparkles source harvest`.
+
+Source loads run in the request using the outbound destination policy. Each selected
+file is staged under the data directory with free-space checks. A load replaces its
+listed graphs after all checksums match. The manifest records the pins and graph
+assignments under the load commit. Keep the commit's metadata and the pinned catalog
+records for reloads. Existing prefixes must agree with the bundle, and every new
+binding is subject to settings locks and the prefix limit.
+
 ### Linked-data publishing
 
 The linked-data front end resolves IRIs under hosted vocabulary namespaces and configured version IRIs from the resource catalog ([API.md](../API.md#linked-data-publishing), [C32](../specs/C32-linked-data-publishing/README.md)).

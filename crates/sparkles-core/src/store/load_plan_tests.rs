@@ -2570,18 +2570,28 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
     let source = tmp.path().join("load.nt");
     std::fs::write(&source, ntriples(0, E + 1)).unwrap();
     let load = format!("LOAD <file://{}>", source.display());
-    for (name, persistent, threshold, retire_fails, bulk) in [
-        ("bulk", true, E, false, true),
-        ("wal", true, 1_000, false, false),
-        ("memory", false, 1_000, false, false),
-        ("bulk, retirement fails", true, E, true, true),
-        ("wal, retirement fails", true, 1_000, true, false),
-    ] {
+    for (replacement, (name, persistent, threshold, retire_fails, bulk)) in
+        [false, true].into_iter().flat_map(|replacement| {
+            [
+                ("bulk", true, E, false, true),
+                ("wal", true, 1_000, false, false),
+                ("memory", false, 1_000, false, false),
+                ("memory bulk", false, E, false, true),
+                ("memory retirement fails", false, 1_000, true, false),
+                ("bulk, retirement fails", true, E, true, true),
+                ("wal, retirement fails", true, 1_000, true, false),
+            ]
+            .into_iter()
+            .map(move |case| (replacement, case))
+        })
+    {
         let opts = StoreOptions {
             bulk_threshold: threshold,
             ..StoreOptions::default()
         };
-        let root = tmp.path().join(name.replace([',', ' '], "-"));
+        let root = tmp
+            .path()
+            .join(format!("{replacement}-{}", name.replace([',', ' '], "-")));
         let s = if persistent {
             Store::open(&root, opts).unwrap()
         } else {
@@ -2608,7 +2618,20 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
         };
         let mut q = QueryOptions::default();
         q.write.cancel = Some(cancel);
-        let refused = update_with_commit_hook(&s, &load, &q, &intent);
+        let refused = if replacement {
+            let src = Source::from_path(&source, None).unwrap();
+            s.replace_with_intent(
+                ReplaceTarget::Default,
+                &[src],
+                CommitKind::Load,
+                &q.write,
+                &intent,
+                Default::default(),
+            )
+            .map(|_| ())
+        } else {
+            update_with_commit_hook(&s, &load, &q, &intent).map(|_| ())
+        };
         assert!(
             matches!(refused, Err(Error::Cancelled)),
             "{name}: {refused:?}"
@@ -2626,7 +2649,7 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
             );
             assert_eq!(generations(&root), before, "{name}");
         }
-        if bulk {
+        if bulk && persistent {
             // the next measurement walks the directory without the candidate
             let cached = s.quota.used();
             s.quota.invalidate();
@@ -2651,5 +2674,73 @@ fn a_refusal_after_the_commit_intent_retires_it_on_every_path() {
             assert_eq!(s.snapshot().commit, head + 1, "{name}");
             assert_eq!(s.snapshot().len(), 2, "{name}");
         }
+    }
+}
+
+#[test]
+fn replacement_intent_crash_at_persist_recovers_without_a_manifest_or_new_head() {
+    use crate::guard::{CommitIntent, WriteOptions};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::PathBuf;
+
+    struct Intent(PathBuf);
+    impl CommitIntent for Intent {
+        fn persist(&self, seq: u64) -> crate::Result<()> {
+            Ok(crate::fsutil::write_atomic(
+                &self.0.join(format!("{seq}.json")),
+                b"intent",
+            )?)
+        }
+
+        fn retire(&self, _: u64) -> crate::Result<()> {
+            panic!("a crash must leave the intent for recovery")
+        }
+    }
+
+    for threshold in [E, 1_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                bulk_threshold: threshold,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .load(&[Source::from_bytes(
+                ntriples(0, 1),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let head = store.head_commit().seq;
+        let manifests = dir.path().join(crate::store::source_manifests::DIRECTORY);
+        std::fs::create_dir(&manifests).unwrap();
+        let file = dir.path().join("source.nt");
+        std::fs::write(&file, ntriples(1, E + 1)).unwrap();
+        let source = Source::from_path(&file, None).unwrap();
+        store.set_failpoint(
+            "commit-intent-persisted",
+            Some(Arc::new(|_| panic!("crash"))),
+        );
+        let crash = catch_unwind(AssertUnwindSafe(|| {
+            store.replace_with_intent(
+                ReplaceTarget::Default,
+                &[source],
+                CommitKind::Load,
+                &WriteOptions::default(),
+                &Intent(manifests.clone()),
+                Default::default(),
+            )
+        }));
+        assert!(crash.is_err());
+        let orphan = manifests.join(format!("{}.json", head + 1));
+        assert!(orphan.exists());
+        drop(store);
+        let reopened = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        assert_eq!(reopened.head_commit().seq, head);
+        assert_eq!(reopened.snapshot().len(), 1);
+        assert!(!orphan.exists());
     }
 }

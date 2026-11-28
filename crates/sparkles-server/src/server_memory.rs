@@ -309,7 +309,15 @@ fn data_write(
         return false;
     }
     match route {
-        Some("/{ds}/upload" | "/{ds}/patch" | "/{ds}/data" | "/{ds}/{*graph}") => true,
+        Some(
+            "/{ds}/upload"
+            | "/{ds}/patch"
+            | "/{ds}/data"
+            | "/{ds}/{*graph}"
+            | "/$/sources/{ds}/load"
+            | "/$/sources/{ds}/manifests/{commit}/reload"
+            | "/$/resources/{id}/versions/{version}/bundle/{ds}",
+        ) => true,
         Some("/{ds}") => {
             let has = |k: &str| {
                 form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).any(|(a, _)| a == k)

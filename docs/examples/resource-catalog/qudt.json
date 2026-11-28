@@ -1,0 +1,26 @@
+{
+  "id": "qudt",
+  "kind": "vocabulary",
+  "title": "Quantities, Units, Dimensions and Types",
+  "namespaces": [
+    {
+      "prefix": "qudt",
+      "iri": "http://qudt.org/schema/qudt/"
+    }
+  ],
+  "versions": [
+    {
+      "version": "3.1.9",
+      "distributions": [
+        {
+          "url": "https://qudt.org/3.1.9/qudt-all",
+          "mediaType": "text/turtle",
+          "byteSize": 6533833,
+          "sha256": "7cd2da4e21e84fbcebe1002222f64b99201810d24ca0e2bf8804a27e40449125"
+        }
+      ]
+    }
+  ],
+  "license": "CC-BY-4.0",
+  "attribution": "QUDT.org"
+}

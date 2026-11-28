@@ -1413,6 +1413,38 @@ const OPTIONAL_META: [&str; 16] = [
     "graphql.json",
 ];
 
+fn capture_source_manifests(
+    root: &Path,
+    cut: u64,
+    control: &crate::guard::WriteOptions,
+) -> Result<Vec<CapturedFile>> {
+    use super::source_manifests::{DIRECTORY, file_seq};
+    let entries = match std::fs::read_dir(root.join(DIRECTORY)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        control.check()?;
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_seq(&name).is_none_or(|seq| seq > cut) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file = File::open(entry.path())?;
+        files.push(CapturedFile {
+            path: format!("{DIRECTORY}/{name}"),
+            kind: FileKind::Immutable,
+            len: file.metadata()?.len(),
+            src: FileSource::File(file),
+        });
+    }
+    files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
 impl Store {
     /// Open the atomically replaced import journal at the WAL or snapshot cut.
     /// The descriptor keeps that version readable throughout the upload.
@@ -1990,6 +2022,11 @@ impl Store {
             ));
         }
         files.extend(import_journal);
+        if let Some(root) = self.root()
+            && self.branching.ident.is_none()
+        {
+            files.extend(capture_source_manifests(root, head.seq, &control)?);
+        }
         files.extend(history_files);
         files.push(meta_file(
             "prefixes.json",
@@ -2465,6 +2502,9 @@ impl Store {
             ));
         }
         files.extend(import_journal);
+        if self.branching.ident.is_none() {
+            files.extend(capture_source_manifests(root, head.seq, control)?);
+        }
         files.extend(history_files);
         files.push(meta(
             "prefixes.json",

@@ -978,13 +978,42 @@ impl OutboundPolicy {
         abort: Option<AbortCheck>,
         deadline: Instant,
     ) -> reqwest::Result<reqwest::blocking::Client> {
+        let redirect = self.redirect_policy(failed, redirected.clone());
+        let mut b = reqwest::blocking::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.timeout)
+            .redirect(redirect)
+            // a proxy would resolve and connect on its own, past the checks
+            .no_proxy()
+            .dns_resolver(Arc::new(Pinned {
+                policy: self.clone(),
+                failed: failed.clone(),
+                aborted,
+                initial_dns_in_flight,
+                redirected,
+                abort,
+                deadline,
+            }))
+            .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
+        if let Some(pem) = &self.tls.extra_roots_pem {
+            b = b.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem)?);
+        }
+        if self.tls.insecure_skip_verify {
+            b = b.tls_danger_accept_invalid_certs(true);
+        }
+        b.build()
+    }
+    fn redirect_policy(
+        &self,
+        failed: &Arc<Mutex<Option<Failure>>>,
+        redirected: Arc<AtomicBool>,
+    ) -> reqwest::redirect::Policy {
         let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
         let custom = self.tls.is_custom();
-        let redirected_for_policy = redirected.clone();
-        let redirect = reqwest::redirect::Policy::custom(move |a| {
+        reqwest::redirect::Policy::custom(move |a| {
             // Receiving any redirect proves an earlier hop already reached a server,
             // so later DNS/connect aborts must never be classified as before-send.
-            redirected_for_policy.store(true, Ordering::SeqCst);
+            redirected.store(true, Ordering::SeqCst);
             if a.previous().len() > max {
                 return a.error(format!("more than {max} redirects"));
             }
@@ -1012,30 +1041,73 @@ impl OutboundPolicy {
                     a.error(m)
                 }
             }
-        });
-        let mut b = reqwest::blocking::Client::builder()
+        })
+    }
+
+    /// Open a download through the same checks as the blocking outbound client. The
+    /// caller owns the response budget and may drop either a pending send or a body
+    /// read to abort it, including while the connection is idle.
+    pub async fn open_download(
+        &self,
+        url: &str,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, Failure> {
+        #[cfg(any(test, feature = "failpoints"))]
+        if probe::intercept(url) {
+            return Err(Failure::Failed("owned test refused outbound send".into()));
+        }
+        let u = self.check_url(url)?;
+        let failed = Arc::new(Mutex::new(None));
+        let redirected = Arc::new(AtomicBool::new(false));
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
-            .timeout(self.timeout)
-            .redirect(redirect)
-            // a proxy would resolve and connect on its own, past the checks
+            .redirect(self.redirect_policy(&failed, redirected.clone()))
             .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .dns_resolver(Arc::new(Pinned {
                 policy: self.clone(),
                 failed: failed.clone(),
-                aborted,
-                initial_dns_in_flight,
+                aborted: Arc::default(),
+                initial_dns_in_flight: Arc::default(),
                 redirected,
-                abort,
+                abort: None,
                 deadline,
             }))
             .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
+        let build_error = |e: reqwest::Error| {
+            Failure::Failed(hidden(url, "the HTTP client could not be built", &e))
+        };
         if let Some(pem) = &self.tls.extra_roots_pem {
-            b = b.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem)?);
+            builder = builder
+                .tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem).map_err(build_error)?);
         }
         if self.tls.insecure_skip_verify {
-            b = b.tls_danger_accept_invalid_certs(true);
+            builder = builder.tls_danger_accept_invalid_certs(true);
         }
-        b.build()
+        let client = builder.build().map_err(build_error)?;
+        let mut request = client.get(u).header("Accept", "*/*");
+        if let Some(hook) = HOOK.get() {
+            let mut headers = Vec::new();
+            hook(&mut |k, v| headers.push((k.to_string(), v.to_string())));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+        }
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(self.timeout);
+        if remaining.is_zero() {
+            return Err(Failure::Failed(timed_out(remaining)));
+        }
+        request.timeout(remaining).send().await.map_err(|e| {
+            failed
+                .lock()
+                .take()
+                .unwrap_or_else(|| Failure::Failed(hidden(url, "the download request failed", &e)))
+        })
     }
 }
 

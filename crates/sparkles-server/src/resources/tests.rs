@@ -42,6 +42,7 @@ fn input(kind: Kind, title: &str) -> ResourceInput {
         namespaces: Vec::new(),
         graphs: Vec::new(),
         dataset: None,
+        iri_policy: None,
     }
 }
 
@@ -388,7 +389,7 @@ fn a_file_of_an_unknown_format_is_refused_and_kept() {
         );
     }
     // a newer unknown format is refused and left untouched
-    let newer = br#"{"format": 3, "resources": []}"#;
+    let newer = br#"{"format": 4, "resources": []}"#;
     std::fs::write(&f, newer).unwrap();
     let e = r.read().unwrap_err();
     assert!(
@@ -1169,4 +1170,272 @@ fn headers_compare_whole_versions_and_exact_licence_urls() {
     assert_eq!(lic("https://user@spdx.org/licenses/MIT.html"), 1);
     assert_eq!(lic("https://spdx.org/licenses/MIT.html?x=1"), 1);
     assert_eq!(lic("https://spdx.org/licenses/Apache-2.0"), 1);
+}
+
+#[tokio::test]
+async fn recipe_load_and_reload_verify_bytes_and_commit_once() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = tokio::spawn(async move {
+        for body in [
+            "<urn:a> <urn:p> <urn:b> .\n",
+            "<urn:a> <urn:p> <urn:b> .\n",
+            "<urn:a> <urn:p> <urn:c> .\n",
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let text = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(text.contains("accept: */*\r\n"), "{text}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.outbound.allow_private = true;
+    let ds = st.attach("ds", DbType::Persistent, None).unwrap();
+    let root = ds.store.root().unwrap().to_path_buf();
+    let st = Arc::new(st);
+    let app = crate::http::router(st.clone());
+    let source = json!({
+        "id": "example",
+        "kind": "source",
+        "title": "Example",
+        "license": "CC0-1.0",
+        "versions": [{"version": "1", "distributions": [{
+            "url": format!("http://{addr}/example.nt"),
+            "sha256": recipe::hash(b"<urn:a> <urn:p> <urn:b> .\n"),
+        }]}],
+    });
+    assert_eq!(
+        send(&app, req("POST", "/$/resources", Some(source)))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let document = json!({
+        "format": 1, "kind": "recipe",
+        "inputs": [{"source": {"resource": "example", "version": "1"}, "graph": "urn:example:graph"}]
+    });
+    let mut bad = document.clone();
+    bad["inputs"][0]["rdfFormat"] = "trig".into();
+    let refused = send(&app, req("POST", "/$/sources/ds/load", Some(bad))).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.text()
+    );
+    let mut bad = document.clone();
+    bad["inputs"][0]["graph"] = "URN:x-sparkles:iri-reservations:example".into();
+    let refused = send(&app, req("POST", "/$/sources/ds/load", Some(bad))).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.text()
+    );
+    let loaded = send(&app, req("POST", "/$/sources/ds/load", Some(document))).await;
+    assert_eq!(loaded.status, StatusCode::OK, "{}", loaded.text());
+    assert_eq!(loaded.headers[header::CACHE_CONTROL], "no-store");
+    let loaded = loaded.json();
+    let seq = loaded["receipt"]["commit"]["seq"].as_u64().unwrap();
+    assert_eq!(ds.store.head_commit().seq, seq);
+    assert_eq!(ds.store.snapshot().len(), 1);
+    let manifest = root.join("source-manifests").join(format!("{seq}.json"));
+    assert_eq!(
+        serde_json::from_slice::<J>(&std::fs::read(&manifest).unwrap()).unwrap(),
+        loaded["manifest"]
+    );
+    let reload_path = format!("/$/sources/ds/manifests/{seq}/reload");
+    let reloaded = send(&app, req("POST", &reload_path, None)).await;
+    assert_eq!(reloaded.status, StatusCode::OK, "{}", reloaded.text());
+    let reloaded = reloaded.json();
+    assert_eq!(reloaded["receipt"]["commit"]["seq"], seq + 1);
+    assert_eq!(reloaded["manifest"]["reloadedFrom"], seq);
+    assert_eq!(ds.store.snapshot().len(), 1);
+    let failed = send(&app, req("POST", &reload_path, None)).await;
+    assert_eq!(failed.status, StatusCode::BAD_GATEWAY, "{}", failed.text());
+    assert_eq!(ds.store.head_commit().seq, seq + 1);
+    assert_eq!(ds.store.snapshot().len(), 1);
+    let backup = ds.store.backup_capture("resource-test").unwrap();
+    assert!(
+        backup
+            .file(&format!("source-manifests/{seq}.json"))
+            .is_some()
+    );
+    assert!(
+        backup
+            .file(&format!("source-manifests/{}.json", seq + 1))
+            .is_some()
+    );
+    assert!(
+        backup
+            .file(&format!("source-manifests/{}.json", seq + 2))
+            .is_none()
+    );
+    let read_path = format!("/$/sources/ds/manifests/{seq}");
+    let read = send(&app, req("GET", &read_path, None)).await;
+    assert_eq!(read.json(), loaded["manifest"]);
+    assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
+    std::fs::write(manifest, b"corrupted").unwrap();
+    let unreadable = send(&app, req("GET", &read_path, None)).await;
+    assert_eq!(unreadable.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unreadable.code(), "source-manifest-unreadable");
+    served.await.unwrap();
+}
+
+#[tokio::test]
+async fn import_lock_checks_format_and_digest_and_mint_reserves_in_a_dedicated_graph() {
+    let s = server(false, license::Policy::Warn);
+    let mut v = vocabulary();
+    v["iriPolicy"] = json!({
+        "namespace": "http://ex/v#",
+        "rule": {"kind": "slug", "template": "{slug}"},
+    });
+    let response = send(&s.app, req("POST", "/$/resources", Some(v))).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{}", response.text());
+    let unknown = send(
+        &s.app,
+        req(
+            "POST",
+            "/$/resources/exv/versions/2.0/lock",
+            Some(json!({"future":true,"format":22,"kind":"future"})),
+        ),
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+    assert!(unknown.text().contains("unsupported document format 22"));
+    let lock_path = "/$/resources/exv/versions/2.0/lock";
+    let lock = send(&s.app, req("GET", lock_path, None)).await.json();
+    assert_eq!(
+        lock,
+        send(&s.app, req("POST", lock_path, Some(lock.clone())))
+            .await
+            .json()
+    );
+    let mut wrong = lock;
+    wrong["root"]["sha256"] = "0".repeat(64).into();
+    let wrong = send(&s.app, req("POST", lock_path, Some(wrong))).await;
+    assert_eq!(
+        (wrong.status, wrong.code().as_str()),
+        (StatusCode::CONFLICT, "import-lock-mismatch")
+    );
+    let mint = || {
+        req(
+            "POST",
+            "/$/resources/exv/mint/ds",
+            Some(json!({"label":"Term Name"})),
+        )
+    };
+    let (a, b) = tokio::join!(send(&s.app, mint()), send(&s.app, mint()));
+    let (created, conflict) = if a.status == StatusCode::OK {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    assert_eq!(created.json()["iri"], "http://ex/v#term-name");
+    assert_eq!(
+        (conflict.status, conflict.code().as_str()),
+        (StatusCode::CONFLICT, "iri-unavailable")
+    );
+    let ds = s.st.get("ds").unwrap();
+    assert!(
+        ds.store
+            .snapshot()
+            .lookup_iri("urn:x-sparkles:iri-reservations:exv")
+            .is_some()
+    );
+    let spoof = Request::builder()
+        .method("POST")
+        .uri("/ds/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .header(
+            "Sparkles-Commit-Message",
+            format!("source manifest sha256:{}", "0".repeat(64)),
+        )
+        .body(Body::from("INSERT DATA { <urn:a> <urn:p> <urn:o> }"))
+        .unwrap();
+    assert_eq!(send(&s.app, spoof).await.status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn source_load_checks_query_and_upload_on_every_target() {
+    use crate::auth::{Access, Endpoint, Grants, Level, Principal, Restricted, Scheme};
+    let s = server(false, license::Policy::Warn);
+    let ds = s.st.get("ds").unwrap();
+    let plan: recipe::Plan = recipe::decode(
+        &serde_json::to_vec(&json!({
+            "kind": "load-plan", "format": 1,
+            "files": [{
+                "graph": "urn:allowed", "source": {"resource":"source","version":"1"},
+                "url": "https://example.invalid/file.nt", "rdfFormat":"application/n-triples",
+                "sha256": "0".repeat(64), "byteSize": null
+            }],
+            "prefixes": {}, "recommendedIndexes": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let grant = |endpoints, graph: &str| Restricted {
+        dataset: "ds".into(),
+        level: Level::Write,
+        endpoints: Some(endpoints),
+        graphs: Some(vec![graph.into()]),
+        branches: None,
+        lifts: Vec::new(),
+        server_models: false,
+        views: Vec::new(),
+    };
+    let principal = |restricted| {
+        Principal::new(
+            crate::auth::Kind::User,
+            "loader",
+            Scheme::Basic,
+            Access::of(Grants {
+                restricted,
+                ..Default::default()
+            }),
+        )
+    };
+    let query = grant(vec![Endpoint::Query], "urn:allowed");
+    let upload = grant(vec![Endpoint::Upload], "urn:allowed");
+    assert!(
+        load::allow_graphs(
+            &principal(vec![query.clone(), upload.clone()]),
+            &ds,
+            &plan,
+            true
+        )
+        .is_ok()
+    );
+    assert!(load::allow_graphs(&principal(vec![upload.clone()]), &ds, &plan, true).is_err());
+    assert!(
+        load::allow_graphs(
+            &principal(vec![query, grant(vec![Endpoint::Upload], "urn:other")]),
+            &ds,
+            &plan,
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        load::allow_graphs(
+            &principal(vec![grant(vec![Endpoint::Query], "urn:other"), upload]),
+            &ds,
+            &plan,
+            true
+        )
+        .is_err()
+    );
 }

@@ -37,10 +37,14 @@ use std::time::{Duration, Instant};
 /// The tools that write: offered only with `--mcp-allow-update` (`--allow-update` over
 /// stdio), never on a read-only server, and listed only for a caller who may write to
 /// some dataset.
-pub(crate) const WRITE_TOOLS: [&str; 9] = [
+pub(crate) const WRITE_TOOLS: [&str; 13] = [
     "propose_claims",
     "review_claims",
     "withdraw_claims",
+    "catalog_load",
+    "catalog_reload",
+    "catalog_install_bundle",
+    "catalog_mint_iri",
     "sparql_update",
     "assert_facts",
     "register_source",
@@ -92,7 +96,10 @@ fn branch_schema() -> Value {
 /// `def` with the `branch` argument when it reads or writes a dataset: when it takes
 /// `dataset` and is not a branch tool.
 pub(super) fn with_branch_argument(mut def: ToolDef) -> ToolDef {
-    if BRANCH_TOOLS.contains(&def.name) {
+    if BRANCH_TOOLS.contains(&def.name)
+        || super::catalog::READ.contains(&def.name)
+        || super::catalog::WRITE.contains(&def.name)
+    {
         return def;
     }
     if let Some(props) = def

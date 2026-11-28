@@ -1806,6 +1806,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: dataset_cmd::DatasetCmd,
     },
+    /// Browse, register and load checksum-pinned catalog sources on a running server
+    #[cfg(feature = "auth")]
+    Source(resources::cli::SourceArgs),
     /// Show or change a dataset's automatic compaction settings, on a local database or
     /// on a server
     Compaction(compaction_cmd::CompactionArgs),
@@ -3804,7 +3807,7 @@ fn run() -> Result<()> {
         } => {
             let message = message
                 .as_deref()
-                .map(sparkles::annotations::validate_message)
+                .map(sparkles::annotations::validate_user_message)
                 .transpose()?
                 .flatten();
             // a template with --lookup reads the database's head before the load
@@ -4277,7 +4280,7 @@ fn run() -> Result<()> {
             };
             let message = message
                 .as_deref()
-                .map(sparkles::annotations::validate_message)
+                .map(sparkles::annotations::validate_user_message)
                 .transpose()?
                 .flatten();
             let Some(loc) = loc else {
@@ -4442,6 +4445,8 @@ fn run() -> Result<()> {
         #[cfg(feature = "text-cjk-dict")]
         Cmd::TextDict(args) => text_dict_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
+        #[cfg(feature = "auth")]
+        Cmd::Source(args) => resources::cli::run(args),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         Cmd::Views(args) => views_cmd::run(args, opts),
         #[cfg(feature = "auth")]

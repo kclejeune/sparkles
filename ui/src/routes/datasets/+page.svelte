@@ -69,6 +69,7 @@
         <Icon name="refresh" size={14} /> Refresh
       </button>
       {#if auth.hasServer('server-admin')}
+        <a class="btn" href={resolve('/admin/sources')}>Sources</a>
         <button class="btn primary" data-primary onclick={() => (createOpen = true)}
           ><Icon name="plus" size={14} /> New dataset</button
         >

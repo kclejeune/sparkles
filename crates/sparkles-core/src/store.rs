@@ -19,6 +19,8 @@ mod branch_tests;
 mod branching;
 pub mod caches;
 mod changelog;
+#[doc(hidden)]
+pub mod source_manifests;
 pub(crate) use changelog::HistoryPages;
 mod changes;
 mod clone;
@@ -2568,6 +2570,7 @@ struct BulkCommit<'a> {
     skip_if_unchanged: bool,
     /// prefixes staged by a bulk [`WriteTxn`] for crash-atomic publication with this commit
     staged_prefixes: BTreeMap<String, String>,
+    required_prefixes: BTreeSet<String>,
 }
 
 /// What [`Store::build_generation_classified`] builds a bulk commit's generation from.
@@ -3852,6 +3855,11 @@ impl Store {
         }
         store.recover_text_pins();
         store.collect_history(gen_no, head.seq);
+        if store.branching.ident.is_none()
+            && let Err(e) = source_manifests::sweep(&store, root, head.seq)
+        {
+            tracing::warn!(target: "sparkles::store", error = %e, "cannot sweep source manifests");
+        }
         store.release_link_if_rebuilt();
         if let Err(e) = store.recover_change_log() {
             // history queries report the commits it could not record
@@ -6227,6 +6235,14 @@ impl Store {
         &self,
         p: &BTreeMap<String, String>,
     ) -> Result<PreparedPrefixes<'_>> {
+        self.prepare_added_prefixes_strict(p, &BTreeSet::new())
+    }
+
+    fn prepare_added_prefixes_strict(
+        &self,
+        p: &BTreeMap<String, String>,
+        required: &BTreeSet<String>,
+    ) -> Result<PreparedPrefixes<'_>> {
         let filter = self.prefix_filter.lock().clone();
         // Acquire `removed_prefixes` before `prefixes` (matching `set_prefix` and
         // `set_prefix_layer`) and retain both guards through admission and publication.
@@ -6237,16 +6253,35 @@ impl Store {
         }
         let mut next: Option<BTreeMap<String, String>> = None;
         let mut skipped = 0usize;
-        for (k, v) in p {
+        let required = required.iter().map(|k| (k, &p[k], true));
+        let optional = p.iter().map(|(k, v)| (k, v, false));
+        for (k, v, required) in required.chain(optional) {
             let map = next.as_ref().unwrap_or(&*cur);
-            if map.contains_key(k) || removed.contains(k) || filter.as_ref().is_some_and(|f| !f(k))
-            {
+            if let Some(old) = map.get(k) {
+                if required && old != v {
+                    return Err(Error::Conflict(format!(
+                        "prefix {k} is already bound to {old}"
+                    )));
+                }
+                continue;
+            }
+            if removed.contains(k) || filter.as_ref().is_some_and(|f| !f(k)) {
+                if required {
+                    return Err(Error::NotPermitted(format!(
+                        "prefix {k} is removed or controlled by settings"
+                    )));
+                }
                 continue;
             }
             if self.prefixes_full(map.len() + removed.len())
                 || k.len() > MAX_PREFIX_NAME_BYTES
                 || v.len() > MAX_PREFIX_IRI_BYTES
             {
+                if required {
+                    return Err(Error::invalid(format!(
+                        "installing prefix {k} would exceed the prefix limit"
+                    )));
+                }
                 skipped += 1;
                 continue;
             }
@@ -7184,6 +7219,7 @@ impl Store {
                 admission: None,
                 skip_if_unchanged: entry == load_plan::Entry::SparqlLoad,
                 staged_prefixes: BTreeMap::new(),
+                required_prefixes: BTreeSet::new(),
             };
             let check = (crate::guard::Changes::Unknown, o);
             Ok(self
@@ -7308,6 +7344,34 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<(u64, Receipt)> {
+        self.replace_with_metadata(target, sources, kind, o, None, BTreeMap::new())
+    }
+
+    /// Replace graphs and persist related metadata before the same commit is published.
+    /// An intent always records a commit, including when the replacement has no RDF
+    /// changes. The intent's reader must verify that the commit reached publication.
+    #[doc(hidden)]
+    pub fn replace_with_intent(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        intent: crate::guard::CommitHook<'_>,
+        declared_prefixes: BTreeMap<String, String>,
+    ) -> Result<(u64, Receipt)> {
+        self.replace_with_metadata(target, sources, kind, o, Some(intent), declared_prefixes)
+    }
+
+    fn replace_with_metadata(
+        &self,
+        target: ReplaceTarget,
+        sources: &[Source],
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        hook: Option<crate::guard::CommitHook<'_>>,
+        declared_prefixes: BTreeMap<String, String>,
+    ) -> Result<(u64, Receipt)> {
         if let Some(a) = &o.graphs {
             // the target is checked before it is looked up, so the answer does not
             // depend on whether it exists
@@ -7342,13 +7406,25 @@ impl Store {
             }
         }
         if self.source_plan(load_plan::Entry::Replace, sources, o)? == LoadPlan::Bulk {
-            return self.replace_bulk(target, sources, kind, o);
+            return self.replace_bulk(target, sources, kind, o, hook, declared_prefixes);
         }
         let mut parsed = Vec::with_capacity(sources.len());
         let mut prefixes = BTreeMap::new();
         for s in sources {
             o.check()?;
-            let (quads, p) = crate::io::parse_to_vec(s)?;
+            let (quads, p) = if hook.is_some() {
+                let mut quads = Vec::new();
+                let prefixes = crate::io::parse_source_into(s, |q| {
+                    if quads.len().is_multiple_of(1024) {
+                        o.check()?;
+                    }
+                    quads.push(q);
+                    Ok(())
+                })?;
+                (quads, prefixes)
+            } else {
+                crate::io::parse_to_vec(s)?
+            };
             prefixes.extend(p);
             parsed.push(quads);
         }
@@ -7368,6 +7444,7 @@ impl Store {
             &mut early,
         )?;
         let mut txn = self.try_write_with(kind, o.clone())?;
+        txn.force = hook.is_some();
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
             ReplaceTarget::Default => vec![Id::DEFAULT_GRAPH],
@@ -7416,6 +7493,13 @@ impl Store {
         drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
+        if hook.is_some() {
+            let required = declared_prefixes.keys().cloned().collect();
+            prefixes.extend(declared_prefixes);
+            txn.stage_prefixes(prefixes);
+            let r = with_early_refusal(txn.commit_with_required_prefixes(hook, required), early)?;
+            return Ok((n, r));
+        }
         let r = with_early_refusal(txn.commit(), early)?;
         self.add_prefixes(prefixes)?;
         Ok((n, r))
@@ -7462,6 +7546,8 @@ impl Store {
         sources: &[Source],
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
+        hook: Option<crate::guard::CommitHook<'_>>,
+        declared_prefixes: BTreeMap<String, String>,
     ) -> Result<(u64, Receipt)> {
         let mut w = self.lock_writer(o)?;
         if w.poisoned {
@@ -7489,8 +7575,9 @@ impl Store {
             dropped += snap.count(Perm::Gspo, &[g.0])?;
         }
         let start_len = snap.len();
+        let required_prefixes = declared_prefixes.keys().cloned().collect();
         let bulk = BulkCommit {
-            hook: None,
+            hook,
             kind,
             net_del: dropped,
             start_len,
@@ -7498,7 +7585,8 @@ impl Store {
                 || sources_reach_default_graph(sources),
             admission: None,
             skip_if_unchanged: false,
-            staged_prefixes: BTreeMap::new(),
+            staged_prefixes: declared_prefixes,
+            required_prefixes,
         };
         let check = (crate::guard::Changes::Unknown, o);
         // the quads parsed, as a transactional replace counts them
@@ -7818,7 +7906,7 @@ impl Store {
         let mut combined_prefixes = meta.prefixes.clone();
         combined_prefixes.extend(bulk.staged_prefixes);
         let mut prepared_prefixes = if !combined_prefixes.is_empty() {
-            match self.prepare_added_prefixes(&combined_prefixes) {
+            match self.prepare_added_prefixes_strict(&combined_prefixes, &bulk.required_prefixes) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     drop(gen_);
@@ -9418,6 +9506,14 @@ impl WriteTxn<'_> {
         self,
         hook: Option<crate::guard::CommitHook<'_>>,
     ) -> Result<Receipt> {
+        self.commit_with_required_prefixes(hook, BTreeSet::new())
+    }
+
+    fn commit_with_required_prefixes(
+        self,
+        hook: Option<crate::guard::CommitHook<'_>>,
+        required_prefixes: BTreeSet<String>,
+    ) -> Result<Receipt> {
         let span = tracing::info_span!(
             target: "sparkles::commit",
             "commit",
@@ -9431,7 +9527,7 @@ impl WriteTxn<'_> {
             store: self.store,
             sample: None,
         };
-        let r = self.commit_inner(&mut observation.sample, hook);
+        let r = self.commit_inner(&mut observation.sample, hook, required_prefixes);
         drop(observation);
         if let Ok(r) = &r
             && r.committed
@@ -9448,6 +9544,7 @@ impl WriteTxn<'_> {
         mut self,
         sync: &mut Option<(SyncPath, std::time::Duration)>,
         hook: Option<crate::guard::CommitHook<'_>>,
+        required_prefixes: BTreeSet<String>,
     ) -> Result<Receipt> {
         self._callback_owner.check()?;
         if self.guard.poisoned
@@ -9563,7 +9660,8 @@ impl WriteTxn<'_> {
             }
             let store = self.store;
             let target_seq = self.guard.head.seq + 1;
-            let mut prep = store.prepare_added_prefixes(&staged_prefixes)?;
+            let mut prep =
+                store.prepare_added_prefixes_strict(&staged_prefixes, &required_prefixes)?;
             if let Some(next) = prep.next.take() {
                 prep.arm_staged_fence(store);
                 if let Err(e) = store.stage_prefixes_for_commit(target_seq, None, &next) {
@@ -9633,6 +9731,7 @@ impl WriteTxn<'_> {
             admission: self.managed_admission.take(),
             skip_if_unchanged: false,
             staged_prefixes: std::mem::take(&mut self.staged_prefixes),
+            required_prefixes,
         };
         let log = std::mem::take(&mut self.log);
         let check = (

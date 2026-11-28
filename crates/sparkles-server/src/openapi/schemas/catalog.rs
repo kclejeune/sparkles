@@ -42,6 +42,7 @@ fn resource_members() -> J {
         "namespaces": with_desc(array(closed(&["prefix", "iri"], json!({ "prefix": string(), "iri": string() }))), "The namespaces a vocabulary owns. A prefix and a namespace belong to one vocabulary of the server."),
         "graphs": with_desc(array(closed(&["dataset", "graph"], json!({ "dataset": string(), "graph": string() }))), "The dataset graphs that hold a vocabulary."),
         "dataset": with_desc(string(), "The server dataset a dataset resource describes."),
+        "iriPolicy": sref("VocabularyIriPolicy"),
     })
 }
 
@@ -78,6 +79,7 @@ fn merged(a: J, b: J) -> J {
 }
 
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
+    manager_schemas(put);
     put(
         "ResourceVersionInput",
         doc(
@@ -306,6 +308,151 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
             ),
             "Redirection recipes for a hosted vocabulary's namespaces and version IRIs.",
             "linked-data-publishing",
+        ),
+    );
+}
+
+fn manager_schemas(put: &mut dyn FnMut(&str, J)) {
+    let map = || json!({ "type": "object", "additionalProperties": string() });
+    let digest = || json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" });
+    let names = || json!({ "type": "integer", "const": 1 });
+    let pin_digest = closed(
+        &["pin", "sha256"],
+        json!({ "pin": pin(), "sha256": digest() }),
+    );
+    put(
+        "SourceRecipe",
+        closed(
+            &["kind", "format", "inputs"],
+            json!({
+                "kind": { "const": "recipe" },
+                "format": names(),
+                "inputs": array(closed(&["source", "graph"], json!({
+                    "source": pin(), "graph": string(), "files": or_null(string()),
+                    "rdfFormat": or_null(string()),
+                }))),
+                "prefixes": map(),
+                "recommendedIndexes": map(),
+            }),
+        ),
+    );
+    put(
+        "SourceLoadPlan",
+        closed(
+            &["kind", "format", "files", "prefixes", "recommendedIndexes"],
+            json!({
+                "kind": { "const": "load-plan" },
+                "format": names(),
+                "files": array(closed(&["graph", "source", "url", "rdfFormat", "sha256", "byteSize"], json!({
+                    "graph": string(), "source": pin(), "url": string(), "rdfFormat": string(),
+                    "sha256": digest(), "byteSize": or_null(int()),
+                }))),
+                "prefixes": map(),
+                "recommendedIndexes": map(),
+            }),
+        ),
+    );
+    put(
+        "SourceImportLock",
+        closed(
+            &["kind", "format", "root", "imports"],
+            json!({
+                "kind": { "const": "import-lock" }, "format": names(),
+                "root": pin_digest.clone(), "imports": array(pin_digest),
+            }),
+        ),
+    );
+    put(
+        "SourceLoadManifest",
+        closed(
+            &[
+                "kind",
+                "format",
+                "id",
+                "datasetId",
+                "recipe",
+                "plan",
+                "reloadedFrom",
+                "by",
+            ],
+            json!({
+                "kind": { "const": "load-manifest" }, "format": names(),
+                "id": string(), "datasetId": string(), "recipe": sref("SourceRecipe"),
+                "plan": sref("SourceLoadPlan"), "reloadedFrom": or_null(int()), "by": string(),
+            }),
+        ),
+    );
+    put(
+        "SourceLoadResult",
+        closed(
+            &["receipt", "manifest"],
+            json!({
+                "receipt": sref("Receipt"), "manifest": sref("SourceLoadManifest"),
+            }),
+        ),
+    );
+    put(
+        "SourceHarvestRequest",
+        closed(
+            &["kind", "document"],
+            json!({
+                "kind": string_enum(&["obo-foundry", "bioregistry", "lov", "ckan", "databus", "dcat", "qleverfile"]),
+                "document": string(),
+            }),
+        ),
+    );
+    put(
+        "SourceHarvestPreview",
+        closed(
+            &["candidates", "inputs"],
+            json!({
+                "candidates": array(closed(&["id", "title", "version", "namespace", "distributions"], json!({
+                    "id": string(), "title": string(), "version": or_null(string()),
+                    "namespace": or_null(string()),
+                    "distributions": array(closed(&["url"], json!({
+                        "url": string(), "mediaType": string(), "byteSize": int(), "sha256": digest(),
+                    }))),
+                }))),
+                "inputs": array(closed(&["files", "rdfFormat", "graph"], json!({
+                    "files": array(string()), "rdfFormat": string(), "graph": or_null(string()),
+                }))),
+            }),
+        ),
+    );
+    put(
+        "VocabularyIriPolicy",
+        closed(
+            &["namespace", "rule"],
+            json!({
+                "namespace": string(),
+                "rule": { "oneOf": [
+                    closed(&["kind", "template"], json!({"kind": {"const": "slug"}, "template": string()})),
+                    closed(&["kind"], json!({"kind": {"const": "uuid"}})),
+                    closed(&["kind"], json!({"kind": {"const": "ulid"}})),
+                    closed(&["kind", "stem", "width", "start", "end"], json!({
+                        "kind": {"const": "sequence"}, "stem": string(), "width": int(), "start": int(), "end": int(),
+                    })),
+                    closed(&["kind", "stem", "width", "ranges"], json!({
+                        "kind": {"const": "obo"}, "stem": string(), "width": int(),
+                        "ranges": {"type": "object", "additionalProperties": closed(&["start", "end"], json!({
+                            "start": int(), "end": int(),
+                        }))},
+                    })),
+                ] },
+            }),
+        ),
+    );
+    put(
+        "VocabularyIriMintRequest",
+        closed(&[], json!({ "label": string() })),
+    );
+    put(
+        "VocabularyIriReservation",
+        closed(
+            &["iri", "receipt"],
+            json!({
+                "iri": string(), "receipt": sref("Receipt"),
+            }),
         ),
     );
 }

@@ -157,6 +157,10 @@ pub fn valid_backup_path(p: &str) -> bool {
     let Some((dir, file)) = p.split_once('/') else {
         return false;
     };
+    use sparkles_core::store::source_manifests::{DIRECTORY, file_seq};
+    if dir == DIRECTORY {
+        return file_seq(file).is_some();
+    }
     valid_generation(dir)
         && !file.is_empty()
         && file.len() <= 64

@@ -1,0 +1,26 @@
+{
+  "id": "dcat",
+  "kind": "vocabulary",
+  "title": "Data Catalog Vocabulary",
+  "namespaces": [
+    {
+      "prefix": "dcat",
+      "iri": "http://www.w3.org/ns/dcat#"
+    }
+  ],
+  "versions": [
+    {
+      "version": "3",
+      "distributions": [
+        {
+          "url": "https://www.w3.org/ns/dcat3.ttl",
+          "mediaType": "text/turtle",
+          "byteSize": 200345,
+          "sha256": "d1624d3bbf364f6fc1d43b9a188bbb9e67639b1a7d46a5cb7ea3f5d47d02b62f"
+        }
+      ]
+    }
+  ],
+  "license": "CC-BY-4.0",
+  "attribution": "W3C"
+}

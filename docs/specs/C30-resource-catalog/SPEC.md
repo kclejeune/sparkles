@@ -1,6 +1,6 @@
 # C30: Resource catalog
 
-> **Status:** implemented in part (Phase 1).
+> **Status:** implemented in part (Phases 1 and 2).
 >
 > **Roadmap:** [item 458](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -213,6 +213,58 @@ The phase meets the third acceptance gate for the verdict. Licence verdicts warn
 default and refuse only under `--license-policy enforce`, and the surfaces that act on
 the verdict are item 525. The first two gates need the source store and stay open.
 
+## Phase 2: verified source loads and vocabulary policies
+
+A versioned recipe resolves pinned catalog records and file patterns into a sorted
+load plan. Each distribution has a raw SHA-256 digest and may have a byte size. The
+server stages downloads under the data directory using its outbound destination and
+redirect checks. It enforces a six-hour and 64 GiB limit on the downloads of one
+request alongside any lower update deadline and upload ceiling. The request yields
+between chunks and cancel or shutdown aborts a pending network read. Startup removes
+abandoned staging files. A load refuses restricted terms without recorded acceptance,
+including restrictions inherited from the selected versions' imports.
+
+Recipes target named graphs outside `urn:x-sparkles:` and accept single-graph RDF
+formats only. Each load verifies every source before starting a replace-mode write.
+The writer applies validation, storage admission and graph protection and publishes
+the listed replacements in one commit. Explicit prefix bindings use the same prefix
+layer, locks and limits as loads. An existing different binding refuses the load.
+
+The commit records a digest of its load manifest. The versioned manifest names the
+authoring dataset, the recipe, the resolved distribution URLs and digests and the
+original commit on reload. The manifest is persisted before publication, and only a
+commit with its matching annotation exposes it. Persistent backups capture manifests
+through their commit cut. Startup sweeps files with no retained annotation. The reader
+refuses unrecognized manifest formats before interpreting their fields. A reload
+recalculates the plan from the catalog and verifies the original checksums again.
+
+An import lock gives the root and a sorted set of transitive pins. Version digest
+format 1 hashes UTF-8 compact JSON. The tuple contains the tag
+`sparkles-version-digest-1`, version string, a four-element tuple of version IRI,
+snapshot, issue date and notes, a three-element tuple of licence expression, class
+and URL, sorted distributions as URL, media type, size and raw digest tuples, sorted
+resource/version import pairs, and sorted graph/source-pin pairs. Absent scalar fields
+are JSON null. Stamps and mutable resource descriptions are outside the digest. A
+diamond that pins distinct versions of one resource reports a conflict. The lock
+verifier compares the complete closure and each digest.
+
+The dataset manager previews public metadata supplied by the operator. It reads OBO
+Foundry and Bioregistry JSON, LOV vocabulary metadata, CKAN package metadata, Databus
+SPARQL SELECT results, DCAT Turtle and the declarative file and graph fields of a
+Qleverfile. It treats metadata and Qleverfile strings as data and registers sources
+only through a separate catalog write. Versioned example records are kept in the
+[curated catalog](../../examples/resource-catalog/README.md).
+
+A bundle assigns each pinned vocabulary version its own stable graph and includes the
+namespaces of its imported vocabularies. Vocabulary policies mint IRIs by a label
+slug, UUID, ULID or a padded sequence, with per-principal ranges for OBO identifiers.
+The main-branch writer tests for the IRI in its term dictionary while holding the
+write lock and records it in the vocabulary's dedicated reservation graph. The
+dictionary can retain a deleted term until compaction, so that term can still block
+a mint. A reservation that remains in the graph survives compaction. Item 81 provides
+the managed-graph protection needed to reserve identifiers against general graph
+edits and deletions.
+
 ## Dependencies
 
 * The policy and plumbing stage of [item 453](../../ROADMAP.md), items 480 to 483, lands first, so that
@@ -257,9 +309,25 @@ List identifiers and checksum terms. The licence table classifies SPDX License L
 identifiers by the terms of their licence texts. No Fluree source or documentation was
 used, and no code from another project is copied.
 
+The Phase 2 harvesters use the published OBO Foundry and Bioregistry registry exports,
+LOV vocabulary API, CKAN Action API, Databus data-download guide, DCAT 3 and Qleverfile
+settings documentation. The curated records link their publisher sources.
+
 ## Outcome
 
-Phase 1 has shipped. [Item 458](../../ROADMAP.md) keeps the remaining phases.
+Phases 1 and 2 have shipped. [Item 458](../../ROADMAP.md) keeps the remaining phases.
+Phase 2 meets the reproducible load gate for the supported pinned URL sources. It uses
+the outbound policy and verifies raw digests. Interrupted transfers restart from
+byte zero under item 1390, so the download-resume acceptance gate remains open.
+Load manifests follow the dataset's retained commit annotations. Item 1391 tracks
+a current manifest that remains available after pruning. Declarations and accepted
+restricted terms are checked before fetching and rechecked before the writer starts.
+
+The content-addressed source store, automated updates, immutable mirrors and fragment
+composition follow items 61, 339, 81 and 455. The source manager accepts registered
+HTTP and HTTPS distributions. Credentialed provider ingestion, storage accounting,
+cross-dataset term usage, full deprecation lifecycle and branch proposals with gate
+results remain under item 458 and its dependencies.
 
 The server keeps the catalog in `resources.json`, format 1, which `sparkles::formats`
 registers as a server settings file. The code is `crates/sparkles-server/src/resources`.
@@ -271,9 +339,8 @@ catalog reads its file on each request under one lock, which keeps it current af
 operator edits the file and costs one parse of at most 16 MiB per request. That is
 small for an administrative catalog of at most 4,096 resources.
 
-A version of a dataset resource records its graphs and their sources by hand in this
-phase. Recording them when data is loaded, and reloading from sources, belong to the load
-manifest phase, which needs the source store for reload. The licence gate reports its
+A version of a dataset resource can record its graphs and their sources by hand.
+Phase 2 can also load that record as a recipe and record its provenance automatically. The licence gate reports its
 verdict, and the export and publication routes apply it under item 525. The Croissant
 export is item 526. Only server administrators read the catalog, and a filtered read
 for dataset administrators belongs to the dataset manager phase.

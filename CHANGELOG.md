@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Verified source loads and vocabulary policies
+
+Source recipes verify pinned distribution checksums and replace the listed graphs in
+one commit. The source manager supports load manifests and reloads, deterministic
+import locks, public metadata harvest previews, vocabulary graph bundles and IRI
+reservations. The HTTP API, `sparkles source` and the MCP catalog tools expose the
+operations. The Sources page registers URLs, builds recipes and shows provenance.
+
+#### Format
+
+`resources.json` uses format 3 when a vocabulary sets `iriPolicy`. Recipes, load
+plans, import locks and commit-bound load manifests start at format 1. Persistent
+backups include source manifests through the captured commit.
+
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 
 The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET

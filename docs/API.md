@@ -6161,8 +6161,9 @@ The design is in [C30 Resource catalog](specs/C30-resource-catalog/README.md).
 The resource catalog records the sources, vocabularies and datasets a server works with,
 their versions and their licences. It describes data and never holds any. The catalog
 is the file `resources.json` of the data directory, and a server without a data
-directory keeps it in memory. Every route needs server `admin`, except the install
-route, which needs `admin` on its dataset. Writes answer `403 server-read-only` on a
+directory keeps it in memory. Catalog administration needs server `admin`. The
+prefix install needs dataset `admin` and the IRI reservation uses Query and Update
+grants. Writes answer `403 server-read-only` on a
 read-only server.
 
 | Route | What it does |
@@ -6293,6 +6294,48 @@ A prefix that the dataset binds to another IRI is `409 prefix-conflict` with the
 `installed`, those it `replaced` and those that were `unchanged`. A prefix write that
 lands between the install's read and its write makes the install read again, so it
 never overwrites a binding it did not check.
+
+### Source manager
+
+Source management responses carry `Cache-Control: no-store`. Its load operations
+target the main branch. With `If-Match`, the dataset head must match the supplied tag
+before the write.
+
+| Route | Operation |
+|---|---|
+| `GET /$/sources` | Lists the source resources of the catalog. |
+| `POST /$/sources/harvest` | Reads `kind` and `document` and previews source candidates or file rules. |
+| `GET /$/resources/{id}/versions/{version}/recipe` | Builds a recipe from a dataset version's graph sources. |
+| `POST /$/sources/plan` | Resolves a recipe to its distribution URLs, byte sizes when known, checksums and graph assignments. |
+| `POST /$/sources/{ds}/load` | Runs a recipe and returns the commit receipt and manifest. |
+| `GET /$/sources/{ds}/manifests/{commit}` | Reads the manifest of a retained source-load commit. |
+| `POST /$/sources/{ds}/manifests/{commit}/reload` | Verifies the original pinned plan and replaces the same graphs in a new commit. |
+| `GET /$/resources/{id}/versions/{version}/lock` | Exports a deterministic lock with digests of the root and transitive imports. |
+| `POST /$/resources/{id}/versions/{version}/lock` | Validates the supplied lock against the catalog. |
+| `POST /$/resources/{id}/versions/{version}/bundle/{ds}` | Replaces a graph per pinned vocabulary version and binds its namespaces. |
+| `POST /$/resources/{id}/mint/{ds}` | Reserves an IRI using the vocabulary's policy. The JSON body may supply `label`. |
+
+A recipe is `{"kind":"recipe","format":1,"inputs":[...]}`. Each input names a
+`source` with `resource` and `version`, and an absolute named `graph` IRI outside
+the Sparkles reserved namespace. Optional `files` matches the last URL path segment
+with `*`. Optional `rdfFormat` specifies the single-graph RDF syntax. Distributions
+need a pinned SHA-256 and an HTTP or HTTPS URL. Optional `prefixes` binds new
+dataset prefixes in the same commit. Optional `recommendedIndexes` carries
+recommendations for the administrator.
+
+A load needs server `admin`, Query access to each target graph and write access to
+each through the Upload endpoint. Manifest reads and reloads require full Query
+access to the dataset. Restricted terms must have recorded acceptance before any of
+their bytes are fetched. The load verifies the raw response bytes, including any
+compression, before parsing. A digest or size mismatch leaves the dataset unchanged.
+
+A vocabulary resource can carry an `iriPolicy` with `namespace` and `rule`. Rules
+have `kind` of `slug`, `uuid`, `ulid`, `sequence` or `obo`. Slug rules require
+a `template` containing `{slug}`. A sequence has `stem`, `width`, `start` and
+`end`. An OBO rule has `stem`, `width` and non-overlapping `ranges` keyed by
+principal ID, each with `start` and `end`. The vocabulary must already name a graph
+on the target dataset. Minting requires full Query access on the dataset and write
+access to its reservation graph through Update.
 
 ## Linked-data publishing
 

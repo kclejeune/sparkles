@@ -340,7 +340,7 @@ pub(super) fn write_precondition_with_pattern_context(
 
 /// The `Sparkles-Commit-Message` of a write: UTF-8, or an RFC 8187 extended value
 /// (`UTF-8''caf%C3%A9`) for clients that can only send ASCII. Checked with
-/// [`sparkles::annotations::validate_message`].
+/// [`sparkles::annotations::validate_user_message`].
 pub(super) fn commit_message(headers: &HeaderMap) -> ApiResult<Option<Arc<str>>> {
     let Some(v) = headers.get(SPARKLES_COMMIT_MESSAGE) else {
         return Ok(None);
@@ -359,7 +359,7 @@ pub(super) fn commit_message(headers: &HeaderMap) -> ApiResult<Option<Arc<str>>>
             .into_owned(),
         None => raw.to_string(),
     };
-    Ok(sparkles::annotations::validate_message(&text)?)
+    Ok(sparkles::annotations::validate_user_message(&text)?)
 }
 
 #[cfg(test)]

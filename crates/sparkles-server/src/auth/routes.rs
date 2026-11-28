@@ -204,6 +204,22 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/resources/{id}/header", &["GET"]),
     ("/$/resources/{id}/recipes", &["GET"]),
     ("/$/resources/{id}/install/{ds}", &["POST"]),
+    ("/$/sources", &["GET"]),
+    ("/$/sources/plan", &["POST"]),
+    ("/$/sources/harvest", &["POST"]),
+    ("/$/sources/{ds}/load", &["POST"]),
+    ("/$/sources/{ds}/manifests/{commit}", &["GET"]),
+    ("/$/sources/{ds}/manifests/{commit}/reload", &["POST"]),
+    ("/$/resources/{id}/versions/{version}/recipe", &["GET"]),
+    (
+        "/$/resources/{id}/versions/{version}/lock",
+        &["GET", "POST"],
+    ),
+    (
+        "/$/resources/{id}/versions/{version}/bundle/{ds}",
+        &["POST"],
+    ),
+    ("/$/resources/{id}/mint/{ds}", &["POST"]),
     // linked-data publishing front end (C32): filtered by the handlers to datasets and
     // graphs the caller may read
     ("/$/ld", &["GET"]),
@@ -504,6 +520,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // the server's resource catalog (C30); installing a vocabulary's prefixes changes
         // one dataset's settings
         "/$/resources/{id}/install/{ds}" => Dataset(Admin),
+        "/$/sources/{ds}/manifests/{commit}" => Dataset(Read),
+        "/$/sources/{ds}/load"
+        | "/$/sources/{ds}/manifests/{commit}/reload"
+        | "/$/resources/{id}/versions/{version}/bundle/{ds}"
+        | "/$/resources/{id}/mint/{ds}" => Dataset(Write),
         "/$/resources"
         | "/$/resources/{id}"
         | "/$/resources/{id}/versions"
@@ -512,7 +533,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/resources/{id}/license"
         | "/$/resources/{id}/notice"
         | "/$/resources/{id}/header"
-        | "/$/resources/{id}/recipes" => Server(ServerPerm::ServerAdmin),
+        | "/$/resources/{id}/recipes"
+        | "/$/resources/{id}/versions/{version}/recipe"
+        | "/$/resources/{id}/versions/{version}/lock"
+        | "/$/sources"
+        | "/$/sources/plan"
+        | "/$/sources/harvest" => Server(ServerPerm::ServerAdmin),
         // linked-data publishing front end (C32): handlers enforce dataset, graph and
         // triple read permissions
         "/$/ld"
@@ -811,7 +837,13 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,
-        "/{ds}/upload" | "/{ds}/mappings/{name}/run" => Endpoint::Upload,
+        "/{ds}/upload"
+        | "/{ds}/mappings/{name}/run"
+        | "/$/sources/{ds}/load"
+        | "/$/sources/{ds}/manifests/{commit}/reload"
+        | "/$/resources/{id}/versions/{version}/bundle/{ds}" => Endpoint::Upload,
+        "/$/sources/{ds}/manifests/{commit}" => Endpoint::Query,
+        "/$/resources/{id}/mint/{ds}" => Endpoint::Update,
         "/{ds}/patch" => Endpoint::Patch,
         "/{ds}/shacl" => Endpoint::Shacl,
         "/{ds}/shex" => Endpoint::Shex,

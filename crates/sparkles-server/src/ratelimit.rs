@@ -150,6 +150,7 @@ pub fn classify(
             || admin == "commits/{ds}/timeline"
             // a vocabulary header reads graphs of the datasets that hold it
             || admin == "resources/{id}/header"
+            || admin == "sources/{ds}/manifests/{commit}"
             // linked-data publishing runs bounded DESCRIBE queries over readable graphs
             || admin == "ld"
             || admin.starts_with("ld/")
@@ -162,7 +163,14 @@ pub fn classify(
         {
             return Some(Class::Query);
         }
-        if admin == "forms/{ds}/save" {
+        if matches!(
+            admin,
+            "forms/{ds}/save"
+                | "sources/{ds}/load"
+                | "sources/{ds}/manifests/{commit}/reload"
+                | "resources/{id}/versions/{version}/bundle/{ds}"
+                | "resources/{id}/mint/{ds}"
+        ) {
             return Some(Class::Update);
         }
         return (!read && *method != Method::OPTIONS).then_some(Class::Admin);
