@@ -761,11 +761,14 @@ impl Store {
         };
         tail.release(&io);
         // every change of the annotations file reaches the quota, a failed write's too
-        let ann_prealloc = (!anns.is_empty()).then(|| anns[0].tail.take_prealloc());
+        let ann_prealloc = (!anns.is_empty()).then(|| anns[0].tail.take_prealloc().1);
         let failed = |_: &Error| {
-            if let Some((was, now)) = ann_prealloc {
-                self.quota.move_ann_preallocated(was, now);
-                self.quota.invalidate();
+            // The failed write may have overwritten zeros after the last durable
+            // commit. Recovery will settle the files before another writer opens.
+            self.quota.set_generation_padding(self.dataset_id, 0, None);
+            if let Some(padding) = ann_prealloc {
+                self.quota
+                    .account_annotations(self.dataset_id, padding, None);
             }
         };
         let direct = written.inspect_err(failed)?;
@@ -780,21 +783,17 @@ impl Store {
         self.failpoint("group-written");
         io.end = last.wal_end;
         self.quota.written(
+            self.dataset_id,
             batch.iter().map(|p| &p.reserved),
             (io.alloc - alloc_before)
                 + dvocab.allocated().saturating_sub(vocab_before)
                 + ann_written.map_or(0, |w| w.grew),
-            io.alloc - io.end,
-            dvocab.preallocated(),
+            io.alloc - io.end + dvocab.preallocated(),
             ann_prealloc,
+            measures,
         );
         // the growth is on disk now
         drop(promise);
-        // A writer that checked its quota meanwhile may have walked the directory with
-        // this growth in it, which the lines above counted again.
-        if self.quota.measures() != measures {
-            self.quota.remeasure();
-        }
         Ok(direct)
     }
 
@@ -996,9 +995,11 @@ impl WriteTxn<'_> {
                 group.fail();
                 return Err(e);
             }
-            store
-                .quota
-                .account_append(branching::MERGE_REC as u64, measures);
+            store.quota.account_append(
+                self.store.dataset_id,
+                branching::MERGE_REC as u64,
+                measures,
+            );
             store.failpoint("merge-recorded");
         }
         // The annotation record is queued with the WAL records, and the fence writes both:

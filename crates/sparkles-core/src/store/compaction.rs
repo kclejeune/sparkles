@@ -630,7 +630,7 @@ impl Drop for Run<'_> {
         }
         s.compaction.reserved.store(0, Ordering::Relaxed);
         if self.dir.is_some() {
-            s.quota.exclude(None);
+            s.quota.exclude(s.dataset_id, None);
         }
         s.compaction.running.store(false, Ordering::Release);
     }
@@ -1171,7 +1171,7 @@ impl Store {
         let build = (relink.is_none()).then(|| self.build_options(&snap0.generation));
         if self.root.is_some() {
             run.dir = Some(dir.clone());
-            self.quota.exclude(Some(&dir));
+            self.quota.exclude(self.dataset_id, Some(&dir));
             // Marks the directory as this dataset's unfinished build. Earlier releases
             // remove a marked directory at open, and this one removes every
             // generation newer than CURRENT (see `history::remove_newer_generations`).

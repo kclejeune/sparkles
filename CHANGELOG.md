@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Dataset storage quota accounting
+
+Dataset quotas now exclude unused write-ahead log, delta vocabulary and change-log
+segment space independently for each branch. Change records and sealed segment indexes
+count toward the shared quota.
+
 ### Online, transactional and historical full-text search
 
 Live datasets can enable or reconfigure full-text indexing while writes continue.

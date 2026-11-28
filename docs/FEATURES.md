@@ -44,6 +44,9 @@ preserve a refused decode's original error.
 
 Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with durable
 transactions, compaction, clones and integrity checks.
+[Dataset storage quotas](storage/README.md#dataset-storage-quotas) cover all branches
+and exclude unused space in their write-ahead logs, delta vocabularies, annotations
+and open change-log segments.
 [History and branches](storage/README.md#versioning-and-history) provide retained
 commits, time travel, diffs, change feeds, RDF Patch and merge review, including nested
 triple terms in HTTP history and diff filters. Snapshots share persistent maps and vectors

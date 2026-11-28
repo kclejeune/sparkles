@@ -2995,24 +2995,35 @@ impl Store {
         if !retire {
             gone.insert(0, e.id);
         }
+        // An open that read the table before deletion can still be installing the
+        // store. Wait for it before taking the entry and withdrawing its quota credit.
+        let removed_stores: Vec<_> = {
+            let _opening = set.opening.lock();
+            let mut stores = set.stores.lock();
+            gone.iter().filter_map(|id| stores.remove(id)).collect()
+        };
         for id in &gone {
-            let store = set.stores.lock().remove(id);
             set.merges.write().remove(id);
             set.broken.lock().remove(id);
-            if let Some(mem) = store.as_ref().and_then(|s| s.mem_history.as_ref()) {
+        }
+        for store in &removed_stores {
+            if let Some(mem) = &store.mem_history {
                 mem.lock().branch_bases.clear();
             }
-            drop(store);
         }
+        drop(removed_stores);
         set.refresh_holds(self);
         for id in gone.iter().filter(|_| !set.memory) {
+            self.quota.unregister_store(*id);
             let dir = set.branch_root(*id);
             let doomed = dir.with_extension("deleting");
             if dir.exists() {
                 std::fs::rename(&dir, &doomed)?;
                 sync_dir(&root.join(BRANCHES_DIR))?;
                 self.failpoint("branch-delete-renamed");
-                std::fs::remove_dir_all(&doomed)?;
+                let removed = std::fs::remove_dir_all(&doomed);
+                self.quota.invalidate();
+                removed?;
             }
         }
         // The deleted branch's directory and holds are gone. Collection of other

@@ -15,10 +15,12 @@
 use super::{Store, dir_size, write_atomic};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// The file in the dataset directory that holds a dataset's own quota.
 pub const QUOTA_FILE: &str = "quota.json";
@@ -58,25 +60,56 @@ pub struct QuotaStatus {
     pub used_bytes: u64,
 }
 
+/// Unused file tails and the staged compaction of one writable store.
+#[derive(Default)]
+struct StoreUsage {
+    generation: u64,
+    annotations: u64,
+    changes: u64,
+    building: Option<PathBuf>,
+}
+
+impl StoreUsage {
+    fn total(&self) -> u64 {
+        self.generation + self.annotations + self.changes
+    }
+}
+
+#[derive(Default)]
+struct Measurement {
+    at: Option<Instant>,
+    physical_bytes: u64,
+    stores: FxHashMap<Uuid, StoreUsage>,
+    padding: u64,
+}
+
+impl Measurement {
+    fn update_padding(&mut self, store: Uuid, update: impl FnOnce(&mut StoreUsage)) -> bool {
+        let Some(padding) = self.stores.get_mut(&store) else {
+            return false;
+        };
+        self.padding -= padding.total();
+        update(padding);
+        self.padding += padding.total();
+        true
+    }
+
+    fn building_bytes(&self) -> u64 {
+        self.stores
+            .values()
+            .filter_map(|p| p.building.as_deref())
+            .map(dir_size)
+            .sum()
+    }
+}
+
 pub(crate) struct Quota {
     root: Option<PathBuf>,
     default: Option<u64>,
     /// the dataset's own quota (`Some(0)`: unlimited)
     own: RwLock<Option<u64>>,
-    used: AtomicU64,
-    /// when `used` was last measured by a walk (`None`: never, or invalidated)
-    measured: Mutex<Option<Instant>>,
-    /// a generation a background compaction is building: not counted, so that a
-    /// compaction never makes the dataset refuse writes
-    excluded: Mutex<Option<PathBuf>>,
-    /// bytes preallocated after the last commit of the write-ahead log: on disk, but
-    /// not counted (see [`StoreOptions::wal_prealloc_bytes`](super::StoreOptions::wal_prealloc_bytes))
-    preallocated: AtomicU64,
-    /// the same after the last chunk of the delta vocabulary
-    vocab_preallocated: AtomicU64,
-    /// the same after the last record of `annotations.bin`, summed over the stores of the
-    /// dataset, each of which reports its own changes
-    ann_preallocated: AtomicU64,
+    /// The cached walk and the padding of the stores it measures.
+    measured: Mutex<Measurement>,
     /// the records of grouped commits queued for their fence, which the leader writes to
     /// the log later: counted as if they were in it
     queued: AtomicU64,
@@ -102,12 +135,7 @@ impl Quota {
             root: root.map(Path::to_path_buf),
             default: root.and(default),
             own: RwLock::new(own),
-            used: AtomicU64::new(0),
-            measured: Mutex::new(None),
-            excluded: Mutex::new(None),
-            preallocated: AtomicU64::new(0),
-            vocab_preallocated: AtomicU64::new(0),
-            ann_preallocated: AtomicU64::new(0),
+            measured: Mutex::new(Measurement::default()),
             queued: AtomicU64::new(0),
             promised: AtomicU64::new(0),
             measures: AtomicU64::new(0),
@@ -130,26 +158,21 @@ impl Quota {
     pub(crate) fn used(&self) -> u64 {
         let Some(root) = &self.root else { return 0 };
         let mut m = self.measured.lock();
-        if m.is_none_or(|t| t.elapsed() >= MAX_AGE) {
+        if m.at.is_none_or(|t| t.elapsed() >= MAX_AGE) {
             #[cfg(test)]
             if let Some(hook) = self.walking.lock().take() {
                 hook();
             }
-            let building = self.excluded.lock().as_deref().map_or(0, dir_size);
-            self.used
-                .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
-            *m = Some(Instant::now());
+            let building = m.building_bytes();
+            m.physical_bytes = dir_size(root).saturating_sub(building);
+            m.at = Some(Instant::now());
             // counted once the walk is done, so that a fence that read the count while
             // this walk was reading the directory sees it change
             self.measures.fetch_add(1, Ordering::Relaxed);
         }
-        // the zero bytes preallocated after the last commit of the log, after the last
-        // chunk of the delta vocabulary and after the last annotation record are not data
-        (self.used.load(Ordering::Relaxed) + self.queued.load(Ordering::Relaxed)).saturating_sub(
-            self.preallocated.load(Ordering::Relaxed)
-                + self.vocab_preallocated.load(Ordering::Relaxed)
-                + self.ann_preallocated.load(Ordering::Relaxed),
-        )
+        m.physical_bytes
+            .saturating_sub(m.padding)
+            .saturating_add(self.queued.load(Ordering::Relaxed))
     }
 
     /// How many walks of the directory have finished, so that a group commit fence can
@@ -161,8 +184,9 @@ impl Quota {
 
     /// Measure the directory again on the next use: a walk during a fence may have seen
     /// the fence's growth, which the fence then counted again.
+    #[cfg(test)]
     pub(crate) fn remeasure(&self) {
-        *self.measured.lock() = None;
+        self.measured.lock().at = None;
     }
 
     /// Run `hook` inside the next directory walk, while it holds the measurement's lock
@@ -219,20 +243,23 @@ impl Quota {
     /// quota counts the prefix twice or not at all.
     pub(crate) fn written<'a>(
         &self,
+        store: Uuid,
         reservations: impl IntoIterator<Item = &'a Reservation>,
         grew: u64,
-        preallocated: u64,
-        vocab_preallocated: u64,
-        ann_preallocated: Option<(u64, u64)>,
+        generation_padding: u64,
+        annotation_padding: Option<u64>,
+        measures_before: u64,
     ) {
-        let _m = self.measured.lock();
+        let mut measured = self.measured.lock();
         let released: u64 = reservations.into_iter().map(Reservation::take).sum();
         self.dequeue(released);
-        self.add(grew);
-        self.set_preallocated(preallocated);
-        self.set_vocab_preallocated(vocab_preallocated);
-        if let Some((was, now)) = ann_preallocated {
-            self.move_ann_preallocated(was, now);
+        if measured.update_padding(store, |pad| {
+            pad.generation = generation_padding;
+            if let Some(bytes) = annotation_padding {
+                pad.annotations = bytes;
+            }
+        }) {
+            self.account_growth(&mut measured, grew, measures_before);
         }
     }
 
@@ -250,61 +277,100 @@ impl Quota {
 
     /// Leave `dir` (a generation being built in the background) out of the measured
     /// size, or stop leaving one out (`None`).
-    pub(crate) fn exclude(&self, dir: Option<&Path>) {
-        *self.excluded.lock() = dir.map(Path::to_path_buf);
-        self.invalidate();
+    pub(crate) fn exclude(&self, store: Uuid, dir: Option<&Path>) {
+        let mut measured = self.measured.lock();
+        if let Some(pad) = measured.stores.get_mut(&store) {
+            pad.building = dir.map(Path::to_path_buf);
+            measured.at = None;
+        }
     }
 
     /// The next [`used`](Self::used) walks the directory (after a rebuild).
     pub(crate) fn invalidate(&self) {
-        *self.measured.lock() = None;
+        self.measured.lock().at = None;
     }
 
-    /// The write-ahead log now holds `bytes` of preallocated zeros after its last commit.
-    pub(crate) fn set_preallocated(&self, bytes: u64) {
-        self.preallocated.store(bytes, Ordering::Relaxed);
+    /// Writable open truncates the previous writer's unused tails.
+    pub(super) fn register_store(&self, store: Uuid) {
+        let mut measured = self.measured.lock();
+        if let Some(old) = measured.stores.insert(store, StoreUsage::default()) {
+            measured.padding -= old.total();
+        }
+        measured.at = None;
     }
 
-    /// The delta vocabulary now holds `bytes` of preallocated zeros after its last chunk.
-    pub(crate) fn set_vocab_preallocated(&self, bytes: u64) {
-        self.vocab_preallocated.store(bytes, Ordering::Relaxed);
+    /// Drop a deleted branch's credit before unlinking its files. Retained handles
+    /// can still finish work but cannot update the dataset's measured size.
+    pub(super) fn unregister_store(&self, store: Uuid) {
+        let mut measured = self.measured.lock();
+        if let Some(old) = measured.stores.remove(&store) {
+            measured.padding -= old.total();
+        }
+        measured.at = None;
     }
 
-    /// The zero bytes preallocated after the last record of `annotations.bin`.
+    pub(super) fn set_generation_padding(&self, store: Uuid, bytes: u64, adopted: Option<&Path>) {
+        let mut measured = self.measured.lock();
+        if measured.update_padding(store, |pad| {
+            pad.generation = bytes;
+            if adopted.is_some() && adopted == pad.building.as_deref() {
+                pad.building = None;
+            }
+        }) {
+            measured.at = None;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn ann_preallocated(&self) -> u64 {
-        self.ann_preallocated.load(Ordering::Relaxed)
+        self.measured
+            .lock()
+            .stores
+            .values()
+            .map(|p| p.annotations)
+            .sum()
     }
 
-    /// One store's `annotations.bin` now holds `now` bytes of preallocated zeros after its
-    /// last record, where it last reported `was` (see `Tail::take_prealloc`).
-    pub(crate) fn move_ann_preallocated(&self, was: u64, now: u64) {
-        // one step, so no reader sees both or neither of the two amounts
-        if now >= was {
-            self.ann_preallocated
-                .fetch_add(now - was, Ordering::Relaxed);
-        } else {
-            self.ann_preallocated
-                .fetch_sub(was - now, Ordering::Relaxed);
-        }
-    }
-
-    /// A small commit grew the write-ahead log by `bytes`, its records and any zeros
-    /// preallocated after them.
-    pub(crate) fn add(&self, bytes: u64) {
-        if self.root.is_some() {
-            self.used.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    /// Account for a file append outside the WAL fence. A walk that finished since
-    /// the append began may already include it, so refresh the cache in that case.
-    pub(super) fn account_append(&self, bytes: u64, measures_before: u64) {
+    /// Charge an append and its new padding together. Rewrites, removals, and
+    /// failures invalidate the walk rather than estimating a size change.
+    fn account_padding(
+        &self,
+        store: Uuid,
+        update: impl FnOnce(&mut StoreUsage),
+        growth: Option<(u64, u64)>,
+    ) {
         let mut measured = self.measured.lock();
+        if measured.update_padding(store, update) {
+            if let Some((bytes, measures_before)) = growth {
+                self.account_growth(&mut measured, bytes, measures_before);
+            } else {
+                measured.at = None;
+            }
+        }
+    }
+
+    pub(super) fn account_annotations(&self, store: Uuid, bytes: u64, growth: Option<(u64, u64)>) {
+        self.account_padding(store, |pad| pad.annotations = bytes, growth);
+    }
+
+    pub(super) fn account_changes(&self, store: Uuid, bytes: u64, growth: Option<(u64, u64)>) {
+        self.account_padding(store, |pad| pad.changes = bytes, growth);
+    }
+
+    /// Account for an append outside the WAL fence. A walk that finished since
+    /// the append began may already include it, so refresh the cache in that case.
+    pub(super) fn account_append(&self, store: Uuid, bytes: u64, measures_before: u64) {
+        let mut measured = self.measured.lock();
+        if measured.stores.contains_key(&store) {
+            self.account_growth(&mut measured, bytes, measures_before);
+        }
+    }
+
+    fn account_growth(&self, measured: &mut Measurement, bytes: u64, measures_before: u64) {
         if self.measures() == measures_before {
-            self.add(bytes);
+            measured.physical_bytes += bytes;
         } else {
-            *measured = None;
+            measured.at = None;
         }
     }
 
@@ -335,17 +401,16 @@ impl Quota {
     /// before, so a replace that shrinks a dataset over its quota goes through. Both
     /// sizes come from walks made here. The cached measurement of [`used`](Self::used) is
     /// not used, since a walk made during a long build would count `new` in it.
-    pub(crate) fn check_rebuild(&self, old: Option<&Path>, new: &Path) -> Result<()> {
-        let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
+    pub(crate) fn check_rebuild(
+        &self,
+        generation_store: Option<Uuid>,
+        old: Option<&Path>,
+        new: &Path,
+    ) -> Result<()> {
+        let Some((limit, before, projected)) = self.project_rebuild(generation_store, old, new)
+        else {
             return Ok(());
         };
-        let building = self.excluded.lock().as_deref().map_or(0, dir_size);
-        // the zeros after the annotation records are not data, as for `used`
-        let now = dir_size(root)
-            .saturating_sub(building)
-            .saturating_sub(self.ann_preallocated.load(Ordering::Relaxed));
-        let before = now.saturating_sub(dir_size(new));
-        let projected = now.saturating_sub(old.map_or(0, dir_size));
         if projected > limit && projected > before {
             return Err(Self::exceeded(limit, projected));
         }
@@ -365,17 +430,27 @@ impl Quota {
     /// [`check_rebuild`](Self::check_rebuild) measures them (`None` without a quota).
     pub(crate) fn project_rebuild(
         &self,
+        generation_store: Option<Uuid>,
         old: Option<&Path>,
         new: &Path,
     ) -> Option<(u64, u64, u64)> {
         let (Some(limit), Some(root)) = (self.limit(), &self.root) else {
             return None;
         };
-        let now = dir_size(root).saturating_sub(self.ann_preallocated.load(Ordering::Relaxed));
+        let measured = self.measured.lock();
+        let now = dir_size(root)
+            .saturating_sub(measured.building_bytes())
+            .saturating_sub(measured.padding);
+        let old = old.map_or(0, |path| {
+            let padding = generation_store
+                .and_then(|store| measured.stores.get(&store))
+                .map_or(0, |p| p.generation);
+            dir_size(path).saturating_sub(padding)
+        });
         Some((
             limit,
             now.saturating_sub(dir_size(new)),
-            now.saturating_sub(old.map_or(0, dir_size)),
+            now.saturating_sub(old),
         ))
     }
 
@@ -606,6 +681,226 @@ mod tests {
         let m = Store::in_memory(StoreOptions::default());
         assert!(m.set_quota(Some(1)).is_err());
         assert_eq!(m.quota().used_bytes, 0);
+    }
+
+    #[test]
+    fn deleted_store_reports_release_reservations_without_changing_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let quota = std::sync::Arc::new(Quota::open(Some(dir.path()), None).unwrap());
+        let id = Uuid::new_v4();
+        quota.register_store(id);
+        let before = quota.used();
+        let reservation = quota.reserve(100);
+        assert_eq!(quota.used(), before + 100);
+
+        quota.unregister_store(id);
+        assert_eq!(quota.used(), before + 100);
+        let measures = quota.measures();
+        quota.written(id, [&reservation], 10_000, 3_000, Some(500), measures);
+        quota.account_changes(id, 1_000, Some((2_000, measures)));
+        assert_eq!(quota.queued(), 0);
+        assert_eq!(quota.used(), before);
+    }
+
+    fn insert(s: &Store, tag: &str) -> Result<()> {
+        let update = format!("INSERT DATA {{ <urn:{tag}> <urn:p> \"{tag}\" }}");
+        crate::sparql::update::update(s, &update, &Default::default()).map(|_| ())
+    }
+
+    fn generation_padding(s: &Store) -> (u64, u64) {
+        let view = s.snapshot();
+        let dir = view.generation.dir.as_ref().unwrap();
+        let length = |file| dir.join(file).metadata().unwrap().len();
+        let wal = length("wal.log") - s.wal_bytes();
+        let vocab = length("delta.vocab") - view.generation.dvocab.file_state().0;
+        (wal, vocab)
+    }
+
+    fn change_padding(s: &Store) -> u64 {
+        let path = s.root.as_ref().unwrap().join(super::super::CHANGES_DIR);
+        let logs = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap());
+        let allocated: u64 = logs
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        allocated - s.change_log_status().unwrap().bytes
+    }
+
+    fn assert_quota_usage(main: &Store, stores: &[&Store]) {
+        let padding: u64 = stores
+            .iter()
+            .map(|s| {
+                let (wal, vocab) = generation_padding(s);
+                wal + vocab + change_padding(s)
+            })
+            .sum();
+        main.quota.invalidate();
+        assert_eq!(main.disk_usage(), main.disk_bytes() - padding);
+    }
+
+    #[test]
+    fn branch_preallocation_quota_tracks_each_store_through_compaction_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            wal_prealloc_bytes: 128 << 10,
+            change_log: false,
+            ..Default::default()
+        };
+        let main = Store::open(dir.path(), opts.clone()).unwrap();
+        insert(&main, "main-first").unwrap();
+        main.create_branch("left", &Default::default()).unwrap();
+        main.create_branch("right", &Default::default()).unwrap();
+        let left = main.branch("left").unwrap();
+        let right = main.branch("right").unwrap();
+        assert_quota_usage(&main, &[&main, &left, &right]);
+
+        std::thread::scope(|scope| {
+            let write_left = scope.spawn(|| insert(&left, "left-first"));
+            let write_right = scope.spawn(|| insert(&right, "right-first"));
+            write_left.join().unwrap().unwrap();
+            write_right.join().unwrap().unwrap();
+        });
+        for store in [&main, &*left, &*right] {
+            let (wal, vocab) = generation_padding(store);
+            assert!(wal > 0 && vocab > 0, "WAL {wal}, vocabulary {vocab}");
+        }
+        assert_quota_usage(&main, &[&main, &left, &right]);
+
+        // A rebuild replaces its own generation at its logical size.
+        main.set_quota(Some(u64::MAX)).unwrap();
+        main.quota.invalidate();
+        let used = main.disk_usage();
+        let live = left.snapshot();
+        let old = live.generation.dir.as_deref().unwrap();
+        let staging = dir.path().join("quota-test-rebuild");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("data"), [0; 128]).unwrap();
+        let (_, before, projected) = main
+            .quota
+            .project_rebuild(Some(left.dataset_id()), Some(old), &staging)
+            .unwrap();
+        let (wal, vocab) = generation_padding(&left);
+        assert_eq!(before, used);
+        assert_eq!(projected, used + 128 - (dir_size(old) - wal - vocab));
+        std::fs::remove_dir_all(staging).unwrap();
+        main.set_quota(None).unwrap();
+
+        let right_padding = generation_padding(&right);
+        left.compact().unwrap();
+        assert_eq!(generation_padding(&left), (0, 0));
+        assert_eq!(generation_padding(&right), right_padding);
+        assert_quota_usage(&main, &[&main, &left, &right]);
+        insert(&left, "left-after-compaction").unwrap();
+        insert(&right, "right-second").unwrap();
+        assert_quota_usage(&main, &[&main, &left, &right]);
+
+        main.delete_branch("left", true).unwrap();
+        assert!(!left.root.as_ref().unwrap().exists());
+        assert_quota_usage(&main, &[&main, &right]);
+        drop(left);
+        assert_quota_usage(&main, &[&main, &right]);
+        drop(right);
+        drop(main);
+
+        let reopened = Store::open(dir.path(), opts).unwrap();
+        assert_eq!(reopened.disk_usage(), reopened.disk_bytes());
+        let right = reopened.branch("right").unwrap();
+        insert(&right, "right-reopened").unwrap();
+        assert_quota_usage(&reopened, &[&reopened, &right]);
+    }
+
+    #[test]
+    fn change_log_preallocation_quota_tracks_roll_reopen_disable_and_branch_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StoreOptions {
+            wal_prealloc_bytes: 0,
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let main = Store::open(dir.path(), options.clone()).unwrap();
+        main.change_log().unwrap().set_background(false);
+        insert(&main, "small").unwrap();
+        main.flush_change_log().unwrap();
+        let padding = change_padding(&main);
+        assert!(padding > 32 << 10, "open segment padding {padding}");
+        assert_quota_usage(&main, &[&main]);
+
+        let limit = main.disk_usage() + (16 << 10);
+        main.set_quota(Some(limit)).unwrap();
+        assert!(main.disk_bytes() > limit);
+        insert(&main, "fits-below-quota").unwrap();
+        main.flush_change_log().unwrap();
+        assert_quota_usage(&main, &[&main]);
+
+        // This record rolls the segment. The index and all records count in the quota.
+        insert(&main, &"large".repeat(600)).unwrap();
+        main.flush_change_log().unwrap();
+        assert_eq!(change_padding(&main), 0);
+        assert_quota_usage(&main, &[&main]);
+
+        insert(&main, "after-roll").unwrap();
+        main.flush_change_log().unwrap();
+        let status = main.change_log_status().unwrap();
+        assert_eq!(status.segments, 2);
+        assert!(change_padding(&main) > 32 << 10);
+        assert_quota_usage(&main, &[&main]);
+
+        // Copy the durable but still padded segment, as it would be after a restart
+        // that occurred before clean shutdown could trim it.
+        let restart = tempfile::tempdir().unwrap();
+        super::super::compaction_tests::copy_dir(dir.path(), restart.path());
+        let recovered = Store::open(restart.path(), options).unwrap();
+        assert_eq!(recovered.change_log_status().unwrap().bytes, status.bytes);
+        assert_eq!(recovered.change_log_status().unwrap().last, status.last);
+        assert_eq!(change_padding(&recovered), 0);
+        assert_quota_usage(&recovered, &[&recovered]);
+
+        main.set_quota(None).unwrap();
+        main.create_branch("dev", &Default::default()).unwrap();
+        let dev = main.branch("dev").unwrap();
+        dev.change_log().unwrap().set_background(false);
+        insert(&dev, "on-branch").unwrap();
+        dev.flush_change_log().unwrap();
+        assert!(change_padding(&dev) > 32 << 10);
+        assert_quota_usage(&main, &[&main, &dev]);
+        main.delete_branch("dev", true).unwrap();
+        assert_quota_usage(&main, &[&main]);
+        drop(dev);
+
+        main.set_change_log_settings(super::super::ChangeLogSettings {
+            enabled: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(change_padding(&main), 0);
+        assert_quota_usage(&main, &[&main]);
+    }
+
+    #[test]
+    fn tight_dataset_quota_admits_real_growth_and_refuses_excess_across_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        insert(&main, "seed").unwrap();
+        main.create_branch("dev", &Default::default()).unwrap();
+        let dev = main.branch("dev").unwrap();
+        insert(&dev, "dev-seed").unwrap();
+        main.flush_change_log().unwrap();
+        dev.flush_change_log().unwrap();
+        assert_quota_usage(&main, &[&main, &dev]);
+        let limit = main.disk_usage() + (16 << 10);
+        main.set_quota(Some(limit)).unwrap();
+        assert!(main.disk_bytes() > limit);
+
+        insert(&main, "main-fits").unwrap();
+        insert(&dev, "dev-fits").unwrap();
+        let head = dev.head_commit();
+        let (refused_limit, wanted) = quota_err(insert(&dev, &"x".repeat(32 << 10)).unwrap_err());
+        assert_eq!(refused_limit, limit);
+        assert!(wanted > limit);
+        assert_eq!(dev.head_commit().seq, head.seq);
     }
 
     #[test]

@@ -132,7 +132,7 @@ impl Recovery {
         if let (Some(quota), Some(root), Some(staging)) =
             (self.quota.upgrade(), self.root.as_deref(), self.staging())
         {
-            quota.check_rebuild(Some(&root.join("text")), &staging)?;
+            quota.check_rebuild(None, Some(&root.join("text")), &staging)?;
         }
         Ok(())
     }
@@ -1154,10 +1154,10 @@ mod tests {
         store.set_quota(Some(u64::MAX)).unwrap();
         let old = root.join("text");
         let new = root.join("text.new");
-        let (_, _, projected) = store.quota.project_rebuild(Some(&old), &new).unwrap();
+        let (_, _, projected) = store.quota.project_rebuild(None, Some(&old), &new).unwrap();
         store.set_quota(Some(projected + 4096)).unwrap();
         // The same quota admits the staged index before the final tail is indexed.
-        store.quota.check_rebuild(Some(&old), &new).unwrap();
+        store.quota.check_rebuild(None, Some(&old), &new).unwrap();
         pause.resume();
         assert!(
             job.wait().is_err(),
