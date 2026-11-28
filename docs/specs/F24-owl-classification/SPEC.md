@@ -4605,9 +4605,13 @@ where the context holds its negative name, is not built, and the last part of th
 subsection gives the reason.
 
 Each part states the change, the clause set that the run saturates, and why that clause
-set has the consequences of the ontology between its classes and no others. Soundness is
-then the paper's Theorem 8 and completeness its Theorem 9 for that clause set, since both
-hold for any set of DL-clauses, as the subsection on the order states. The parts build on
+set has the consequences of the ontology between its classes and no others. Completeness
+is then the paper's Theorem 9 for that clause set, since it holds for any set of
+DL-clauses, as the subsection on the order states. Soundness is the paper's Theorem 8 for
+a clause set that contains every clause the run applies. Where the run applies clauses
+beyond the saturated set, such as the unweakened told step `G_2(x) → W_2(x)` or an
+inclusion that only units take, that clause set is item 894's `O⁺` with the names of the
+third part and the guarded clauses of the fourth, and the part says so. The parts build on
 `O'`, the weakened clause set of [the order's argument](#the-order-between-number-restrictions),
 in which the told step of a minimum's name `G_2` to its witnesses is
 `G_2(x) → W_2(x) ∨ ⋁ G_1(x)` over the blockers `G_1` of `G_2`.
@@ -4622,17 +4626,29 @@ tests the three cases in this order. A unit `G_2` still waits in the context unt
 taken its units, as item 894 describes.
 
 Each skipped step has a conclusion that the context already contains up to redundancy.
-Hyper on `C` and the clause of `O'` gives `Γ → Δ ∨ W_2(x) ∨ ⋁ G_1(x)`, one clause for each
-existential restriction of `W_2`. A unit blocker subsumes it, as before, and so does `D`
-in the second new case. In the first, the atom `G_1(x)` of the body entered the context
-through the marker `G_1 → G_1` of the hypothesis that a predecessor sent, since every atom
-in the body of a context clause comes from such a marker, and the marker subsumes the
-conclusion. The paper's elimination rule deletes a clause only when another clause of the
-context contains it, so the marker, or `D`, is either kept or replaced by a clause that
+Hyper on `C` and the clause of `O'` gives `Γ → Δ ∨ W_2(x) ∨ ⋁ G_1(x)`, in which `W_2` is
+the one interned conjunction literal that the told step derives, and the conjunction rule
+then gives its conjuncts one by one. A unit blocker subsumes this conclusion, as before.
+In the second new case `D` subsumes it, since `dl_clause`'s `has_clause_blocker` accepts
+in `D`'s head only the literals of `Δ` other than `G_2`, the literal `W_2` itself and the
+blockers of `G_2`. The step is redundant as the Hyper conclusion on `W_2`, and the
+conjunction rule gives the projections onto the conjuncts from the clause that subsumes
+it. In the first new case the scan tests
+only the class atom `G_1(x)` of `Γ` and no other atom of the body, such as the role atom
+that the rule of a qualified role adds. In a run without the root a class atom over `x`
+enters the body of a context clause only through the marker `G_1 → G_1` of a hypothesis,
+which `dl_rules::hyp` adds when a predecessor sends `G_1`, and the other rules only carry
+such an atom from the bodies of their premises into their conclusions. The marker's body
+and head are both within the conclusion, so the marker subsumes it. The paper's
+elimination rule deletes a clause only when another clause of the context contains it, so the marker, or `D`, is either kept or replaced by a clause that
 also subsumes the conclusion, which is the unit `G_1`, the clause `G_1 → ⊥`, a stronger
-blocker clause or the empty clause. A context of the run is therefore saturated for `O'` up to redundancy, and
-Theorem 9 applies to `O'` as before. A blocker that arrives after `W_2` was derived leaves
-sound clauses behind, as with units. The scan reads every literal of `C`, every blocker
+blocker clause or the empty clause. Where no case applies, the run takes the told step and
+derives `Γ → Δ ∨ W_2(x)`, a conclusion of the clause `G_2(x) → W_2(x)` of `O⁺` that
+subsumes the conclusion on `O'`'s clause. The clause `G_2(x) → W_2(x) ∨ ⋁ G_1(x)` that this
+argument uses is also a clause of `O_b`, the clause set of the next part, so a context of
+the run is saturated for `O_b` up to redundancy, and Theorem 9 applies to `O_b`, which the
+next part shows has the consequences of `O'`. A blocker that arrives after `W_2` was
+derived leaves sound clauses behind, as with units. The scan reads every literal of `C`, every blocker
 and every stored clause it inspects, dead or alive, charges this work to the run in chunks
 with the remainder carried from scan to scan, and polls the run's bounds, so cancellation,
 a deadline, the memory budget and a work bound stop it. A stopped scan marks the context
@@ -4650,26 +4666,43 @@ inclusion other than its witness inclusion and the order's, when `G_2` is in a d
 set that the order did not add, and when the normalization told the inclusion before the
 order added its own.
 
-Let `O_b` be `O'` without the clauses `G_1(x) → G_2(x)` of these pairs. `O_b` is within
-`O'`, so it is sound. A model of `O_b` becomes a model of `O'` with the same classes of the
-ontology when each such `G_2` is enlarged by every `G_1` of its pairs, repeated until
-nothing changes. A larger name in a head only makes a clause easier to satisfy, and
-outside the excluded cases the name of a minimum occurs in the body of three kinds of
-clause, which the enlargement keeps true. Its witness clause holds at an added element because
-that element is in the blocker `G_1`. An inclusion `G_2 ⊑ G_3` into a weaker minimum is
-matched by the inclusion `G_1 ⊑ G_3`, since entailment is transitive and, with nothing
-left out, the order relates every pair of representatives that entail each other or one
-the other. That inclusion is in `O_b`, or it is a pair of the same kind and the
-enlargement adds `G_1` to `G_3` as well. A disjointness set of `G_2` with the holder `M` of
-a maximum `≤k s.B` that `G_2` contradicts has its counterpart for `G_1`, since `G_1`'s
-minimum has at least `G_2`'s bound, a role below `G_2`'s and a filler below `G_2`'s, so it
-contradicts `M` too. The names that lost their own witnesses keep a route to witnesses on
-every clause, because their inclusion into a blocker is not of this kind. So `O_b` has the
-consequences of `O'` between the ontology's classes. The run applies the removed clauses to
-units as well, which adds conclusions of `O'` and therefore sound ones, and Theorem 9 needs
-only that each context be closed under the rules for `O_b`, which these extra clauses do
-not disturb. When the relations were cut at the bound, `skip_weaken` is empty and every
-clause takes every inclusion, as in item 894.
+Let `O_b` be `O'` without the clauses `G_1(x) → G_2(x)` of these pairs. The run applies
+the clauses of `O_b`, the removed clauses to units, and the told step `G_2(x) → W_2(x)`
+where nothing blocks it. These are all clauses of `O⁺`, so each conclusion is a
+consequence of `O⁺` by Theorem 8, and `O⁺` has the consequences of the ontology between
+its classes and no others by item 894's argument. The extra conclusions do not disturb
+completeness, since Theorem 9 needs only that each context be closed under the rules for
+`O_b`.
+
+`O_b` entails every consequence of `T` between the ontology's classes by item 894's
+induction on the blockers, which reads no inclusion between two names of minimums other
+than the inclusion of a name that lost its witnesses into a blocker. In a model of `O_b`,
+an element of a name `G_2` that keeps its witnesses satisfies `W_2` or is in a blocker
+`G_1`, by `G_2`'s clause, which `O_b` keeps. An element of a name that lost its witnesses
+is in a blocker through the mandatory inclusion that the condition above requires, and a
+mandatory inclusion is never in `skip_weaken`. By induction over the blockers, which have
+no cycle, the element has the neighbours of `G_2`'s minimum over its role in its filler,
+through the told role and class inclusions, which are clauses of `O_b`. So the name of a
+minimum is within its minimum in every model of `O_b`. The argument uses the condition on
+the names that lost their witnesses. The run also requires that nothing was cut at the
+bound, and when the relations were cut, `skip_weaken` is empty and every clause takes
+every inclusion, as in item 894.
+
+This suffices because a name of a minimum occurs only in positions where a smaller class
+leaves the axiom true, apart from its witness clause and the order's relations.
+`dl_norm`'s `at_least` makes the name and returns it as the positive form of the minimum.
+`neg`, `sub_order` and `shadow_negative` build the left side of an inclusion, a
+disjointness set, the body of a clause, the guard of a lazy clause and a qualifier only
+from classes of the ontology, fresh names of their own and expressions over these, and
+put every result of `pos` in a head. A name of a minimum therefore occurs in heads, in
+positive conjunctions and as the filler of a positive restriction, and on the left only in
+its witness inclusion and in the inclusions and disjointness sets that the order adds. So
+every model of `O_b` satisfies each axiom of `T` that states a minimum, and the other
+axioms of `T` are clauses of `O_b`. The exclusions of `skip_weaken` for a name on the left
+of another told inclusion, for a name in a disjointness set of the normalization and for
+an inclusion that the normalization told never apply to the normalization's output. They
+keep this premise if a later change of the normalization places a name of a minimum in a
+negative position.
 
 **Names of negative existential restrictions.** After every axiom is normalized and
 committed, `dl_norm::shadow_negative` replaces each existential restriction `∃r.g` over a
@@ -4715,14 +4748,19 @@ other minimum `≥n_i r_i.F_i` becomes a lazy clause with the plain guard,
 own qualifier, and its neighbours range over the successor terms and the predecessor with
 equalities in the head, as item 728's clauses do.
 
-The guarded set has the consequences of the axiom. A model of the axiom extends to the
-guarded set when `Y_i` is read as `≥n_i r_i.F_i` on the elements of the plain guard. In a
-model of the guarded set, an element of the left side satisfies the plain guard and each
-minimum, so the clauses of the other minimums give each `Y_i`, the first clause applies
-with its `n` qualified neighbours, and the head holds, which is the axiom. The qualifier of
-each clause is the negative form of its filler and the qualified role holds only for
-neighbours in that qualifier, so two neighbours outside `F` never fire a clause. These are
-DL-clauses of the paper's Section 2.4, and the rules that apply item 728's clauses apply
+The guarded set has the consequences of the axiom. The qualifier of each clause is the
+negative form `B` of its filler, with `F ⊑ B`, and the qualified role holds for the
+neighbours in `B`. A model of the axiom extends to the guarded set when `Y_i` is read as
+`≥n_i r_i.F_i` on the elements of the plain guard, and `B`, each name of a negative
+existential restriction within it and the qualified role are read exactly, as the
+expressions they stand for and as the edges into `F`. A clause then counts only
+neighbours in `F`, so it fires only where the axiom's left side holds, and its head holds
+there. A model of the guarded set may put further neighbours in `B`, and the converse
+direction does not need the reverse inclusion. In such a model, an element of the left
+side satisfies the plain guard and each minimum, every neighbour in a filler `F_i` is in
+its `B_i` and so qualifies, the clauses of the other minimums give each `Y_i`, the first
+clause applies with its `n` qualified neighbours, and the head holds, which is the axiom.
+These are DL-clauses of the paper's Section 2.4, and the rules that apply item 728's clauses apply
 them, with the guard as a premise that a unit, a maximal literal of a stored clause or a
 later derivation can supply, in any order of arrival. No at-most holder is made for a
 left minimum, which is how this form differs from the experiment that
@@ -4738,16 +4776,21 @@ form of a name `N` of a negative existential restriction `∃r'.B'` with `r' ⊑
 `B' ⊑ F`, held as a unit, as an atom of a clause's body or in the core. The three forms
 differ in what they need.
 
-The form that blocks the expansion where `N` is a unit is not complete. Take `X ⊑ A ⊔ B`,
-`A ⊑ ∃r.F`, `B ⊑ ∃r.F`, `X ⊑ U_1 ⊔ U_2`, `U_1 ⊑ ∀r.D_1`, `U_2 ⊑ ∀r.D_2`, `F` disjoint
-with `D_1` and with `D_2`, and `∃r.F ⊑ C`, whose name `N` has `F ⊑ ∀r⁻.N`. The ontology
+The form that blocks the expansion where `N` is a unit is not complete. It would skip the
+told step from a holder of the restriction, here `A` or `B` with `A ⊑ ∃r.F` and
+`B ⊑ ∃r.F`, to `∃r.F` while the context holds `N` as a unit, so that the restriction never
+enters the context's units. A unit `∃r.F` already gives the context its role and filler in
+place, which the universal rule reads, so the form has to act before that step. Take
+`X ⊑ A ⊔ B`, `A ⊑ ∃r.F`, `B ⊑ ∃r.F`, `X ⊑ U_1 ⊔ U_2`, `U_1 ⊑ ∀r.D_1`, `U_2 ⊑ ∀r.D_2`,
+`F` disjoint with `D_1` and with `D_2`, and `∃r.F ⊑ C`, whose name `N` has `F ⊑ ∀r⁻.N`. The ontology
 entails `X ⊑ ⊥`. In one admissible schedule, the context of `X` takes the case `A`, and the
 witness of `∃r.F` sends `N` back through Pred, which gives `B ∨ N`. The case `B` then gives
 the unit `N` through its own witness, and the unit deletes the clauses of `B`'s witness,
 which all hold `N` in their heads. The cases `U_1` and `U_2` then refute the witness of
-`A` and give the unit `B`, which deletes the clauses of `A`'s witness and gives the unit
-`∃r.F`. The unit `N` would block that restriction, and no witness would be left to
-refute. The name was derived from the restriction's own witnesses and then blocked the
+`A` and give the unit `B`, which deletes the clauses of `A`'s witness. The told step from
+the unit `B` to `∃r.F` is the only step left that derives the restriction, and the unit
+`N` would skip it, so `∃r.F` never becomes a unit, no witness is made and nothing is left
+to refute. The name was derived from the restriction's own witnesses and then blocked the
 restriction. This is a schedule of the clause-level rules and not a measured run. The
 ontology needs no counting and so turns no order on by itself, and the regression
 `section_4_1_counterexample_with_counting_trigger_entails_x_unsatisfiable` adds
@@ -4815,14 +4858,16 @@ changes. The other files differ between the two runs only in the number of concl
 on four threads, which varies from run to run. Three files pass the bound with counting and classify again without it.
 ore_ont_541 has no number restriction and counts because of one functional property, and
 its classification with counting requested takes 5.7 to 6.0 s against 1.6 to 1.8 s
-without counting, with the order or without it. ore_ont_14817 takes 10.7 to 11.9 s
-against 3.1 to 3.5 s, and 7.0 s when `number_order` is false, whose attempt passes the
-memory budget before the bound of conclusions. ore_ont_9663 takes 10.6 to 11.1 s against
-8.4 to 8.8 s. In each of these runs the time with counting requested is the failed
-attempt, then the run without counting under its own bound of 4 million conclusions, and
-then the Horn rules, since the run without counting also passes its bound on ore_ont_541
-and ore_ont_14817. The single runs on four threads put three more files above twice their time
-without counting, and on one thread ore_ont_8273, ore_ont_11110 and ore_ont_12141 derive
+without counting, with the order or without it. ore_ont_14817's classification with
+counting requested takes 10.7 to 11.9 s against 3.1 to 3.5 s, and 7.0 s when
+`number_order` is false, whose attempt passes the memory budget before the bound of
+conclusions. ore_ont_9663's takes 10.6 to 11.1 s against 8.4 to 8.8 s. Each of these
+times is of the whole classification, which is the failed attempt, then the run without
+counting under its own bound of 4 million conclusions, and then the Horn rules, since the
+run without counting also passes its bound on ore_ont_541 and ore_ont_14817. The medians
+do not separate the attempt's own time from the fallback's.
+The single runs on four threads put three more files above twice their time without
+counting, and on one thread ore_ont_8273, ore_ont_11110 and ore_ont_12141 derive
 the same conclusions in both runs and take the same time within the rounds' spread.
 
 The parent of the merge of these changes, commit fbe62c12 with the order, and the merge
@@ -4830,16 +4875,25 @@ itself, commit 3ba8f6d6, were measured in the same way in one more pair of round
 Before the changes, ore_ont_6485's attempt passes the bound and its classification with
 counting requested takes 230 to 244 ms, and after them the file finishes in 26 to 28 ms,
 so the four changes and not the order make it finish. Before them, ore_ont_14817's
-attempt passes the memory budget first and takes 7.0 to 8.0 s, and after them it runs to
-the bound of conclusions and takes 11.5 s in the round that the host's load did not
-disturb. ore_ont_541 takes 6.0 to 6.5 s in both builds, and ore_ont_6952 finishes in both.
+attempt passes the memory budget first and the classification with counting requested
+takes 7.0 to 8.0 s. After them the attempt runs to the bound of conclusions and the
+classification takes 11.5 s in the round that the host's load did not disturb. Both times
+include the fallback, so the attempt's flags show that its stopping condition changed,
+and the time of the attempt itself needs the phase timings. ore_ont_541 takes 6.0 to
+6.5 s in both builds, and ore_ont_6952 finishes in both.
 
 Counting stays off by default. The condition of item 896 that no development file costs
 more than twice its run without counting fails on ore_ont_541 and ore_ont_14817 at 3.4
 to 3.5 times, and on ore_ont_6485 at 3.8 to 3.9 times, where only the run with counting
-gives the complete taxonomy. A run that counts also rests on item 1229's repair, which is
-not proved, as the section on the disjunctive rules states. ore_ont_541's attempt is item
-1395, and the cost that the four changes add to ore_ont_14817's attempt is item 1396.
+gives the complete taxonomy. The default waits until every other development file meets
+that condition. ore_ont_6485 then has to meet it as well, or the maintainer has to accept
+its cost for its complete taxonomy as an exception for that file alone. Its run with
+counting also has to be within the speed target, or its attempt cost no more with the
+order than without it, which the comparison on `atlas` decides. A run that counts also
+rests on item 1229's repair, which is not proved, as the section on the disjunctive rules
+states. ore_ont_541's cost, which the four changes do not change, is item 1395, and the
+cost that they add to ore_ont_14817's classification with counting requested is item
+1396.
 
 #### Compound qualifiers of number restrictions
 
