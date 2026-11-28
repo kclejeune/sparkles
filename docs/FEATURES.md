@@ -199,7 +199,7 @@ instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Server and Fuseki integration](server/README.md#server-and-protocols) | Core complete | Fuseki protocols, config conversion, write previews, stored queries, read-only GraphQL and OpenAPI 3.1 are available. GraphQL Phase 2 and Fuseki or ARQ extensions remain under items 37, 39, 51, 76, 1339 and 1340. |
+| [Server and Fuseki integration](server/README.md#server-and-protocols) | Core complete | Fuseki protocols, config conversion, write previews, stored queries, read-only GraphQL and OpenAPI 3.1 are available. GraphQL Phase 2 and Fuseki or ARQ extensions remain under items 37, 39, 51, 76, 1339, 1340 and 1341. |
 | [Access control and authentication](server/README.md#access-control-and-security) | Core complete | Dataset, graph, branch, endpoint and triple guards pair with Basic, OIDC, API-token, trusted-proxy and TLS authentication. Provenance-based derived visibility, guarded view preparation and triple-restricted change feeds or validation remain planned. |
 | [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete | Layered server and dataset settings, operator locks, runtime administration and declared prefix completion span HTTP, the CLI, LSP and the web UI. |
 | [Resource catalog](server/README.md#resource-catalog) | Early (Phase 1) | DCAT 3 resource records, SPDX licence tracking, NOTICE generation, warning licence gates and vocabulary namespaces are available for administrators. Remote fetching, content-addressed storage, recipes, mirrors and export enforcement remain under items 458, 525 and 526. |

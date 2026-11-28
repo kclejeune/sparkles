@@ -1264,11 +1264,12 @@ fn parallel_requests_admit_their_answers() {
 
 /// The requests of a wave share the outbound time of the SPARQL request: with a total
 /// shorter than one response takes, every request of the wave is cut short within its
-/// share, the query fails with SILENT too, and no later wave goes out.
+/// share, the query fails with SILENT too, and no later wave goes out. Without shares
+/// each request would wait for the whole total of 2 s.
 #[test]
 fn parallel_requests_share_the_outbound_time() {
     let data = store(&departments(12));
-    let ep = Endpoint::start(data.clone(), Duration::from_millis(400));
+    let ep = Endpoint::start(data.clone(), Duration::from_secs(4));
     let q = |silent: &str| {
         format!(
             "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE {silent} <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
@@ -1276,20 +1277,160 @@ fn parallel_requests_share_the_outbound_time() {
         )
     };
     let mut o = opts();
-    o.outbound.request_timeout = Duration::from_millis(600);
+    o.outbound.request_timeout = Duration::from_secs(2);
     for silent in ["", "SILENT"] {
         let started = Instant::now();
         let r = run(&data, &q(silent), &o);
         assert!(r.is_err(), "{silent}: {r:?}");
-        // four shares of 150 ms, not four requests of 400 ms each
-        assert!(
-            started.elapsed() < Duration::from_millis(390),
-            "{silent}: {:?}",
-            started.elapsed()
-        );
+        // four shares of 500 ms, not four requests of 2 s each
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1700), "{silent}: {took:?}");
         let sent = ep.take().len();
         assert!(sent <= 4, "{silent}: {sent} requests were sent");
     }
+}
+
+/// A query cancelled while a wave is in flight sends no later wave. The requests in
+/// flight end when their responses arrive (roadmap item 1341), so the query waits for
+/// one wave and not for the three it would send.
+#[test]
+fn parallel_requests_stop_when_cancelled() {
+    let data = store(&departments(12));
+    let ep = Endpoint::start(data.clone(), Duration::from_secs(2));
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:parallel+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut o = opts();
+    o.cancel = Some(cancel.clone());
+    let flag = cancel.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, Ordering::SeqCst);
+    });
+    let started = Instant::now();
+    let r = run(&data, &q, &o);
+    t.join().unwrap();
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(3500), "{took:?}");
+    let sent = ep.take().len();
+    assert!(sent <= 4, "{sent} requests were sent");
+}
+
+/// `se:cacheRm` called through `fn:apply` or `afn:eval` removes nothing, with the right
+/// or without it, and the results of `se:cacheLs` are never kept in the query result
+/// cache: a second caller and a later listing each see the entries as they are.
+#[test]
+fn dynamic_removal_and_listings_in_the_result_cache() {
+    // a result cache that keeps every result, however fast
+    let data = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    data.load(&[Source::from_bytes(
+        departments(9).into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let data = Arc::new(data);
+    // the result cache does keep a plain query's result
+    let plain = "SELECT ?d { ?d a <urn:Department> }";
+    let caching0 = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    run(&data, plain, &caching0).unwrap();
+    let before = data.result_cache().hits();
+    run(&data, plain, &caching0).unwrap();
+    assert!(
+        data.result_cache().hits() > before,
+        "the result cache is on"
+    );
+    let listed_hits = || data.result_cache().hits();
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let url = ep.url();
+    let cached = |d: &str| {
+        format!(
+            "SELECT ?p {{ VALUES ?d {{ <urn:{d}> }} SERVICE <loop:cache:{url}> {{ ?d <urn:hasEmployee> ?p }} }}"
+        )
+    };
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id {{ ?id se:cacheLs () }}");
+    let caching = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    rows(&data, &cached("dept1"));
+    let hits = listed_hits();
+    assert_eq!(run(&data, &ls, &caching).unwrap().len(), 1);
+    assert_eq!(run(&data, &ls, &caching).unwrap().len(), 1);
+    assert_eq!(
+        listed_hits(),
+        hits,
+        "a listing was answered from the result cache"
+    );
+    rows(&data, &cached("dept2"));
+    assert_eq!(
+        run(&data, &ls, &caching).unwrap().len(),
+        2,
+        "a stale listing"
+    );
+    let mut bob = caching.clone();
+    bob.service_scope = Some("bob".into());
+    assert_eq!(
+        run(&data, &ls, &bob).unwrap().len(),
+        0,
+        "another caller's listing"
+    );
+    let mut admin = caching.clone();
+    admin.service_cache_mgmt = true;
+    for q in [
+        format!(
+            "{se} PREFIX fn: <http://www.w3.org/2005/xpath-functions#> SELECT (fn:apply(se:cacheRm) AS ?n) {{}}"
+        ),
+        format!(
+            "{se} PREFIX afn: <http://jena.apache.org/ARQ/function#> SELECT (afn:eval(se:cacheRm) AS ?n) {{}}"
+        ),
+    ] {
+        for o in [&caching, &admin] {
+            // an error of the expression leaves ?n unbound
+            assert_eq!(run(&data, &q, o).unwrap(), vec!["-".to_string()], "{q}");
+            assert_eq!(run(&data, &ls, &caching).unwrap().len(), 2, "{q}");
+        }
+    }
+}
+
+/// A listing admits its entries as it makes them, so a query under a small memory
+/// budget fails on a long listing that it would run without one.
+#[test]
+fn a_listing_admits_its_entries() {
+    use sparkles_core::BudgetKind;
+    let data = store(&departments(200));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    rows(
+        &data,
+        &format!(
+            "SELECT ?p {{ ?d a <urn:Department> SERVICE <loop:cache:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+            ep.url()
+        ),
+    );
+    let se = "PREFIX se: <http://jena.apache.org/service-enhancer#>";
+    let ls = format!("{se} SELECT ?id ?s ?q ?b {{ ?id se:cacheLs (?s ?q ?b) }}");
+    assert_eq!(run(&data, &ls, &opts()).unwrap().len(), 200);
+    let small = QueryOptions {
+        max_memory_bytes: Some(16 << 10),
+        ..opts()
+    };
+    // the same shape without a listing runs under the budget
+    assert!(run(&data, "SELECT ?id { VALUES ?id { 1 } }", &small).is_ok());
+    let r = run(&data, &ls, &small);
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
 }
 
 /// A dataset that keeps its SERVICE cache on disk answers a cached query from it after
