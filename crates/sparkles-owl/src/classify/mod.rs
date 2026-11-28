@@ -94,6 +94,8 @@ mod index;
 mod numeric;
 mod partial;
 mod polled;
+#[cfg(test)]
+mod pred_audit_tests;
 mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
@@ -13353,6 +13355,24 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
+            // the closure check of item 1229's lemma, for the tests that observe it
+            #[cfg(test)]
+            if pred_audit_tests::observing() {
+                let made = dynamic.iter().flat_map(|dy| {
+                    (0..dy.len() as Ex)
+                        .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
+                });
+                for (e, c) in self
+                    .ctx
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
+                    .chain(made)
+                {
+                    pred_audit_tests::record(dl_rules::pred_audit(&ix, e, &c.st.lock(), d));
+                }
+                pred_audit_tests::saturated();
+            }
             let decline = dl_root::marker_decline(limits.rooted_decline);
             if self.dl_rooted && open.is_none() && (dl_root::marker_diag() || decline.is_some()) {
                 #[cfg(test)]

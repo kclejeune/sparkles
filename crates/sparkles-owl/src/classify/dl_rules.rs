@@ -9010,3 +9010,103 @@ mod tests {
         assert!(refused, "budget below 8-bucket layout must refuse");
     }
 }
+
+/// What [`pred_audit`] finds in one saturated context: the clauses and units that Pred
+/// gives again and the context does not already hold, and a description of the first.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct PredAudit {
+    pub clauses: usize,
+    pub units: usize,
+    pub first: Option<String>,
+}
+
+/// The closure check of item 1229's lemma, for tests. After a saturation that finished,
+/// Pred is made again on a copy of the context `me` with every clause that each successor
+/// sent and every restriction that now reaches that successor, over `f_e(x)` and in a
+/// rooted run along each edge over `f_e(u)`. A context that the late rules left without
+/// one of these inferences gets a stored clause or a unit that it did not hold, and a
+/// closed context gets none. The check reads only the clauses that reached `pred_in`, so
+/// it says nothing about a clause that a successor never sent.
+#[cfg(test)]
+pub(super) fn pred_audit(ix: &Index, me: Ex, st: &State, run: &DlRun) -> PredAudit {
+    struct Rec<'a> {
+        run: &'a DlRun,
+        units: usize,
+    }
+    impl Sink for Rec<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, c: Concl) {
+            if matches!(c, Concl::Sub(_)) {
+                self.units += 1;
+            }
+        }
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+    }
+    let dx = dix(ix);
+    let root = dx.is_root(me);
+    let Some(x) = dl(st).filter(|_| !st.bottom) else {
+        return PredAudit::default();
+    };
+    let pairs: Vec<(Ex, u32)> = x
+        .pred_in
+        .iter()
+        .flat_map(|(&v, cids)| cids.iter().map(move |&cid| (v, cid)))
+        .collect();
+    let mut copy = st.clone();
+    let stored = |st: &State| dl(st).map_or(0, |x| x.store.clauses.len());
+    let before = stored(&copy);
+    let mut out = Rec { run, units: 0 };
+    let mut first = None;
+    for (v, cid) in pairs {
+        let mut es = Vec::new();
+        if !root {
+            for_each_reaching(dx, &copy, v, |e| {
+                if into_nominal(ix, e).is_none() {
+                    es.push(e);
+                }
+                true
+            });
+        }
+        let along: Vec<(Ex, u32)> = dl(&copy)
+            .and_then(|x| x.root.as_deref())
+            .map(|r| r.edges_to(v).to_vec())
+            .unwrap_or_default();
+        let n0 = stored(&copy) + out.units;
+        {
+            let mut guard = Guard::new(&mut out);
+            let mut found = Found {
+                root,
+                ..Found::default()
+            };
+            for &e in &es {
+                assert!(pred(ix, &copy, e, cid, None, &mut found, &mut guard));
+            }
+            for &(e, u) in &along {
+                assert!(super::dl_root::root_pred(
+                    ix, &copy, e, u, cid, None, &mut found, &mut guard
+                ));
+            }
+            if root {
+                drain_with_admitted(ix, &mut copy, found, &mut guard, &RootDerive);
+            } else {
+                drain_admitted(ix, &mut copy, found, &mut guard);
+            }
+        }
+        if first.is_none() && stored(&copy) + out.units > n0 {
+            let c = run.table.get(cid);
+            first = Some(format!(
+                "context {me}, successor {v}, restrictions {es:?}, edges {along:?}, clause {} → {}",
+                tr(ix, &run.lits, c.body()),
+                tr(ix, &run.lits, c.head())
+            ));
+        }
+    }
+    PredAudit {
+        clauses: stored(&copy) - before,
+        units: out.units,
+        first,
+    }
+}
