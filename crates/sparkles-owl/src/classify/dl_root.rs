@@ -11702,4 +11702,64 @@ Ontology(<http://example.org/g6>
             );
         }
     }
+
+    #[test]
+    fn the_closure_check_counts_a_fresh_promotion_to_the_root() {
+        // An empty-core hypothetical context z caches the successor's clause `→ B(b)` before
+        // any edge, and its edge to the successor opens with the replay off, so Pred never
+        // runs. Pred over the edge gives the ground fact, which `derive` promotes to the
+        // root without storing a clause or deriving a unit, and the check counts it as the
+        // only conclusion left out. With the replay on, the same edge makes the promotion
+        // and the check finds the context closed.
+        let mut s = Sig::new();
+        let nb = s.ind("b");
+        let [a, b, z] = ["A", "B", "Z"].map(|n| s.class(n));
+        let r = s.role("r");
+        let e1 = s.some_h(r, a);
+        let (ix, _) = probe_ix(s);
+        let w = dix(&ix).hyp[&e1];
+        let RTerm::C(ub) = c(nb, &ix) else {
+            unreachable!()
+        };
+        for mode in [0u8, 2] {
+            super::super::dl_rules::with_late_unit_mode_override(mode, || {
+                let run = DlRun::new(false, Default::default());
+                let mut out = Probe {
+                    run: &run,
+                    sent: Vec::new(),
+                    mine: Vec::new(),
+                };
+                let mut st = State {
+                    init: true,
+                    ..State::default()
+                };
+                ds(&mut st).empty_core = true;
+                let lb = atom(&ix, &out, b, ub);
+                let cid = run.table.push(Clause::new(Vec::new(), vec![lb]));
+                assert!(super::super::dl_rules::pred_c(
+                    &ix, z, &mut st, w, cid, &mut out
+                ));
+                ds(&mut st).insert_edge(e1, w);
+                let mut g = Guard::new(&mut out);
+                let mut found = Found::default();
+                super::super::dl_rules::late(&ix, z, &mut st, e1, w, "edge", &mut found, &mut g);
+                drain_admitted(&ix, &mut st, found, &mut g);
+                drop(g);
+                let held = dl(&st).unwrap().promoted.contains(&[lb][..]);
+                assert_eq!(held, mode != 0, "mode {mode}: the edge's own promotion");
+                let stored = dl(&st).unwrap().store.clauses.len();
+                let iso = run.audit_copy();
+                let f = super::super::dl_rules::pred_audit(&ix, z, &st, &iso);
+                assert!(!f.interrupted, "mode {mode}: {f:?}");
+                assert_eq!(f.replayed, 1, "mode {mode}: {f:?}");
+                assert_eq!((f.clauses, f.units), (0, 0), "mode {mode}: {f:?}");
+                assert_eq!(f.facts, usize::from(mode == 0), "mode {mode}: {f:?}");
+                assert_eq!(f.first.is_some(), mode == 0, "mode {mode}: {f:?}");
+                // the check leaves the context and the run it read as they were
+                assert_eq!(dl(&st).unwrap().promoted.contains(&[lb][..]), held);
+                assert_eq!(dl(&st).unwrap().store.clauses.len(), stored);
+                assert_eq!(run.table.len(), iso.table.len() - usize::from(mode == 0));
+            });
+        }
+    }
 }

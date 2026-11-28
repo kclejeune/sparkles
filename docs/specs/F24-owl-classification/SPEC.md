@@ -390,6 +390,53 @@ bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlie
 which a rooted run classifies again without counting or without the rooted rules when such
 a restriction or edge arrives, and `=0` turns both off, for measurement.
 
+A closure check now tests the replay's lemma, that after a saturation that finished, Pred
+with every clause a successor sent and every restriction that reaches the successor gives
+nothing the context does not already hold. The check replays the clauses that each context
+received from its successors, so it says nothing about a clause that a successor never
+sent. A diagnostic build ran a version of the check that counted the clauses the replay
+stored and the units it derived, so it could not see a context whose only missing
+conclusion is a ground fact promoted to the root. It attempted the check in 157,672 runs on
+each of three routes, rooted runs that count, rooted runs without counting and runs that
+count without the root, over the generated and fixture ontologies on one and four requested
+threads with both strategies. On each route 2,912 runs ended without a result, and 69,240,
+5,944 and 142,684 runs on the three routes gave an answer without a result from the check.
+The check therefore audited
+85,520, 148,816 and 12,076 runs, and with the replay it found no context open in any of
+them. With `SPARKLES_COUNTING_LATE_UNIT=0` it found open contexts in 5,902, 370 and 2,518
+runs that reported a complete answer on those routes. The dedicated unit tests run the
+check on the ontologies built around each order of arrival. Their version replays in a copy
+of the run, reads only saturations that finished, and also counts the ground facts that a
+hypothetical context promotes to the root. The check is a measurement, and item 1229 stays
+open for the proof that the replay covers every order.
+
+On the same corpora and 4,000 further generated ontologies, 170,620 rooted runs that count
+gave 89,134 answers in full. Where HermiT gave a reference answer, the answers that differ
+from it, apart from one row of a search whose temporary files collided, are the four
+configurations of one of the further generated ontologies, which has a second loss. That
+loss does not come from the order of arrival, and ontologies built around individuals with
+at-most restrictions find it often. The at-most rule acts on restrictions held at `x`, so an
+individual's own restrictions take effect in the context of its singleton and in a context
+that holds the restriction at `x`. The rule has no inference for a holder that a context
+represents only by a constant or by a successor term of a constant, as
+[the section on at-most restrictions at constants](#item-1229-at-most-restrictions-at-constants)
+describes. The loss is open and not contained, so such a run can still report a complete
+answer that misses a merge of an individual's values. Of 2,623 generated ontologies built
+around at-most restrictions at individuals, 312 of the 10,222 answers in full on one and
+four requested threads with both strategies differ from HermiT's reference answers. Of
+3,000 with qualified at-most restrictions whose qualifiers the neighbours meet by
+entailment, 256 of 10,894 differ. A check after the saturation for the premises of an
+at-most inference that no rule makes classified again without counting where it found
+them, and two versions of it were measured. The first counted every neighbour over the
+restriction's underlying role, whatever its qualifier, and contained every one of these
+losses. It also gave up the consistent cases of item 897's fixture of compound qualifiers,
+7,084 answers in full of the qualified set that HermiT confirms and 1,748 of the 89,134
+answers in full of the other generated and fixture sets. The second counted only the
+neighbours with an explicit atom of the qualified role. It kept item 897's fixture and
+missed a loss in four runs of the qualified set, since a context can hold a neighbour's
+qualifier without the atom of the qualified role. Item 1229 stays open for the proof of the
+replay, the containment and the repair.
+
 Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
 queried class and concerns an individual reached from another individual must reach the
 contexts registered for that individual, and its consequences there must come back to the
@@ -5500,6 +5547,38 @@ is the duplication of ground reasoning across contexts that item 1061 follows. I
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
+
+#### Item 1229: at-most restrictions at constants
+
+The at-most rule of a run that counts takes a holder of `≤n S.B` at `x` and counts the
+neighbours of `x` over S among its successor terms and its predecessor `y`, as the journal's
+rule does for the element of a context. In a rooted run the context of a singleton `N_u`
+has `x ≈ u`, so the rule applies the at-most restrictions of an individual there, over the
+successor terms that its assertions and its restrictions give. Another context applies one
+only when it holds the restriction at its own `x`, such as a context of a queried class
+that holds the restriction at `x` and identifies `x` with the individual. The rule has no
+inference for a holder that a context represents only by a constant or by a successor term
+of a constant, and it counts no neighbour of `x` that only a role atom to a constant gives.
+Hyper at a constant in the root applies inequalities but not at-most restrictions. The literals of a rooted run also have no equality `f(u) ≈ g(u)`
+between two successor terms of one constant. A merge in the context of `N_u` can give a
+ground consequence, such as an equality of two constants, that no rule carries to the root
+or to the other contexts that hold the constants. A rooted run that counts can therefore
+report a complete answer that leaves out an entailed subsumption. An individual with at
+most one r-value and two asserted r-values `b` and `c` makes `b ≈ c`, and a class whose
+p-value is `b` then has a p-value in every class of `c`, which the run misses. The same
+holds for a named and an anonymous value, for a case of a disjunction that the at-most
+restriction refutes into an equality, and for such a case under a queried class whose
+context reasons about the individual as a constant.
+
+The loss is neither contained nor repaired, and the Outcome records the measured attempts
+at a containment.
+
+The repair is an extension of the calculus. The at-most rule would apply at a constant in
+every context that holds the restriction there and at the successor terms of constants,
+count role atoms to constants beside the successor terms, and take equalities between
+successor terms of one constant, and a context's ground equalities would reach the root
+and the other contexts that hold the constants. Each part needs its own argument within the
+proof that item 823 asks for, so item 1229 stays open for it.
 
 #### Item 1075: binary splitting over disjunctive equalities of constants
 

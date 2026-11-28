@@ -44,6 +44,23 @@ C4 finishes with item 1231's repair off, and every complete rooted disjunctive a
 agrees with HermiT in every mode of the repair. The containment test adds the generated
 files H1 and U2, which fall back without the cut. Item 1324 follows the cut's cost on
 part022 p01 and the fallback on C4. This completes roadmap item 1250.
+### A closure check of the Pred replay and a recorded loss of rooted runs that count
+
+Dedicated unit tests now check their fixtures after every saturation that finished. The
+check replays in a copy of the run every clause that a successor sent with every
+restriction that reaches the successor, and it requires that Pred gives no clause, unit or
+promoted ground fact that the context does not already hold. A diagnostic build ran an
+earlier version of the check, which counted stored clauses and units, on the generated and
+fixture sets of rooted runs and runs that count. With item 1229's replay of late
+restrictions it found no context open in the runs it audited, and with
+`SPARKLES_COUNTING_LATE_UNIT=0` it found the inferences that the late restrictions left
+out. The at-most rule of a rooted run with `Limits::counting` acts only on restrictions
+held at `x` and has no inference for a holder represented only by a constant or its
+successor term, and the ground equalities that a merge gives reach no other context. Such a
+run can therefore miss a merge of two values of an individual and report a complete
+answer. The F24 spec records the loss and the measured attempts at
+containing it, and roadmap item 1229 stays open for the proof of the replay, the
+containment and the repair.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 

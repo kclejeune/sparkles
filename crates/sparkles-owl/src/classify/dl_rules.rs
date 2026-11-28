@@ -1153,6 +1153,40 @@ impl DlRun {
         self.shared_facts = on;
         self
     }
+    /// A run for the closure check of item 1229's lemma to replay Pred in, with copies of
+    /// this run's clause table and interner at their ids and its settings, and with fresh
+    /// counts, no bound on derived conclusions and no adaptive state. The check's
+    /// derivations, the clauses it stores and the literals it interns then leave this run
+    /// as the saturation left it, and a product past the width limit marks the copy.
+    #[cfg(test)]
+    pub(super) fn audit_copy(&self) -> DlRun {
+        let empty = OnceLock::new();
+        if let Some(&e) = self.empty.get() {
+            let _ = empty.set(e);
+        }
+        DlRun {
+            table: self.table.snapshot(),
+            lits: self.lits.snapshot(),
+            eager: self.eager,
+            empty,
+            width_limit: AtomicUsize::new(self.width_limit.load(Ordering::Relaxed)),
+            mrepair: self.mrepair,
+            shared_facts: self.shared_facts,
+            merge: std::sync::atomic::AtomicBool::new(self.merge.load(Ordering::Relaxed)),
+            merge_skip: self.merge_skip,
+            split_mode: std::sync::atomic::AtomicU8::new(self.split_mode.load(Ordering::Relaxed)),
+            split_probe: self.split_probe,
+            split_epoch: self.split_epoch,
+            const_rank: self.const_rank.clone(),
+            branch_neq: self.branch_neq.clone(),
+            ..DlRun::default()
+        }
+    }
+    /// Whether a product too wide to make passed the run's bound.
+    #[cfg(test)]
+    pub(super) fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Relaxed)
+    }
     pub(super) fn split_meta_bytes(&self) -> usize {
         self.const_rank
             .len()
@@ -2937,6 +2971,18 @@ pub fn late_unit_mode() -> u8 {
 #[cfg(test)]
 thread_local! {
     static LATE_UNIT_MODE_TEST: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// The test override of [`late_unit_mode`] on this thread, which a saturation hands to its
+/// helper threads with [`set_late_unit_mode_test`] so that it reaches every worker.
+#[cfg(test)]
+pub(super) fn late_unit_mode_test() -> Option<u8> {
+    LATE_UNIT_MODE_TEST.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(super) fn set_late_unit_mode_test(mode: Option<u8>) {
+    LATE_UNIT_MODE_TEST.with(|c| c.set(mode));
 }
 
 #[cfg(test)]
@@ -9009,4 +9055,191 @@ mod tests {
             has_pending_candidate(&ix, &ctx, x, &tested, &mut |bytes| bytes < expected_scratch);
         assert!(refused, "budget below 8-bucket layout must refuse");
     }
+}
+
+/// What [`pred_audit`] finds in one saturated context: the clauses, units and ground facts
+/// that Pred gives again and the context does not already hold, with a description of the
+/// first, how many replays of a received clause it made, and whether a replay stopped.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct PredAudit {
+    /// clauses the replay stored that the context did not hold
+    pub clauses: usize,
+    /// units over `x` the replay derived
+    pub units: usize,
+    /// ground conclusions of an empty-core hypothetical context that the replay promoted
+    /// to the root, which leave the context's store unchanged
+    pub facts: usize,
+    /// the Pred inferences the replay made, one per received clause and restriction or
+    /// edge, and one per constants-only clause that item 1061's shared facts take as a
+    /// ground side, so that a context with no eligible input counts zero here
+    pub replayed: usize,
+    /// whether a replay was refused, marked the context interrupted or passed the width
+    /// limit, in which case the counts above say nothing about closure
+    pub interrupted: bool,
+    /// whether the context belongs to a run with the root, and to one that counts
+    pub rooted: bool,
+    pub counting: bool,
+    pub first: Option<String>,
+}
+
+#[cfg(test)]
+impl PredAudit {
+    /// The conclusions the replay gave that the context did not hold.
+    pub fn found(&self) -> usize {
+        self.clauses + self.units + self.facts
+    }
+}
+
+/// The closure check of item 1229's lemma, for tests. After a saturation that finished,
+/// Pred is made again on a copy of the context `me` with every clause that each successor
+/// sent and every restriction that now reaches that successor, over `f_e(x)` and in a
+/// rooted run along each edge over `f_e(u)`. A constants-only clause that item 1061's
+/// shared facts take goes in as a ground side, as `pred_c` takes it. A context that the
+/// late rules left without one of these inferences gets a stored clause, a unit or a
+/// promoted ground fact that it did not hold, and a closed context gets none. The replay
+/// runs in `iso`, a copy that [`DlRun::audit_copy`] made of the saturation's run, so that
+/// its derivations, stores and interned literals leave the run unchanged. The check reads
+/// only the clauses that reached `pred_in`, so it says nothing about a clause that a
+/// successor never sent.
+#[cfg(test)]
+pub(super) fn pred_audit(ix: &Index, me: Ex, st: &State, iso: &DlRun) -> PredAudit {
+    struct Rec<'a> {
+        run: &'a DlRun,
+        /// the root, when the context is not the root itself
+        to_root: Option<Ex>,
+        units: usize,
+        facts: usize,
+    }
+    impl Sink for Rec<'_> {
+        fn send(&mut self, to: Ex, c: Concl) {
+            // `derive` sends a fresh promotion to the root once and records it in the
+            // context's `promoted`, without storing a clause or a unit
+            if matches!(c, Concl::RFact(_)) && Some(to) == self.to_root {
+                self.facts += 1;
+            }
+        }
+        fn me(&mut self, c: Concl) {
+            if matches!(c, Concl::Sub(_)) {
+                self.units += 1;
+            }
+        }
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+    }
+    let dx = dix(ix);
+    let root = dx.is_root(me);
+    let mut audit = PredAudit {
+        rooted: dx.root.is_some(),
+        counting: dx.counting,
+        ..PredAudit::default()
+    };
+    let Some(x) = dl(st).filter(|_| !st.bottom) else {
+        return audit;
+    };
+    let pairs: Vec<(Ex, u32)> = x
+        .pred_in
+        .iter()
+        .flat_map(|(&v, cids)| cids.iter().map(move |&cid| (v, cid)))
+        .collect();
+    let mut copy = st.clone();
+    let stored = |st: &State| dl(st).map_or(0, |x| x.store.clauses.len());
+    let stopped = |st: &State| st.interrupted || dl(st).is_some_and(|x| x.store.interrupted);
+    let was = stopped(&copy);
+    let before = stored(&copy);
+    let mut out = Rec {
+        run: iso,
+        to_root: dx.root.filter(|_| !root),
+        units: 0,
+        facts: 0,
+    };
+    // a context that stopped before the check says nothing about closure either
+    audit.interrupted = was;
+    let mut first = None;
+    for (v, cid) in pairs {
+        let (shared, mark) = {
+            let c = iso.table.get(cid);
+            let cs = dx.root.is_some() && iso.shared_facts && constants_only(ix, dx, &iso.lits, c);
+            (cs, cs && super::dl_root::is_marker(c))
+        };
+        let mut es = Vec::new();
+        if !root && !shared {
+            for_each_reaching(dx, &copy, v, |e| {
+                if into_nominal(ix, e).is_none() {
+                    es.push(e);
+                }
+                true
+            });
+        }
+        let along: Vec<(Ex, u32)> = dl(&copy)
+            .and_then(|x| x.root.as_deref())
+            .map(|r| r.edges_to(v).to_vec())
+            .unwrap_or_default();
+        let ground = shared
+            && !mark
+            && (!along.is_empty() || !root && has_eligible_ordinary_edge(ix, dx, &copy, v));
+        let n0 = stored(&copy) + out.units + out.facts;
+        let mut refused = false;
+        {
+            let mut guard = Guard::new(&mut out);
+            let mut found = Found {
+                root,
+                ..Found::default()
+            };
+            if shared {
+                // item 1061's shared facts take the clause as a ground side when the
+                // successor has an edge, and leave it pending at the root otherwise
+                if ground {
+                    found.rule = "predg";
+                    let side = {
+                        let c = iso.table.get(cid);
+                        (c.body().to_vec(), c.head().to_vec())
+                    };
+                    let bytes = side_exact_bytes(side.0.len(), side.1.len());
+                    if bytes.is_some_and(|b| found.reserve_one_admitted(1, b, &mut guard)) {
+                        found.push(side);
+                        guard.release_to(found.held_bytes());
+                        audit.replayed += 1;
+                    } else {
+                        refused = true;
+                    }
+                }
+            } else {
+                for &e in &es {
+                    audit.replayed += 1;
+                    refused |= !pred(ix, &copy, e, cid, None, &mut found, &mut guard);
+                }
+                for &(e, u) in &along {
+                    audit.replayed += 1;
+                    refused |= !super::dl_root::root_pred(
+                        ix, &copy, e, u, cid, None, &mut found, &mut guard,
+                    );
+                }
+            }
+            if !refused {
+                if root {
+                    drain_with_admitted(ix, &mut copy, found, &mut guard, &RootDerive);
+                } else {
+                    drain_admitted(ix, &mut copy, found, &mut guard);
+                }
+            }
+        }
+        if refused || !was && stopped(&copy) || iso.exhausted() {
+            audit.interrupted = true;
+        }
+        if first.is_none() && stored(&copy) + out.units + out.facts > n0 {
+            let c = iso.table.get(cid);
+            first = Some(format!(
+                "context {me}, successor {v}, restrictions {es:?}, edges {along:?}, clause {} → {}",
+                tr(ix, &iso.lits, c.body()),
+                tr(ix, &iso.lits, c.head())
+            ));
+        }
+    }
+    audit.clauses = stored(&copy) - before;
+    audit.units = out.units;
+    audit.facts = out.facts;
+    audit.first = first;
+    audit
 }

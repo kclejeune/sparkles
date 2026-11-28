@@ -688,6 +688,29 @@ impl Lits {
         self.unadmitted_bytes.load(Ordering::Relaxed)
     }
 
+    /// A copy of the interner with every literal at its id, for the closure check of
+    /// item 1229's lemma, whose replay must not intern into the run it reads.
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> Lits {
+        let copy = Lits::default();
+        let n = self.next.load(Ordering::Relaxed);
+        {
+            let mut ids = copy.ids.lock();
+            for id in 0..n {
+                let l = *self
+                    .recs
+                    .slot_with_delta(id)
+                    .0
+                    .get()
+                    .expect("an interned literal");
+                let _ = copy.recs.slot_with_delta(id).0.set(l);
+                ids.insert(l, id);
+            }
+        }
+        copy.next.store(n, Ordering::Relaxed);
+        copy
+    }
+
     /// Re-bases `unadmitted_bytes` to total `bytes` when starting a new saturation round that
     /// carries `self` forward from a previous run.
     pub(super) fn sync_unadmitted_on_begin_run(&mut self) {
@@ -1337,6 +1360,18 @@ impl Table {
     /// The clauses the table holds.
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed) as usize
+    }
+
+    /// A copy of the table with every clause at its id, for the closure check of item
+    /// 1229's lemma, whose replay must not append to the run it reads.
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> Table {
+        let copy = Table::default();
+        for id in 0..self.len() as u32 {
+            let at = copy.push(self.get(id).clone());
+            debug_assert_eq!(at, id);
+        }
+        copy
     }
 }
 
