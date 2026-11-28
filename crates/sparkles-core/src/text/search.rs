@@ -48,11 +48,7 @@ pub fn search_in(
     lenient: bool,
 ) -> Result<Table> {
     let snap = &ctx.snap;
-    if let Some(base) = snap
-        .text
-        .as_ref()
-        .and_then(|view| view.overlay_base.as_deref())
-    {
+    if let Some(base) = adjustment_base(snap) {
         return search_adjusted(ctx, spec, vars, subjects, lenient, base);
     }
     let Some(Prepared {
@@ -152,7 +148,7 @@ fn prepare<'a>(
     let snap = &ctx.snap;
     if snap.historical && snap.text.is_none() {
         return Err(Error::HistoryUnsupported(format!(
-            "historical full-text search needs the current generation or an indexed named snapshot; this query reads commit {}",
+            "historical full-text search requires an active index in the current generation or an indexed named snapshot; this query reads commit {}",
             snap.commit
         )));
     }
@@ -198,9 +194,18 @@ fn prepare<'a>(
     }))
 }
 
+fn adjustment_base(snap: &Snapshot) -> Option<&Snapshot> {
+    let view = snap.text.as_deref()?;
+    match &view.source {
+        super::ViewSource::Pin(_) => Some(snap),
+        _ => view.overlay_base.as_deref(),
+    }
+}
+
 /// A transaction or historical query searches the committed corpus and its private
 /// overlay with one query and one set of BM25 statistics.
 struct Adjusted<'a> {
+    pinned: bool,
     sh: &'a Arc<super::imp::Shared>,
     resolved: Resolved,
     field: Field,
@@ -209,7 +214,7 @@ struct Adjusted<'a> {
 }
 
 fn prepare_adjusted<'a>(
-    ctx: &Ctx,
+    ctx: &'a Ctx,
     spec: &TextSpec,
     subjects: Option<&[Id]>,
     lenient: bool,
@@ -217,7 +222,16 @@ fn prepare_adjusted<'a>(
     charge: &mut dyn FnMut(u64) -> Result<()>,
 ) -> Result<Option<Adjusted<'a>>> {
     ctx.check()?;
-    let view = base.text.as_ref().expect("adjustment has a base text view");
+    let target = ctx.snap.text.as_ref().expect("adjustment has a text view");
+    let (view, pinned) = match &target.source {
+        super::ViewSource::Pin(pin) => (pin.open(ctx)?, true),
+        _ => (
+            base.text
+                .as_deref()
+                .expect("adjustment has a base text view"),
+            false,
+        ),
+    };
     let sh = &view.ready(base.commit)?.index;
     if view.seq != base.commit {
         return Err(unavailable("dataset", "stale", view.seq, base.commit));
@@ -230,7 +244,9 @@ fn prepare_adjusted<'a>(
         }
     }
     let mut resolved = view.resolved()?.clone();
-    resolved.overlay = super::imp::build_overlay(ctx, base, sh, &resolved.searcher, charge)?;
+    if !pinned {
+        resolved.overlay = super::imp::build_overlay(ctx, base, sh, &resolved.searcher, charge)?;
+    }
     resolved.adjusted = true;
     resolved.uncertain = Arc::new(FxHashSet::default());
     let (field, analyzer) = sh.fields.text_for(spec.lang.as_deref());
@@ -262,6 +278,7 @@ fn prepare_adjusted<'a>(
         return Ok(None);
     };
     Ok(Some(Adjusted {
+        pinned,
         sh,
         resolved,
         field,
@@ -346,17 +363,17 @@ impl Adjusted<'_> {
         let mut hits = BinaryHeap::new();
         let max = self.sh.config.max_hits;
         let cap = top.unwrap_or(max);
+        let mut total = 0u64;
         let mut admit = |hit: RankedHit| -> Result<()> {
-            if hits.len() == cap {
-                if top.is_none() {
-                    return Err(Error::BudgetExceeded(crate::Budget {
-                        kind: crate::BudgetKind::Rows,
-                        limit: max as u64,
-                        requested: (max as u64)
-                            .checked_add(1)
-                            .ok_or_else(|| text_err("hit count overflow"))?,
-                    }));
+            if top.is_none() {
+                total = total
+                    .checked_add(1)
+                    .ok_or_else(|| text_err("hit count overflow"))?;
+                if total > max as u64 {
+                    return Ok(());
                 }
+            }
+            if hits.len() == cap {
                 if let Some(mut worst) = hits.peek_mut()
                     && hit < *worst
                 {
@@ -396,7 +413,7 @@ impl Adjusted<'_> {
                 ctx.check()?;
                 let quad = [terms.s[i], terms.p[i], terms.o[i], terms.g[i]];
                 if quad.contains(&Id::UNDEF)
-                    || (committed && !base.contains(&quad)?)
+                    || (committed && !self.pinned && !base.contains(&quad)?)
                     || !snap.contains(&quad)?
                     || snap
                         .mask
@@ -449,6 +466,13 @@ impl Adjusted<'_> {
             }
         }
         ctx.check()?;
+        if total > max as u64 {
+            return Err(Error::BudgetExceeded(crate::Budget {
+                kind: crate::BudgetKind::Rows,
+                limit: max as u64,
+                requested: total,
+            }));
+        }
         // Converting the retained heap to the reader's ordered list holds two buffers.
         let buffers = hits
             .capacity()
@@ -594,12 +618,7 @@ impl Reader {
             spec.limit.is_none(),
             "a reader serves a search without a limit"
         );
-        if let Some(base) = ctx
-            .snap
-            .text
-            .as_ref()
-            .and_then(|view| view.overlay_base.as_deref())
-        {
+        if let Some(base) = adjustment_base(&ctx.snap) {
             return Self::open_adjusted(ctx, spec, vars, base, charge);
         }
         let Some(Prepared {

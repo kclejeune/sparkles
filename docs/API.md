@@ -5884,7 +5884,7 @@ not copy the log.
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/snapshots/{ds}` | `{ dataset, datasetId, head, snapshots: NamedSnapshot[] }` |
-| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm?, text? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized. `text: true` builds a full-text index for the pin on a persistent dataset. Returns `201` and `Location`, or `200` if the name already pins that commit. `409` if the name pins another commit. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
+| POST | `/$/snapshots/{ds}` | Pins a commit. The body is `{ name, at?: selector (default head), note?, expires?, warm?, text? }`, as JSON, a form or the query string. `expires` is an RFC 3339 time or a duration from now (`90s`, `30m`, `12h`, `7d`, `2w`). `warm: true` keeps the pinned state materialized. `text: true` builds a full-text index for the pin on a persistent dataset. Returns `201` and `Location` for a new pin. Returns `200` when an existing pin meets the request, or `409` when it pins another commit or lacks a requested text index. `409` with `code: "history-limit"` beyond `--max-snapshots` (256) or `--history-max-generations` (8). `410` if the commit is no longer readable. |
 | GET | `/$/snapshots/{ds}/{name}` | `NamedSnapshot` |
 | DELETE | `/$/snapshots/{ds}/{name}` | `204`. Generations that only this snapshot kept are removed. |
 | PUT | `/$/snapshots/{ds}/{name}/text` | Builds or replaces the pin's full-text index and returns `NamedSnapshot`. |
@@ -5939,10 +5939,13 @@ A pin created with `text: true` keeps a full-text index built with the active
 configuration at creation. Query it with `at=snapshot:NAME`. Its bytes count toward
 dataset quota and `retention.maxBytes`. Pin indexes are kept until they are dropped
 or the RDF pin is deleted or expires. Creating or rebuilding a pin index holds the
-dataset writer, so RDF commits wait during the build.
+dataset writer, so RDF commits wait during the build. The server applies its default
+query timeout to the build and returns `408` if the deadline expires. To add an index
+to an existing pin, use `PUT /$/snapshots/{ds}/{name}/text`. A build that needs the
+active configuration returns `503` while that index recovers.
 
-A missing or unreadable pin index returns `503` for text searches, and RDF reads
-remain available. Rebuild the index using its saved configuration, or the active
+The first text search opens the pin's index. A missing or unreadable index returns
+`503` when searched, and RDF reads remain available. Rebuild the index using its saved configuration, or the active
 configuration if the pin has no readable saved settings. Ordinary backups omit
 named pins and their index files. When history metadata is carried separately,
 identity-preserving copies keep the reference and reidentified copies keep the

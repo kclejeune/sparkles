@@ -132,15 +132,18 @@ impl Store {
                 .pins
                 .get(name)
                 .and_then(|pin| pin.text_index);
-            let config = match old.and_then(|id| {
-                read_pin(&root.join(ROOT).join(id.to_string()), resolved.commit.seq).ok()
-            }) {
+            let old_dir = old.map(|id| root.join(ROOT).join(id.to_string()));
+            let config = match old_dir
+                .as_deref()
+                .and_then(|dir| read_pin(dir, resolved.commit.seq).ok())
+            {
                 Some(meta) => meta.config.with_dictionaries()?,
                 None => self.active_text_pin_config()?,
             };
             let live = self.snapshot();
             let (snapshot, _, _) = self.materialize_snapshot(&at, limit, resolved, &live)?;
-            let (id, bytes) = self.build_text_pin(&snapshot, config, controls)?;
+            let (id, bytes) =
+                self.build_text_pin(&snapshot, config, old_dir.as_deref(), controls)?;
             let mut history = history.lock();
             self.replace_text_pin(root, &mut history, name, Some(id), bytes)?;
             let generation = crate::commit::generation_number(&live.generation.name);
@@ -200,7 +203,13 @@ impl Store {
             .as_ref()
             .map(|index| index.config().clone())
             .ok_or_else(|| {
-                Error::invalid("enable full-text search before creating a snapshot text index")
+                if self.text_enabled() {
+                    Error::TextUnavailable(
+                        "the active full-text index is recovering; retry after recovery".into(),
+                    )
+                } else {
+                    Error::invalid("enable full-text search before creating a snapshot text index")
+                }
             })
     }
 
@@ -209,6 +218,7 @@ impl Store {
         &self,
         snapshot: &Snapshot,
         config: crate::text::TextConfig,
+        old_dir: Option<&Path>,
         options: &crate::history::HistoryOptions,
     ) -> Result<(uuid::Uuid, u64)> {
         use crate::history::ReadControl;
@@ -238,7 +248,7 @@ impl Store {
         }
         write_atomic(&stage.join(META), &metadata)?;
         sync_dir(stage)?;
-        self.quota.check_rebuild(None, stage)?;
+        self.quota.check_rebuild(old_dir, stage)?;
         check()?;
         let id = uuid::Uuid::new_v4();
         let path = parent.join(id.to_string());
@@ -257,12 +267,12 @@ impl Store {
         snapshot: &Arc<Snapshot>,
         limit: C,
     ) -> Result<Option<Arc<Snapshot>>> {
-        let (Some(root), Some(history), crate::history::At::Snapshot(name)) =
+        let (Some(root), Some(history_state), crate::history::At::Snapshot(name)) =
             (&self.root, &self.history, at)
         else {
             return Ok(None);
         };
-        let history = limit.read_limit().lock(history)?;
+        let history = limit.read_limit().lock(history_state)?;
         let Some(id) = history
             .pins
             .get(name)
@@ -271,48 +281,70 @@ impl Store {
         else {
             return Ok(None);
         };
-        let path = root.join(ROOT).join(id.to_string());
-        // Check both the metadata scratch and the compressed Tantivy manifest before
-        // admitting a reader. The search itself accounts its own working state.
-        let estimate = [&path.join(META), &path.join("text/meta.json")]
-            .into_iter()
-            .map(|file| file.metadata().map_or(0, |m| m.len()))
-            .try_fold(0u64, u64::checked_add);
-        let opening = || {
-            let Some(estimate) = estimate.filter(|size| *size <= MAX_META_BYTES) else {
-                return Err(Error::Corrupt(
-                    "snapshot text index metadata is too large".into(),
-                ));
-            };
-            limit.check(estimate)?;
-            let meta = read_pin(&path, snapshot.commit)?;
-            crate::text::TextIndex::open_pin(&path, meta.config, meta.seq)
-        };
         let mut pinned = (**snapshot).clone();
-        pinned.text = match opening() {
-            Ok(view) => {
-                // Historical text uses the controlled collector even for a pin
-                // that already has its own complete index.
-                let mut base = (**snapshot).clone();
-                base.text = Some(view.clone());
-                Some(Arc::new(
-                    view.with_historical_changes(snapshot.commit, Arc::new(base)),
-                ))
-            }
-            Err(error @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
-                return Err(error);
-            }
-            Err(error) => {
-                tracing::warn!(target: "sparkles::store", %error, %name, "snapshot text index unavailable");
-                Some(crate::text::TextView::recovering(
-                    snapshot.commit,
-                    crate::text::next_owner(),
-                    true,
-                ))
+        pinned.counts = Default::default();
+        pinned.text = Some(Arc::new(crate::text::TextView::pinned(
+            snapshot.commit,
+            LazyTextPin {
+                name: name.clone(),
+                id,
+                path: root.join(ROOT).join(id.to_string()),
+                history: Arc::downgrade(history_state),
+                opened: std::sync::OnceLock::new(),
+            },
+        )));
+        Ok(Some(Arc::new(pinned)))
+    }
+}
+
+/// A snapshot carries the pin identity. Only text evaluation opens its index.
+#[cfg(feature = "text")]
+pub(crate) struct LazyTextPin {
+    name: String,
+    id: uuid::Uuid,
+    path: PathBuf,
+    history: std::sync::Weak<Mutex<crate::history::HistoryState>>,
+    opened: std::sync::OnceLock<Arc<crate::text::TextView>>,
+}
+
+#[cfg(feature = "text")]
+impl LazyTextPin {
+    pub(crate) fn open(&self, ctx: &crate::sparql::ctx::Ctx) -> Result<&crate::text::TextView> {
+        if let Some(view) = self.opened.get() {
+            return Ok(view);
+        }
+        let seq = ctx.snap.commit;
+        let unavailable = || crate::text::unavailable(&self.name, "unavailable", seq, seq);
+        let history = self.history.upgrade().ok_or_else(unavailable)?;
+        let history = loop {
+            ctx.check()?;
+            if let Some(guard) = history.try_lock_for(std::time::Duration::from_millis(10)) {
+                break guard;
             }
         };
-        limit.check(0)?;
-        Ok(Some(Arc::new(pinned)))
+        if let Some(view) = self.opened.get() {
+            return Ok(view);
+        }
+        // Drop, replace and expiry all collect files while holding this same lock.
+        if history.pins.get(&self.name).and_then(|pin| pin.text_index) != Some(self.id) {
+            return Err(unavailable());
+        }
+        let estimate = [&self.path.join(META), &self.path.join("text/meta.json")]
+            .into_iter()
+            .map(|file| file.metadata().map_or(0, |meta| meta.len()))
+            .try_fold(0u64, u64::checked_add)
+            .filter(|size| *size <= MAX_META_BYTES)
+            .ok_or_else(unavailable)?;
+        let _scratch = ctx.charge(estimate)?;
+        let view = read_pin(&self.path, seq)
+            .and_then(|meta| crate::text::TextIndex::open_pin(&self.path, meta.config, seq))
+            .map_err(|error| {
+                tracing::warn!(target: "sparkles::store", %error, name = %self.name, "snapshot text index unavailable");
+                unavailable()
+            })?;
+        ctx.check()?;
+        // Other callers use this searcher even when the pin has since been removed.
+        Ok(self.opened.get_or_init(|| view))
     }
 }
 

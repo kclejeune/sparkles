@@ -56571,7 +56571,7 @@
                 }
               }
             },
-            "description": "The name already pins that commit."
+            "description": "Existing pin meets the request."
           },
           "201": {
             "content": {
@@ -56595,11 +56595,23 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
           "409": {
             "$ref": "#/components/responses/Conflict"
           },
           "410": {
             "$ref": "#/components/responses/Gone"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -56828,6 +56840,9 @@
           },
           "501": {
             "$ref": "#/components/responses/NotImplemented"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
           },
           "507": {
             "$ref": "#/components/responses/InsufficientStorage"

@@ -1549,6 +1549,8 @@ fn apply_controlled(
             key,
             hidden,
             retained,
+            #[cfg(feature = "text")]
+            text_delta: Mask::text_delta(snap),
             cache_link: std::sync::OnceLock::new(),
         })),
         ..snap.clone()

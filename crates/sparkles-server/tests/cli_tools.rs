@@ -41,6 +41,43 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+#[cfg(feature = "text")]
+#[test]
+fn text_index_completes_a_pending_reconfiguration() {
+    use sparkles::store::Store;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let store = Store::open(root, Default::default()).unwrap();
+    let mut config = store.enable_text(Default::default()).unwrap().config;
+    drop(store);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("text/meta.json")).unwrap()).unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(meta["payload"].as_str().unwrap()).unwrap();
+    config.max_hits = 17;
+    let pending = root.join("text.pending.json");
+    std::fs::write(
+        &pending,
+        sparkles::formats::settings_to_vec(
+            "text.pending.json",
+            &serde_json::json!({"base": payload["config"], "config": config}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(root, &["text-index", "--loc", "."]);
+    assert!(output.status.success(), "{}", err(&output));
+    assert!(!pending.exists());
+    let active: sparkles::text::TextConfig = sparkles::formats::settings_from_slice(
+        "text.json",
+        &std::fs::read(root.join("text.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(active.max_hits, 17);
+}
+
 const TTL: &str = r#"@prefix ex: <http://example.org/> .
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .
 ex:alice foaf:name "Alice"@en ; foaf:knows [ foaf:name "Bob" ] .

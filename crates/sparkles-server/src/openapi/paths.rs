@@ -3392,9 +3392,9 @@ fn history(p: &mut Paths) {
                 "application/x-www-form-urlencoded": { "schema": sref("SnapshotRequest") },
             }),
         )
-        .json("200", "The name already pins that commit.", "NamedSnapshot")
+        .json("200", "Existing pin meets the request.", "NamedSnapshot")
         .json("201", "Created.", "NamedSnapshot")
-        .errors(&[400, 409, 410]),
+        .errors(&[400, 408, 409, 410, 501, 503, 507]),
     );
     p.add(
         op(
@@ -3428,7 +3428,7 @@ fn history(p: &mut Paths) {
         )
         .see("named-snapshots-and-retention")
         .json("200", "The snapshot.", "NamedSnapshot")
-        .errors(&[400, 408, 410, 501, 507]),
+        .errors(&[400, 408, 410, 501, 503, 507]),
     );
     p.add(
         op(

@@ -206,6 +206,9 @@ pub struct Mask {
     /// the bytes of delta nodes the masked snapshot alone owns: those that hiding the
     /// quads copied or created
     pub(crate) retained: u64,
+    /// Original GSPO roots for text overlays. The mask's deletions are not RDF changes.
+    #[cfg(feature = "text")]
+    pub(crate) text_delta: Option<[crate::store::KeySet; 2]>,
     /// optional non-owning link to evict our dead slot from the base snapshot's cache
     pub(crate) cache_link: std::sync::OnceLock<MaskCacheLink>,
 }
@@ -232,6 +235,17 @@ impl Drop for Mask {
 }
 
 impl Mask {
+    #[cfg(feature = "text")]
+    fn text_delta(snap: &Snapshot) -> Option<[crate::store::KeySet; 2]> {
+        snap.text.as_ref()?.overlay_base.as_ref()?;
+        Some(
+            snap.mask
+                .as_ref()
+                .and_then(|mask| mask.text_delta.clone())
+                .unwrap_or_else(|| snap.delta.change_keys().map(Clone::clone)),
+        )
+    }
+
     /// Whether the quad `[s, p, o, g]` is hidden.
     pub fn hides(&self, q: &[u64; 4]) -> bool {
         self.hidden.binary_search(q).is_ok()
@@ -397,6 +411,8 @@ pub(crate) fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot 
             key,
             hidden,
             retained,
+            #[cfg(feature = "text")]
+            text_delta: Mask::text_delta(snap),
             cache_link: std::sync::OnceLock::new(),
         })),
         ..snap.clone()

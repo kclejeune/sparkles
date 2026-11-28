@@ -1156,6 +1156,11 @@ python = "Dataset.snapshots.delete"
 jvm = "DatasetGraphSparkles.snapshots().delete"
 node = "Dataset.snapshots.delete"
 
+["snapshots.drop_text"]
+python = "planned: typed snapshot text index administration"
+jvm = "planned: typed snapshot text index administration"
+node = "planned: typed snapshot text index administration"
+
 ["snapshots.get"]
 python = "Dataset.snapshots.get"
 jvm = "DatasetGraphSparkles.snapshots().get"
@@ -1165,6 +1170,11 @@ node = "Dataset.snapshots.get"
 python = "Dataset.snapshots.list"
 jvm = "DatasetGraphSparkles.snapshots().list"
 node = "Dataset.snapshots.list"
+
+["snapshots.rebuild_text"]
+python = "planned: typed snapshot text index administration"
+jvm = "planned: typed snapshot text index administration"
+node = "planned: typed snapshot text index administration"
 
 ["sparql.parse_query"]
 python = "parse_query"

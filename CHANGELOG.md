@@ -9,6 +9,8 @@ Reconfiguration keeps the active index available until it installs the replaceme
 SPARQL text searches see earlier inserts and deletes in the same write transaction.
 Retained commits in the live generation support bounded text search, and a named
 snapshot created with `text: true` keeps its own index across compaction and restart.
+Persistent copies carry the active text settings. A copy taken during first enablement
+has full-text search disabled until it is enabled on the copy.
 
 ### Hierarchical memory budgets for reasoning and views
 

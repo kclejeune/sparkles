@@ -478,17 +478,22 @@ sized at about one to two weeks.
   Hindi, which use Snowball stemmers or none today. Item 251 records them.
 * **Online enable and reconfigure.** The configuration builder uses the bounded recovery
   journal and a separate `text.configure` directory. Writes continue during the scan
-  and update the active index while the journal records changes for the new one. The
-  final catch-up retires the old writer and checkpoint before it reuses the path. The
+  and update the active index while the journal records changes for the new one.
+  Commits take the solo path while the journal records. The final catch-up retires
+  the old writer and checkpoint before it reuses the path. The
   versioned `text.pending.json` binds the requested settings to the recorded active
   configuration. Recovery promotes an already installed matching index or resumes the
-  build. If publication fails after the old writer has retired, text searches report
-  unavailable until recovery installs an index. A failed settings promotion after
+  build. A failed build discards the intent while an earlier index remains active.
+  A retirement failure leaves that index stale and routes commits through the solo path
+  until repair. If publication fails after the old writer has retired, text searches
+  report unavailable until recovery installs an index. A failed settings promotion after
   installation leaves the replacement searchable. Copies and backups carry the durable
-  active settings from `text.json`. The enablement acceptance measurement compares
-  median single-triple write latency during the build over 10.5M triples with the
-  same workload without a build. Its threshold is twice the baseline median. This
-  measurement remains pending for first enablement.
+  active settings from `text.json`. The 10.5M-triple acceptance measurements for
+  first enablement and reconfiguration remain open under
+  [roadmap item 1345](../../ROADMAP.md#performance-follow-ups). They compare median
+  single-triple write latency during each build with the same workload without a
+  build, including a baseline with grouped commits disabled. The acceptance threshold
+  is twice the baseline median.
 * **Search after uncommitted writes.** Text reads compare the transaction's delta with
   its base. The evaluator indexes newly visible literals in a private Tantivy
   `RamDirectory` and verifies committed hits against RDF visibility before counting or
@@ -503,10 +508,11 @@ sized at about one to two weeks.
   `history.json` references the index by UUID, and versioned index metadata records
   its commit, configuration and dictionary fingerprints. Pin creation installs the
   index before publishing the reference. Removal publishes the new history record
-  before reclaiming the files. A reader holds the history mutex while opening the
-  immutable index so removal cannot race its file opens. Creating or rebuilding a
-  pin index holds the RDF writer through the build. The current-generation path is limited to 10,000
-  changed quads, and temporary index work also has a 128 MiB admission ceiling.
+  before reclaiming the files. The first text search on a snapshot holds the history
+  mutex while opening the immutable index so removal cannot race its file opens.
+  Creating or rebuilding a pin index holds the RDF writer through the build. The
+  current-generation path counts up to 10,000 underlying quad changes before applying
+  the caller's triple mask. Temporary index work has a 128 MiB admission ceiling.
   Other retained commits need an indexed named pin. Ordinary backups omit named
   pins and their derived files. When a copy carries pin metadata under a new
   dataset identity, it clears the derived file reference. Restoring pinned

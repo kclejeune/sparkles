@@ -25844,7 +25844,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The name already pins that commit. */
+            /** @description Existing pin meets the request. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -25866,8 +25866,12 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
             410: components["responses"]["Gone"];
+            501: components["responses"]["NotImplemented"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -25957,6 +25961,7 @@ export interface operations {
             408: components["responses"]["Timeout"];
             410: components["responses"]["Gone"];
             501: components["responses"]["NotImplemented"];
+            503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };

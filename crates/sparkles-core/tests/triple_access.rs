@@ -1259,3 +1259,68 @@ fn rdfs_on_read_derives_from_visible_triples() {
         ]
     );
 }
+
+#[cfg(feature = "text")]
+#[test]
+fn masked_quads_do_not_count_as_historical_text_changes() {
+    use std::fmt::Write;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path(), Default::default()).unwrap();
+    let mut rdf = String::from("<http://ex/visible> <http://ex/label> \"fox\" .\n");
+    for n in 0..10_001 {
+        writeln!(rdf, "<http://ex/hidden{n}> <http://ex/salary> \"fox\" .").unwrap();
+    }
+    store
+        .load(&[Source::from_bytes(
+            rdf.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    store.enable_text(Default::default()).unwrap();
+    // This hit is indexed by the pin and must come from the RAM overlay for the
+    // historical commit. Both searches also encounter hidden committed hits.
+    ok(
+        &store,
+        "INSERT DATA { ex:restored ex:label \"fox\" }",
+        &Default::default(),
+    );
+    let seq = store.snapshot().commit;
+    store
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap();
+    ok(
+        &store,
+        r#"DELETE DATA { ex:restored ex:label "fox" . ex:hidden0 ex:salary "fox" };
+            INSERT DATA { ex:new ex:label "fox" }"#,
+        &Default::default(),
+    );
+    let options = writer(&[(salaries(), Graphs::none(), Graphs::none())], "staff");
+    let query_text = format!("{SPARQL_PREFIXES}SELECT ?s {{ ?s text:query \"fox\" }} ORDER BY ?s");
+    let answers = [At::Commit(seq), At::Snapshot("search".into())].map(|at| {
+        let (snap, _) = store.snapshot_at(&at, &Default::default()).unwrap();
+        assert_eq!(
+            options
+                .graphs
+                .as_ref()
+                .unwrap()
+                .masked(&snap)
+                .unwrap()
+                .hidden_quad_count(),
+            10_001
+        );
+        let rows = query(snap, &query_text, &options)?.rows()?;
+        Ok::<Vec<_>, Error>(
+            rows.iter()
+                .map(|row| row.values()[0].as_ref().unwrap().to_string())
+                .collect(),
+        )
+    });
+    assert!(
+        answers.iter().all(|answer| answer
+            .as_ref()
+            .is_ok_and(|subjects| subjects == &["<http://ex/restored>", "<http://ex/visible>"])),
+        "{answers:?}"
+    );
+}

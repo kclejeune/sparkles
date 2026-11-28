@@ -642,10 +642,22 @@ impl Delta {
     /// The walk passes over the key-set leaves the two deltas share (see
     /// [`KeySet::symmetric_difference`]), so two snapshots of one store compare in time
     /// proportional to their deltas' leaves and the writes between them.
-    pub fn changes_since(&self, other: &Delta, mut f: impl FnMut(&[Id; 4]) -> bool) -> bool {
+    pub fn changes_since(&self, other: &Delta, f: impl FnMut(&[Id; 4]) -> bool) -> bool {
+        Self::changes_between(self.change_keys(), other.change_keys(), f)
+    }
+
+    pub(crate) fn change_keys(&self) -> [&KeySet; 2] {
         let i = Perm::Gspo.index();
-        self.ins[i].symmetric_difference(&other.ins[i], |k| f(&Perm::Gspo.to_quad(k)))
-            && self.del[i].symmetric_difference(&other.del[i], |k| f(&Perm::Gspo.to_quad(k)))
+        [&self.ins[i], &self.del[i]]
+    }
+
+    pub(crate) fn changes_between(
+        [ins, del]: [&KeySet; 2],
+        [other_ins, other_del]: [&KeySet; 2],
+        mut f: impl FnMut(&[Id; 4]) -> bool,
+    ) -> bool {
+        ins.symmetric_difference(other_ins, |k| f(&Perm::Gspo.to_quad(k)))
+            && del.symmetric_difference(other_del, |k| f(&Perm::Gspo.to_quad(k)))
     }
 
     /// Whether the inserted keys of `perm` (PSO or POS) hold one starting with `a, b`.
@@ -4357,6 +4369,8 @@ impl Store {
             && let Some(view) = &live.text
         {
             let mut adjusted = (*snapshot).clone();
+            // A cached mask includes the text view it was made from.
+            adjusted.counts = Default::default();
             adjusted.text = Some(Arc::new(
                 view.with_historical_changes(adjusted.commit, live.clone()),
             ));
@@ -5039,6 +5053,7 @@ impl Store {
         #[cfg(feature = "text")]
         let (text_index, text_bytes) = if let Some(controls) = text {
             drop(h);
+            let config = self.active_text_pin_config()?;
             let live = self.snapshot();
             let (snapshot, _, _) = self.materialize_snapshot(
                 at,
@@ -5050,8 +5065,7 @@ impl Store {
                 r,
                 &live,
             )?;
-            let config = self.active_text_pin_config()?;
-            let (id, bytes) = self.build_text_pin(&snapshot, config, controls)?;
+            let (id, bytes) = self.build_text_pin(&snapshot, config, None, controls)?;
             h = hist.lock();
             (Some(id), bytes)
         } else {
@@ -5528,10 +5542,10 @@ impl Store {
         {
             let cfg = crate::text::imp_read_config(root)?;
             let mut pending = crate::text::read_pending_config(root)?;
-            let active_hash = cfg.as_ref().map(crate::text::config_hash);
-            if pending.as_ref().is_some_and(|intent| {
-                intent.base != active_hash && cfg.as_ref() != Some(&intent.config)
-            }) {
+            if pending
+                .as_ref()
+                .is_some_and(|intent| !intent.applies_to(cfg.as_ref()))
+            {
                 // A later active settings edit supersedes this intent.
                 text_recovery::remove_pending(root)?;
                 pending = None;
@@ -5697,7 +5711,11 @@ impl Store {
             .load()
             .as_ref()
             .is_some_and(|job| self.text_recovery_excludes_group(job))
-            || self.text.load().as_ref().is_some_and(|t| t.rebuilding())
+            || self
+                .text
+                .load()
+                .as_ref()
+                .is_some_and(|t| t.rebuilding() || t.retirement_failed())
     }
 
     #[cfg(feature = "text")]
@@ -5920,6 +5938,19 @@ impl Store {
             .text
             .load_full()
             .ok_or_else(|| Error::invalid("full-text search is not enabled"))?;
+        if let Some(job) = self.text_recovery.load_full() {
+            if job.failed_configuration() {
+                if let Some(root) = &self.root {
+                    text_recovery::remove_pending(root)?;
+                }
+                self.stop_text_recovery();
+            } else if !job.pending() && job.message().is_some() {
+                if let Some(root) = &self.root {
+                    text_recovery::promote_pending(root, ti.config())?;
+                }
+                self.stop_text_recovery();
+            }
+        }
         // before the writer lock, which a rebuild holding this waits for
         let guard = ti.lock_rebuild();
         let start = {
@@ -5963,8 +5994,8 @@ impl Store {
                 if job.pending() {
                     status.pending_config = Some(job.config().clone());
                 }
-                if let Some(message) = job.message() {
-                    status.message = Some(message);
+                if status.message.is_none() {
+                    status.message = job.message();
                 }
             }
             return Some(status);
@@ -6736,8 +6767,13 @@ impl Store {
             {
                 return Some(Fallback::TextRecovering);
             }
-            if self.text.load().as_ref().is_some_and(|t| t.rebuilding()) {
-                return Some(Fallback::TextRebuilding);
+            if let Some(index) = self.text.load().as_ref() {
+                if index.retirement_failed() {
+                    return Some(Fallback::TextRecovering);
+                }
+                if index.rebuilding() {
+                    return Some(Fallback::TextRebuilding);
+                }
             }
         }
         if self.geo.load().is_some() {

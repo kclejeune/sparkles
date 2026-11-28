@@ -2183,10 +2183,12 @@ impl Checker<'_> {
             return;
         }
         if p.pending {
-            run.add(
-                Issue::warning("an online full-text configuration is pending")
-                    .file("text.pending.json"),
-            );
+            let message = if p.pending_installed {
+                "the index matches the pending full-text configuration, which is promoted on open"
+            } else {
+                "an online full-text configuration is pending"
+            };
+            run.add(Issue::warning(message).file("text.pending.json"));
         }
         if let Some(e) = p.config_error {
             run.add(Issue::error(format!("{e}: open fails")).file("text.json"));

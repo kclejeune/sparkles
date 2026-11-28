@@ -321,6 +321,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("deleteSnapshot", "snapshots.delete", |ds| {
             ds.snapshots().delete("s");
         }),
+        op!("rebuildSnapshotText", "snapshots.rebuild_text", |ds| {
+            ds.snapshots().rebuild_text("s", &Default::default());
+        }),
+        op!("dropSnapshotText", "snapshots.drop_text", |ds| {
+            ds.snapshots().drop_text("s");
+        }),
         op!("diff", "history.diff", |ds| {
             ds.history().diff(
                 &sparkles::history::At::Commit(1),

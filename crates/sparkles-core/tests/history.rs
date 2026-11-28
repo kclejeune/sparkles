@@ -475,6 +475,99 @@ fn named_snapshot_text_survives_compaction_reopen_and_live_disable() {
 
 #[cfg(feature = "text")]
 #[test]
+fn rdf_query_at_an_indexed_pin_defers_opening_its_corrupt_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = open(root, StoreOptions::default());
+    upd(&store, r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#);
+    store.enable_text(Default::default()).unwrap();
+    store
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap();
+    upd(&store, r#"DELETE DATA { <urn:old> <urn:label> "fox" }"#);
+    let manifest = snapshot_text_dir(root).join("text/meta.json");
+    let bytes = std::fs::read(&manifest).unwrap();
+    std::fs::write(&manifest, b"invalid").unwrap();
+
+    let (snapshot, _) = store
+        .snapshot_at(&At::Snapshot("search".into()), &Default::default())
+        .unwrap();
+    let rdf = query(
+        snapshot.clone(),
+        "SELECT ?s { ?s <urn:label> ?o }",
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(rdf.len(), 1);
+    // The same snapshot can search after the file is repaired because the RDF read
+    // neither tried opening the malformed manifest nor cached a failure.
+    std::fs::write(manifest, bytes).unwrap();
+    let text = r#"SELECT ?s { ?s <http://jena.apache.org/text#query> "fox" }"#;
+    assert_eq!(query(snapshot, text, &Default::default()).unwrap().len(), 1);
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn rebuilding_snapshot_text_charges_only_the_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let store = open(root, StoreOptions::default());
+    upd(&store, r#"INSERT DATA { <urn:old> <urn:label> "fox" }"#);
+    store.enable_text(Default::default()).unwrap();
+    let (pin, _) = store
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap();
+    let old = snapshot_text_dir(root);
+    let quota = store.quota().used_bytes + 512;
+    assert!(pin.text_bytes > 512);
+    store.set_quota(Some(quota)).unwrap();
+
+    let rebuilt = store
+        .rebuild_snapshot_text("search", &Default::default())
+        .unwrap();
+    assert_eq!(rebuilt.seq, pin.seq);
+    assert!(rebuilt.text_bytes > 512);
+    assert!(store.quota().used_bytes <= quota);
+    assert!(!old.exists());
+    assert_ne!(old, snapshot_text_dir(root));
+}
+
+#[cfg(feature = "text")]
+#[test]
+fn adjusted_and_head_text_search_report_the_full_hit_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path(), StoreOptions::default());
+    upd(
+        &store,
+        r#"INSERT DATA {
+        <urn:a> <urn:label> "fox" . <urn:b> <urn:label> "fox" .
+        <urn:c> <urn:label> "fox" . <urn:d> <urn:label> "fox"
+    }"#,
+    );
+    store
+        .enable_text(sparkles_core::text::TextConfig {
+            max_hits: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let seq = store.snapshot().commit;
+    store
+        .create_snapshot_with_text("search", &At::Head, &Default::default())
+        .unwrap();
+    upd(&store, r#"INSERT DATA { <urn:e> <urn:label> "hen" }"#);
+    let q = r#"SELECT ?s { ?s <http://jena.apache.org/text#query> "fox" }"#;
+    for at in [At::Head, At::Commit(seq), At::Snapshot("search".into())] {
+        let (snap, _) = store.snapshot_at(&at, &Default::default()).unwrap();
+        assert!(matches!(
+            query(snap, q, &Default::default()),
+            Err(Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Rows
+                && b.limit == 2 && b.requested == 4
+        ));
+    }
+}
+
+#[cfg(feature = "text")]
+#[test]
 fn expiration_releases_snapshot_text_files() {
     let dir = tempfile::tempdir().unwrap();
     let s = open(dir.path(), StoreOptions::default());

@@ -128,7 +128,7 @@ Each limit below cites the [central roadmap](../ROADMAP.md) item tracking it.
 
 ### Versioning and history
 
-* **Historical retention and search.** Point-in-time reads require a retained generation even if the change log still holds the diffs. Full-text search at an older generation requires a named snapshot created with `text: true`. Backups and clones omit derived snapshot text files. These limits are tracked in [item 52](../ROADMAP.md).
+* **Historical retention and search.** Point-in-time reads require a retained generation even if the change log still holds the diffs. Full-text search at an older generation requires a named snapshot created with `text: true`. RDF reads at an indexed pin open no text files. Backups and clones omit derived snapshot text files. Pin rebasing and derived index restoration are tracked in [item 52](../ROADMAP.md). Remote and archive clones remain planned.
 * **Large bulk commits in the change log.** Bulk commits loading or dropping more than 1,000,000 quads into a non-empty dataset record counts only in the change log, and a crash immediately after a bulk commit can omit its change-log entry (roadmap [item 52](../ROADMAP.md)).
 * **RDF Patch and replication.** Multi-transaction (`TX … TC`) patches commit as one transaction, patches from other datasets cannot target existing blank nodes, and neither rotating patch logs nor streaming replicas exist (roadmap [items 66 and 74](../ROADMAP.md)).
 

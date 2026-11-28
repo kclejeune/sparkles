@@ -151,6 +151,13 @@ pub(crate) struct PendingTextConfig {
     pub config: TextConfig,
 }
 
+#[cfg(feature = "text")]
+impl PendingTextConfig {
+    pub(crate) fn applies_to(&self, active: Option<&TextConfig>) -> bool {
+        active == Some(&self.config) || self.base == active.map(config_hash)
+    }
+}
+
 pub(crate) fn read_pending_config(root: &std::path::Path) -> Result<Option<PendingTextConfig>> {
     const NAME: &str = "text.pending.json";
     match std::fs::read(root.join(NAME)) {
@@ -731,6 +738,7 @@ pub struct TextView {
 enum ViewSource {
     Ready(ReadyView),
     Unavailable(UnavailableState),
+    Pin(std::sync::Arc<crate::store::text_pins::LazyTextPin>),
     /// The view of a grouped commit whose fence has not published it yet. Its changes
     /// wait in a [`Staged`] and reach the live index only at publication, so a search
     /// waits for that and then uses the view the publication made (X09 section 17.2).
@@ -786,7 +794,7 @@ impl TextView {
     pub(crate) fn is_available(&self) -> bool {
         match &self.source {
             ViewSource::Ready(_) => true,
-            ViewSource::Unavailable(_) => false,
+            ViewSource::Unavailable(_) | ViewSource::Pin(_) => false,
             // not published yet: it will be ready unless its fence fails
             ViewSource::Pending(p) => match p.get() {
                 None => true,
@@ -831,6 +839,19 @@ impl TextView {
                 Err(unavailable("dataset", state.name(), self.seq, data_seq))
             }
             ViewSource::Pending(p) => p.published(self.seq, data_seq)?.ready(data_seq),
+            ViewSource::Pin(_) => Err(unavailable("snapshot", "unopened", self.seq, data_seq)),
+        }
+    }
+
+    #[cfg(feature = "text")]
+    pub(crate) fn pinned(seq: u64, pin: crate::store::text_pins::LazyTextPin) -> Self {
+        Self {
+            seq,
+            epoch: 0,
+            owner: next_owner(),
+            source: ViewSource::Pin(std::sync::Arc::new(pin)),
+            uncommitted: false,
+            overlay_base: None,
         }
     }
 
@@ -914,6 +935,8 @@ pub(crate) struct TextProbe {
     pub config_error: Option<String>,
     /// an online configuration is pending
     pub pending: bool,
+    /// The installed index already matches the pending configuration.
+    pub pending_installed: bool,
     pub pending_error: Option<String>,
     /// this build has no full-text support: only the configuration was read
     pub unsupported: bool,
@@ -936,13 +959,19 @@ pub(crate) struct TextProbe {
 }
 
 impl TextProbe {
-    fn check_pending(&mut self, root: &std::path::Path) {
+    fn check_pending(&mut self, root: &std::path::Path) -> Option<PendingTextConfig> {
         match read_pending_config(root) {
-            Ok(Some(_)) => self.pending = true,
-            Ok(None) => {}
-            Err(error) => self.pending_error = Some(error.to_string()),
+            Ok(intent) => {
+                self.pending = intent.is_some();
+                self.configured |= self.pending;
+                intent
+            }
+            Err(error) => {
+                self.configured = true;
+                self.pending_error = Some(error.to_string());
+                None
+            }
         }
-        self.configured |= self.pending || self.pending_error.is_some();
     }
 }
 
@@ -961,7 +990,7 @@ pub(crate) use imp::probe;
 #[cfg(not(feature = "text"))]
 pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
     let mut p = TextProbe::default();
-    p.check_pending(root);
+    let _ = p.check_pending(root);
     p.unsupported = p.configured;
     match std::fs::read(root.join("text.json")) {
         Ok(b) => {
@@ -1902,15 +1931,19 @@ mod imp {
         mut after_snapshot: impl FnMut(&tantivy::IndexMeta),
     ) -> super::TextProbe {
         let mut p = super::TextProbe::default();
-        p.check_pending(root);
-        let config = match read_config(root) {
-            Ok(Some(c)) => c,
-            Ok(None) => return p,
+        let pending = p.check_pending(root);
+        let active = match read_config(root) {
+            Ok(config) => config,
             Err(e) => {
                 p.configured = true;
                 p.config_error = Some(e.to_string());
                 return p;
             }
+        };
+        let pending = pending.filter(|intent| intent.applies_to(active.as_ref()));
+        let pending = pending.as_ref().map(|intent| &intent.config);
+        let Some(config) = active.as_ref().or(pending) else {
+            return p;
         };
         p.configured = true;
         p.dirty = marker(root).exists();
@@ -1928,10 +1961,6 @@ mod imp {
                     return p;
                 }
             };
-            if index.schema() != schema(&config).0 {
-                p.open_error = Some("unexpected index schema".into());
-                return p;
-            }
             let meta = match index.load_metas() {
                 Ok(m) => m,
                 Err(e) => {
@@ -1941,12 +1970,23 @@ mod imp {
             };
             p.payload = None;
             p.payload_error = None;
-            match meta.payload.as_deref().map(serde_json::from_str::<Payload>) {
+            let payload = meta.payload.as_deref().map(serde_json::from_str::<Payload>);
+            let pending_installed = pending.filter(|cfg| {
+                matches!(&payload, Some(Ok(pl)) if pl.format == FORMAT && pl.config == config_hash(cfg))
+                    && meta.schema == schema(cfg).0
+            });
+            p.pending_installed = pending_installed.is_some();
+            let config = pending_installed.unwrap_or(config);
+            if meta.schema != schema(config).0 {
+                p.open_error = Some("unexpected index schema".into());
+                return p;
+            }
+            match payload {
                 Some(Ok(pl)) => {
                     p.payload = Some(super::ProbePayload {
                         format_ok: pl.format == FORMAT,
                         seq: pl.seq,
-                        config_matches: pl.config == config_hash(&config),
+                        config_matches: pl.config == config_hash(config),
                     })
                 }
                 Some(Err(e)) => p.payload_error = Some(e.to_string()),
@@ -2385,6 +2425,10 @@ mod imp {
                 }
             }
             if !matches!(q[2].tag(), Tag::Vocab | Tag::Delta)
+                || snap
+                    .mask
+                    .as_ref()
+                    .is_some_and(|mask| mask.hides(&q.map(|id| id.0)))
                 || base.contains(q)?
                 || !snap.contains(q)?
                 || !ctx
@@ -2455,7 +2499,12 @@ mod imp {
                 .map_err(text_err)
         };
         let mut result = Ok(());
-        snap.delta.changes_since(&base.delta, |q| {
+        let target_keys = snap
+            .mask
+            .as_ref()
+            .and_then(|mask| mask.text_delta.as_ref())
+            .map_or_else(|| snap.delta.change_keys(), |[ins, del]| [ins, del]);
+        crate::store::Delta::changes_between(target_keys, base.delta.change_keys(), |q| {
             result = build(q);
             result.is_ok()
         });
@@ -2987,7 +3036,7 @@ mod imp {
         /// Old sealed views can keep their searchers, but no writer may touch that path.
         /// The caller owns the store's lifecycle lock and drained writer admission.
         pub(crate) fn retire(&self) -> Result<()> {
-            if self.inner.retirement_failed.load(Ordering::SeqCst) {
+            if self.retirement_failed() {
                 return Err(text_err(
                     "a failed full-text retirement must be rebuilt or reopened",
                 ));
@@ -3004,6 +3053,10 @@ mod imp {
                 self.inner.fail_locked(&mut self.inner.live.lock(), error);
             }
             result
+        }
+
+        pub(crate) fn retirement_failed(&self) -> bool {
+            self.inner.retirement_failed.load(Ordering::SeqCst)
         }
 
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
@@ -4901,7 +4954,19 @@ mod imp {
                     .is_err()
             );
             assert!(inner.retirement_failed.load(Ordering::SeqCst));
+            assert!(store.text_needs_direct_maintain());
+            assert!(!root.path().join("text.pending.json").exists());
+            let status = store.text_status().unwrap();
+            assert_eq!(status.state, "stale");
+            assert!(status.message.unwrap().contains("retirement repair probe"));
+            crate::sparql::update::update(
+                &store,
+                r#"INSERT DATA { <urn:after> <urn:p> "repair after retirement" }"#,
+                &Default::default(),
+            )
+            .unwrap();
             store.rebuild_text().unwrap();
+            assert!(!store.text_needs_direct_maintain());
             assert!(!inner.retirement_failed.load(Ordering::SeqCst));
             assert!(inner.ticks.load(Ordering::SeqCst));
             let query = crate::sparql::query(
@@ -4910,7 +4975,7 @@ mod imp {
                 &Default::default(),
             )
             .unwrap();
-            assert_eq!(query.len(), 1);
+            assert_eq!(query.len(), 2);
             store.disable_text().unwrap();
             assert!(!root.path().join("text").exists());
         }
