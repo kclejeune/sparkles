@@ -4631,9 +4631,9 @@ the one interned conjunction literal that the told step derives, and the conjunc
 then gives its conjuncts one by one. A unit blocker subsumes this conclusion, as before.
 In the second new case `D` subsumes it, since `dl_clause`'s `has_clause_blocker` accepts
 in `D`'s head only the literals of `Δ` other than `G_2`, the literal `W_2` itself and the
-blockers of `G_2`. The step is redundant as the Hyper conclusion on `W_2`, and the
-conjunction rule gives the projections onto the conjuncts from the clause that subsumes
-it. In the first new case the scan tests
+blockers of `G_2`. A redundant conclusion is not derived, and saturation up to redundancy
+needs no inference from it, so its projections onto the conjuncts of `W_2` are not needed.
+In the first new case the scan tests
 only the class atom `G_1(x)` of `Γ` and no other atom of the body, such as the role atom
 that the rule of a qualified role adds. In a run without the root a class atom over `x`
 enters the body of a context clause only through the marker `G_1 → G_1` of a hypothesis,
@@ -4690,11 +4690,13 @@ every inclusion, as in item 894.
 
 This suffices because a name of a minimum occurs only in positions where a smaller class
 leaves the axiom true, apart from its witness clause and the order's relations.
-`dl_norm`'s `at_least` makes the name and returns it as the positive form of the minimum.
-`neg`, `sub_order` and `shadow_negative` build the left side of an inclusion, a
-disjointness set, the body of a clause, the guard of a lazy clause and a qualifier only
-from classes of the ontology, fresh names of their own and expressions over these, and
-put every result of `pos` in a head. A name of a minimum therefore occurs in heads, in
+`dl_norm`'s `at_least` is the one site that makes such a name, and it returns the name as
+the positive form of the minimum to `pos`, its only caller. No site of `dl_norm` places a
+result of `pos` on a left side. The left sides of inclusions, the disjointness sets, the
+bodies of clauses, the guards of lazy clauses and the qualifiers come from `neg` and
+`qualifier`, from fresh names that the site makes, such as the name of a union in a
+positive position, and from expressions over these, and `shadow_negative` rewrites only
+negative positions. A name of a minimum therefore occurs in heads, in
 positive conjunctions and as the filler of a positive restriction, and on the left only in
 its witness inclusion and in the inclusions and disjointness sets that the order adds. So
 every model of `O_b` satisfies each axiom of `T` that states a minimum, and the other
@@ -4861,7 +4863,7 @@ its classification with counting requested takes 5.7 to 6.0 s against 1.6 to 1.8
 without counting, with the order or without it. ore_ont_14817's classification with
 counting requested takes 10.7 to 11.9 s against 3.1 to 3.5 s, and 7.0 s when
 `number_order` is false, whose attempt passes the memory budget before the bound of
-conclusions. ore_ont_9663's takes 10.6 to 11.1 s against 8.4 to 8.8 s. Each of these
+conclusions. That of ore_ont_9663 takes 10.6 to 11.1 s against 8.4 to 8.8 s. Each of these
 times is of the whole classification, which is the failed attempt, then the run without
 counting under its own bound of 4 million conclusions, and then the Horn rules, since the
 run without counting also passes its bound on ore_ont_541 and ore_ont_14817. The medians
@@ -4885,8 +4887,8 @@ and the time of the attempt itself needs the phase timings. ore_ont_541 takes 6.
 Counting stays off by default. The condition of item 896 that no development file costs
 more than twice its run without counting fails on ore_ont_541 and ore_ont_14817 at 3.4
 to 3.5 times, and on ore_ont_6485 at 3.8 to 3.9 times, where only the run with counting
-gives the complete taxonomy. The default waits until every other development file meets
-that condition. ore_ont_6485 then has to meet it as well, or the maintainer has to accept
+gives the complete taxonomy. The default waits until every development file other than
+ore_ont_6485 meets that condition. ore_ont_6485 then has to meet it as well, or the maintainer has to accept
 its cost for its complete taxonomy as an exception for that file alone. Its run with
 counting also has to be within the speed target, or its attempt cost no more with the
 order than without it, which the comparison on `atlas` decides. A run that counts also
