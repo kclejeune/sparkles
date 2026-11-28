@@ -1,0 +1,75 @@
++ . /home/user/lanes/store1152/.artifacts/lanes/store1152-drop-imbl/worker/env.sh
+++ umask 077
+++ export PATH=/home/user/.local/share/mise/installs/mr-boxington/1.29.1:/home/user/.local/share/mbx/bin:/home/user/.local/share/mise/installs/github-nextest-rs-nextest/0.9.146:/usr/local/cargo/bin:/home/user/.local/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/user/.local/bin:/usr/local/cargo/bin:/home/user/.nvm/versions/node/v24.22.1/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/user/.dotnet/tools
+++ PATH=/home/user/.local/share/mise/installs/mr-boxington/1.29.1:/home/user/.local/share/mbx/bin:/home/user/.local/share/mise/installs/github-nextest-rs-nextest/0.9.146:/usr/local/cargo/bin:/home/user/.local/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/user/.local/bin:/usr/local/cargo/bin:/home/user/.nvm/versions/node/v24.22.1/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/user/.dotnet/tools
+++ export RUSTUP_TOOLCHAIN=1.99.1 RUSTUP_AUTO_INSTALL=0 MBX_REMOTE_URL= CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=1
+++ RUSTUP_TOOLCHAIN=1.99.1
+++ RUSTUP_AUTO_INSTALL=0
+++ MBX_REMOTE_URL=
+++ CARGO_PROFILE_TEST_DEBUG=0
+++ CARGO_BUILD_JOBS=1
+++ unset MBX_TOKEN MBX_REMOTE_TOKEN CARGO_TARGET_DIR
+++ cd /home/user/lanes/store1152
++ f=crates/sparkles-core/src/store/pmap.rs
++ TAG=v5a
++ bash .artifacts/lanes/store1152-drop-imbl/worker/bench-inner.sh
++ cd /home/user/lanes/store1152/.artifacts/lanes/store1152-drop-imbl/bench
++ mbx build --release -j 1
++ grep -E 'error|Finished'
+    Finished `release` profile [optimized] target(s) in 3.70s
++ lscpu
++ grep -E 'Model name|^CPU\(s\)'
+CPU(s):                                  8
+Model name:                              AMD Ryzen 9 9950X 16-Core Processor
++ uptime
+ 03:39:38 up 2 days, 23:33,  3 users,  load average: 2.89, 4.16, 4.59
++ sha256sum target/release/pmap-bench
+353828317ee2b0c230d7fe90feb035bedd2b3fb1e08d918814a225bb2cf28423  target/release/pmap-bench
++ ROUNDS=8
++ taskset -c 3 target/release/pmap-bench
++ uptime
+ 03:40:14 up 2 days, 23:34,  3 users,  load average: 2.05, 3.81, 4.45
++ cp crates/sparkles-core/src/store/pmap.rs /tmp/store1152-pmap.rs
++ sed -i 's/if heavy::<K, V>() { 16 } else { 32 }/if heavy::<K, V>() { 16 } else { 16 }/' crates/sparkles-core/src/store/pmap.rs
++ grep -c 'else { 16 }' crates/sparkles-core/src/store/pmap.rs
+2
++ TAG=v5b
++ bash .artifacts/lanes/store1152-drop-imbl/worker/bench-inner.sh
++ cd /home/user/lanes/store1152/.artifacts/lanes/store1152-drop-imbl/bench
++ mbx build --release -j 1
++ grep -E 'error|Finished'
+    Finished `release` profile [optimized] target(s) in 3.88s
++ lscpu
++ grep -E 'Model name|^CPU\(s\)'
+CPU(s):                                  8
+Model name:                              AMD Ryzen 9 9950X 16-Core Processor
++ uptime
+ 03:40:18 up 2 days, 23:34,  3 users,  load average: 1.97, 3.76, 4.43
++ sha256sum target/release/pmap-bench
+ea3f596e297e7023c3950205aa271d85aba8f8991b1155230ffb7637ecb51342  target/release/pmap-bench
++ ROUNDS=8
++ taskset -c 3 target/release/pmap-bench
++ uptime
+ 03:40:55 up 2 days, 23:35,  3 users,  load average: 1.54, 3.45, 4.30
++ cp /tmp/store1152-pmap.rs crates/sparkles-core/src/store/pmap.rs
++ rm /tmp/store1152-pmap.rs
++ TAG=v5a2
++ bash .artifacts/lanes/store1152-drop-imbl/worker/bench-inner.sh
++ cd /home/user/lanes/store1152/.artifacts/lanes/store1152-drop-imbl/bench
++ mbx build --release -j 1
++ grep -E 'error|Finished'
+    Finished `release` profile [optimized] target(s) in 4.05s
++ lscpu
++ grep -E 'Model name|^CPU\(s\)'
+CPU(s):                                  8
+Model name:                              AMD Ryzen 9 9950X 16-Core Processor
++ uptime
+ 03:40:59 up 2 days, 23:35,  3 users,  load average: 1.49, 3.41, 4.29
++ sha256sum target/release/pmap-bench
+353828317ee2b0c230d7fe90feb035bedd2b3fb1e08d918814a225bb2cf28423  target/release/pmap-bench
++ ROUNDS=8
++ taskset -c 3 target/release/pmap-bench
++ uptime
+ 03:41:35 up 2 days, 23:35,  3 users,  load average: 1.27, 3.14, 4.16
++ echo STEP6-DONE
+STEP6-DONE

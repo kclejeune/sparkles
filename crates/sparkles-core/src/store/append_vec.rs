@@ -128,14 +128,22 @@ impl<T> AppendVec<T> {
 impl<T: Clone> AppendVec<T> {
     /// Add `x` at the end.
     pub fn push_back(&mut self, x: T) {
-        let tail = Arc::make_mut(&mut self.tail);
+        if Arc::get_mut(&mut self.tail).is_none() {
+            // a clone shares the tail: copy it into a buffer with room for a full chunk
+            let mut copy = Vec::with_capacity(CHUNK);
+            copy.extend_from_slice(&self.tail);
+            self.tail = Arc::new(copy);
+        }
+        let tail = Arc::get_mut(&mut self.tail).expect("the tail is not shared");
         if tail.capacity() < CHUNK {
             tail.reserve_exact(CHUNK - tail.len());
         }
         tail.push(x);
         self.len += 1;
         if tail.len() == CHUNK {
-            let full = std::mem::replace(tail, Vec::with_capacity(CHUNK));
+            // the next push allocates the buffer, so a view that ends at a full chunk
+            // holds none
+            let full = std::mem::take(tail);
             self.push_chunk(Arc::new(Node::Chunk(full)));
         }
     }
@@ -292,6 +300,22 @@ mod tests {
         for c in 0..base.chunked() / CHUNK {
             assert!(std::ptr::eq(base.chunk(c * CHUNK), v.chunk(c * CHUNK)));
         }
+    }
+
+    #[test]
+    fn the_tail_holds_one_buffer_of_a_chunk() {
+        let mut v: AppendVec<u64> = (0..CHUNK as u64).collect();
+        // a vector that ends at a full chunk keeps no buffer for the next one
+        assert_eq!(v.tail.capacity(), 0);
+        v.push_back(1);
+        assert_eq!(v.tail.capacity(), CHUNK);
+        // an append to a clone copies the shared tail into a buffer of a chunk
+        let snap = v.clone();
+        v.push_back(2);
+        assert!(!Arc::ptr_eq(&v.tail, &snap.tail));
+        assert_eq!(v.tail.capacity(), CHUNK);
+        assert_eq!(snap.tail.len(), 1);
+        check(&v, &(0..CHUNK as u64).chain([1, 2]).collect::<Vec<_>>());
     }
 
     #[test]

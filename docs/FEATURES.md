@@ -46,9 +46,11 @@ Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with d
 transactions, compaction, clones and integrity checks.
 [History and branches](storage/README.md#versioning-and-history) provide retained
 commits, time travel, diffs, change feeds, RDF Patch and merge review, including nested
-triple terms in HTTP history and diff filters. Rust branch administration refuses with a
-conflict when the calling thread already holds a needed write transaction, leaving that
-transaction usable.
+triple terms in HTTP history and diff filters. Snapshots share persistent maps and vectors
+with the writer, and a commit copies one path of each, as
+[X16](specs/X16-storage-consolidation/SPEC.md#item-1152-outcome) describes. Rust branch
+administration refuses with a conflict when the calling thread already holds a needed
+write transaction, leaving that transaction usable.
 
 ### Search and graph analysis
 

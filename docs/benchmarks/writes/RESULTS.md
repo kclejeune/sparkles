@@ -639,6 +639,33 @@ On the native store, a one-triple commit without geometry takes 0.025 ms with th
 index on and off, medians of 200. A commit of 1,000 `geo:asWKT` points takes 4.119 ms with
 the index and 3.546 ms without it, medians of 20.
 
+### Persistent collections of the commit path
+
+A commit clones the delta's predicate statistics, the control keyspace and the spatial
+index's tail from the last snapshot and changes them. Collection microbenchmarks on the Boat
+worker `bx_4xarzecx` compare the persistent map and vector that hold them with `imbl` 7.0.2,
+on one pinned core in eight alternating rounds. They time the collection operations alone,
+with no whole-store commit or spatial query, and Boat timings are approximate. The harness
+was built with Rust 1.99.1 and mbx 1.29.1 in a release profile with thin LTO, and its
+correctness evidence is the unit tests of the same sources, which compare the map with
+`BTreeMap`, together with the `sparkles-core` test suite. Each figure is the median per
+operation over the rounds.
+
+| Case at 10,000 and at 1,000,000 entries | `imbl` | `PMap` or `AppendVec` |
+|---|---:|---:|
+| Clone and update one existing predicate, 10,000 | 409 ns | 465 ns |
+| Clone and add one new predicate, 10,000 | 475 ns | 553 ns |
+| Clone and update one existing predicate, 1,000,000 | 1.34 µs | 1.44 µs |
+| Insert into one unshared map, 1,000,000 | 202 ns | 322 ns |
+| Clone and set one control key, 1,000,000 | 2.51 µs | 2.41 µs |
+| Clone and remove one control key, 1,000,000 | 1.90 µs | 2.36 µs |
+
+The [outcome of item 1152](../../specs/X16-storage-consolidation/SPEC.md#item-1152-outcome)
+gives the ratios of every case at three sizes, including the spatial tails, which take about
+half of `imbl`'s time. The [run record](runs/2026-11-27-persistent-collections-boat/README.md)
+holds the raw output, the harness and the binaries' identities, and item 1246 of the
+[roadmap](../../ROADMAP.md) times the slower cases on an Intel host.
+
 <a id="branches-and-merges-105m-triples"></a>
 
 ### Branches and merges

@@ -13,6 +13,13 @@
 //! of half the size. Their keys also compare through a pointer, and a binary search over
 //! them stops at an equal key.
 //!
+//! A write copies every shared node it changes before it changes any, so a key or value
+//! whose `Clone` panics during those copies leaves the map as it was. The largest keys
+//! that branches keep for routing are cloned after a leaf changes, so a key whose `Clone`
+//! panics there can leave a map that the writer goes on using inconsistent. The maps here
+//! hold integer and byte-string keys, whose clones fail only when an allocation fails,
+//! which aborts the process.
+//!
 //! [`KeySet`]: super::keyset::KeySet
 
 use super::keyset::{split_with_room, with_room};
@@ -311,6 +318,17 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
             }
             Node::Branch(b) => {
                 let i = steps[0] as usize;
+                let last = i + 1 == b.children.len();
+                let cap = match &*b.children[i] {
+                    Node::Leaf(_) => leaf_cap::<K, V>(),
+                    Node::Branch(_) => branch_cap::<K, V>(),
+                };
+                // A child at a quarter of its capacity can fall below it and merge with a
+                // neighbour. Copying that neighbour now, before the leaf changes, keeps a
+                // panicking copy from leaving the tree half changed.
+                if b.children[i].width() <= cap / 4 && b.children.len() > 1 {
+                    Arc::make_mut(&mut b.children[if last { i - 1 } else { i + 1 }]);
+                }
                 let child = Arc::make_mut(&mut b.children[i]);
                 let (value, moved) = child.remove_at(&steps[1..], pos);
                 let width = child.width();
@@ -322,11 +340,6 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
                 if moved {
                     b.lasts[i] = child.last().clone();
                 }
-                let cap = match child {
-                    Node::Leaf(_) => leaf_cap::<K, V>(),
-                    Node::Branch(_) => branch_cap::<K, V>(),
-                };
-                let last = i + 1 == b.children.len();
                 if width < cap / 4 && b.children.len() > 1 {
                     let j = if last { i - 1 } else { i };
                     // a merge keeps the larger bound of the pair, so the branch's
@@ -342,6 +355,9 @@ impl<K: Ord + Clone, V: Clone> Node<K, V> {
 /// Merge children `j` and `j + 1` of `b`, or share their entries evenly when together
 /// they are more than `cap`.
 fn rebalance<K: Ord + Clone, V: Clone>(b: &mut Branch<K, V>, j: usize, cap: usize) {
+    // copy both siblings before either changes, so that a panicking copy leaves `b` whole
+    Arc::make_mut(&mut b.children[j]);
+    Arc::make_mut(&mut b.children[j + 1]);
     let right = Arc::unwrap_or_clone(b.children.remove(j + 1));
     let right_last = b.lasts.remove(j + 1);
     let left = Arc::make_mut(&mut b.children[j]);
@@ -491,10 +507,9 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
     /// its path that a clone shares.
     pub fn insert(&mut self, k: K, value: V) -> Option<V> {
         let Some(root) = self.root.as_mut() else {
-            self.root = Some(Arc::new(Node::Leaf(with_room(
-                &[(k, value)],
-                leaf_cap::<K, V>(),
-            ))));
+            let mut leaf = Vec::with_capacity(leaf_cap::<K, V>() + 1);
+            leaf.push((k, value));
+            self.root = Some(Arc::new(Node::Leaf(leaf)));
             self.len = 1;
             return None;
         };
@@ -502,15 +517,16 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
             Inserted::Replaced(old) => return Some(old),
             Inserted::New { split, .. } => split,
         };
-        self.len += 1;
         if let Some(right) = split {
-            let left = self.root.take().expect("the root is set");
+            // the new root's bounds are cloned before the old root leaves `self`
             let mut lasts = Vec::with_capacity(branch_cap::<K, V>() + 1);
-            lasts.extend([left.last().clone(), right.last().clone()]);
+            lasts.extend([root.last().clone(), right.last().clone()]);
+            let left = self.root.take().expect("the root is set");
             let mut children = Vec::with_capacity(branch_cap::<K, V>() + 1);
             children.extend([left, Arc::new(right)]);
             self.root = Some(Arc::new(Node::Branch(Branch { children, lasts })));
         }
+        self.len += 1;
         None
     }
 
@@ -548,9 +564,10 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V> {
         K: Borrow<Q>,
     {
         let path = self.locate(k)?;
-        self.len -= 1;
         let root = self.root.as_mut().expect("a map with a key has a root");
         let (value, _) = Arc::make_mut(root).remove_at(path.steps(), path.pos);
+        // only now, since a panicking copy of a node leaves the entry in place
+        self.len -= 1;
         // a branch left with one child gives way to it
         loop {
             match self.root.as_deref() {
@@ -1056,5 +1073,127 @@ mod tests {
             }
             check(&m, &model);
         }
+    }
+
+    thread_local! {
+        /// The clone of a [`Bomb`] that panics, counting down from one, or 0 for none.
+        static FUSE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A value that owns heap memory, as the control entries do, and whose clone panics
+    /// when [`FUSE`] runs out.
+    #[derive(Debug, PartialEq)]
+    struct Bomb(Box<u64>);
+
+    impl Clone for Bomb {
+        fn clone(&self) -> Self {
+            FUSE.with(|f| match f.get() {
+                0 => {}
+                1 => {
+                    f.set(0);
+                    panic!("the clone of a bomb");
+                }
+                n => f.set(n - 1),
+            });
+            Bomb(self.0.clone())
+        }
+    }
+
+    /// Run `op` on a copy of `m` that shares every node with `m`, with the `n`th clone of
+    /// a value panicking, and return the copy and whether `op` finished.
+    fn with_fuse(
+        m: &PMap<u64, Bomb>,
+        n: usize,
+        op: &dyn Fn(&mut PMap<u64, Bomb>),
+    ) -> (PMap<u64, Bomb>, bool) {
+        let mut w = m.clone();
+        FUSE.with(|f| f.set(n));
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut w))).is_ok();
+        FUSE.with(|f| f.set(0));
+        (w, done)
+    }
+
+    #[test]
+    fn a_panicking_value_clone_leaves_the_map_as_it_was() {
+        // keep the expected panics out of the test output
+        static QUIET: std::sync::Once = std::sync::Once::new();
+        QUIET.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if info.payload().downcast_ref::<&str>() != Some(&"the clone of a bomb") {
+                    prev(info);
+                }
+            }));
+        });
+        let mut rng = Rng(7);
+        let mut m: PMap<u64, Bomb> = PMap::new();
+        let mut model: BTreeMap<u64, Bomb> = BTreeMap::new();
+        let (mut panics, mut deepest, mut peak) = (0, 0, 0);
+        for step in 0..1_500u64 {
+            // fill the map over three levels, then drain it by removing keys it holds,
+            // which merges and redistributes the nodes of a shared tree
+            let drain = step >= 900;
+            // 0 inserts, 1 updates, 2 updates or inserts and 3 removes
+            let kind = match rng.below(10) {
+                x if x < if drain { 1 } else { 6 } => 0,
+                6 => 1,
+                7 => 2,
+                _ => 3,
+            };
+            let k = match model.len() as u64 {
+                n if drain && kind == 3 && n > 0 => {
+                    *model.keys().nth(rng.below(n) as usize).expect("a held key")
+                }
+                _ => rng.below(1_000),
+            };
+            let op = move |w: &mut PMap<u64, Bomb>| match kind {
+                0 => {
+                    w.insert(k, Bomb(Box::new(step)));
+                }
+                1 => {
+                    if let Some(v) = w.get_mut(&k) {
+                        *v.0 += 1;
+                    }
+                }
+                2 => *w.get_or_insert_with(k, || Bomb(Box::new(0))).0 += 1,
+                _ => {
+                    w.remove(&k);
+                }
+            };
+            let mut after = model.clone();
+            match kind {
+                0 => {
+                    after.insert(k, Bomb(Box::new(step)));
+                }
+                1 => {
+                    if let Some(v) = after.get_mut(&k) {
+                        *v.0 += 1;
+                    }
+                }
+                2 => *after.entry(k).or_insert_with(|| Bomb(Box::new(0))).0 += 1,
+                _ => {
+                    after.remove(&k);
+                }
+            }
+            // every clone the write makes, in turn, until it finishes
+            for n in 1.. {
+                let (w, done) = with_fuse(&m, n, &op);
+                check(&m, &model);
+                if done {
+                    check(&w, &after);
+                    m = w;
+                    break;
+                }
+                panics += 1;
+                check(&w, &model);
+            }
+            model = after;
+            deepest = deepest.max(depth(&m));
+            peak = peak.max(model.len());
+        }
+        assert!(deepest >= 3, "the tree reached {deepest} levels");
+        let left = model.len();
+        assert!(2 * left < peak, "{left} of {peak} entries are left");
+        assert!(panics > 1_000, "{panics} panics");
     }
 }

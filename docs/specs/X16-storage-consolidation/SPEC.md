@@ -940,7 +940,8 @@ temporary pattern runs.
 
 ### Item 1152 outcome
 
-The `imbl` crate has left the workspace, the three binding workspaces and every lock file.
+The `imbl` crate has left the workspace, the three binding workspaces and every workspace
+lockfile.
 A `BTreeMap` behind an `Arc` would copy the whole map at the first change after a snapshot,
 which measured 38 µs a commit at 10,000 predicates, 8.4 ms at a million and 30 ms a frame
 for a control state of a million entries, as
@@ -964,23 +965,46 @@ each node.
 The rows that commits add to the spatial index after its overlay was built are kept in a
 `store::append_vec::AppendVec`. It is a radix tree of full 32-row chunks with the last,
 partly filled chunk beside it, so an append to a clone copies at most that last chunk and the
-branches above a new chunk. Iteration walks the chunks in order, and the memory that a view
-charges for its tail is unchanged. Unit tests compare `PMap` with `BTreeMap` under random
+branches above a new chunk. Iteration walks the chunks in order. A shared tail is copied
+into a buffer with room for a chunk, and a tail that fills moves into the tree and leaves no
+buffer behind, so a view whose rows end at a full chunk allocates its next buffer at its
+next append.
+
+The memory charges keep their logical definitions. `maxControlBytes` counts each control
+key and value once, and the spatial `overlay_bytes` counts each tail row once, as before.
+Neither counts the structure around those entries. Each branch of a `PMap` keeps a copy of
+the largest key under each child to route a descent, so a control map of byte-string keys
+holds one more copy of a key for each node below its root, and a write that copies a branch
+allocates new copies of its keys. A spatial tail that holds a row reserves room for 32,
+which is 1,280 bytes for 40-byte `TailRow` values on a 64-bit build against the 40 bytes the
+view charges for one row, and full chunks add their branches and allocation headers. The
+spatial formula left out the tree around the tail with `imbl` as well.
+
+A write copies every shared node it changes before it changes any, so a key or value whose
+`Clone` panics during those copies leaves a `PMap` as it was, which a unit test checks at
+every value clone of a set of writes to a shared tree. The bounds that branches keep are cloned
+after a leaf changes, so a panicking key clone there can leave the writer's map
+inconsistent. The maps of the store hold integer and byte-string keys, whose clones fail
+only when an allocation fails, and that aborts the process. Unit tests compare `PMap` with `BTreeMap` under random
 inserts, removals, updates and ranges with integer and heap keys, and check after each phase
 that every snapshot kept its entries, that a write to a clone of a million entries leaves
 at most one path and its splits unshared, and that a missing key copies nothing. The tests
 of `AppendVec` cover sizes past three levels of branches and two clones of one version that
 append different rows.
 
-A harness timed both crates in one process on one pinned core of the Boat worker
+A [collection harness](../../benchmarks/writes/RESULTS.md#persistent-collections-of-the-commit-path)
+timed both crates in one process on one pinned core of the Boat worker
 `bx_4xarzecx`, an AMD Ryzen 9 9950X, against `imbl` 7.0.2, in eight rounds that alternate
 the order of the two. Each commit case clones a map and changes one entry, as a single-quad
 commit and a control frame do. The table gives the ratio of the medians, `PMap` or
 `AppendVec` over `imbl`, at 100, 10,000 and 1,000,000 entries, and at 4,096, 100,000 and
 1,000,000 rows for the tails. Boat timings are approximate. Two later runs of the final
 code, after a long test run on the worker, read the random inserts into one map of a million
-predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and 1.44,
-and item 1246 holds the costs that an Intel host should confirm.
+predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and 1.44.
+Item 1246 holds the cases that ran slower, the commits at 10,000 predicates, the inserts into
+one map of 10,000 and of a million predicates and the control removal at a million entries,
+for an Intel host to confirm. The harness times collection operations alone and no
+whole-store commit or spatial query.
 
 | Case | Small | Medium | Large |
 |---|---|---|---|
