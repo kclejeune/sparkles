@@ -18058,6 +18058,9 @@ mod string_order_tests {
         prefix_pairs: Vec<(Id, Id)>,
         /// Language-tagged, directional, typed, numeric and IRI terms.
         others: Vec<Id>,
+        /// Pairs of language-tagged literals with one tag and pairs of integers, which the
+        /// generic comparison orders, with their order.
+        comparable: Vec<([Id; 2], Ordering)>,
         /// The lexical form of every stored simple literal, by its id.
         text: std::collections::HashMap<u64, String>,
     }
@@ -18098,6 +18101,21 @@ mod string_order_tests {
             Literal::new_typed_literal("5", oxrdf::vocab::xsd::INTEGER).into(),
             NamedNode::new("urn:iri").unwrap().into(),
         ];
+        let en = |s: &str| -> Term {
+            Literal::new_language_tagged_literal(s, "en")
+                .unwrap()
+                .into()
+        };
+        let int =
+            |s: &str| -> Term { Literal::new_typed_literal(s, oxrdf::vocab::xsd::INTEGER).into() };
+        let comparable: Vec<(Term, Term, Ordering)> = vec![
+            (en("k00001"), en("k00009"), Ordering::Less),
+            (en("k00009"), en("k00001"), Ordering::Greater),
+            (en("k00009"), en("k00009"), Ordering::Equal),
+            (int("5"), int("10"), Ordering::Less),
+            (int("10"), int("5"), Ordering::Greater),
+            (int("10"), int("10"), Ordering::Equal),
+        ];
         let simple = |s: &str| -> Term { Literal::new_simple_literal(s).into() };
         let strings: Vec<Term> = general
             .iter()
@@ -18105,7 +18123,13 @@ mod string_order_tests {
             .map(|s| simple(s))
             .collect();
         let mut nt = String::new();
-        for (i, term) in strings.iter().chain(&others).enumerate() {
+        let comparable_terms = comparable.iter().flat_map(|(a, b, _)| [a, b]);
+        for (i, term) in strings
+            .iter()
+            .chain(&others)
+            .chain(comparable_terms)
+            .enumerate()
+        {
             writeln!(nt, "<urn:s:{i}> <urn:p> {term} .").unwrap();
         }
         let store = Store::in_memory(StoreOptions {
@@ -18140,20 +18164,32 @@ mod string_order_tests {
             .iter()
             .map(|term| snap.lookup_term(term).unwrap())
             .collect();
+        let comparable = comparable
+            .iter()
+            .map(|(a, b, ord)| {
+                let pair = [snap.lookup_term(a).unwrap(), snap.lookup_term(b).unwrap()];
+                assert!(pair.iter().all(|id| !text.contains_key(&id.0)), "{a} {b}");
+                (pair, *ord)
+            })
+            .collect();
         drop(snap);
         MixedCorpus {
             store,
             general,
             prefix_pairs,
             others,
+            comparable,
             text,
         }
     }
 
-    /// `STRING_ORDER_ROWS` rows of string pairs. Rarely repeating rows use every general
-    /// string at most once and pair a string with its proper extension in every 16th row.
-    /// Repeating rows draw both sides from 80 strings. After the sample, every 61st row
-    /// holds another kind of term on one side.
+    /// `STRING_ORDER_ROWS` rows of string pairs. Rarely repeating rows pair a string with
+    /// its proper extension in every 16th row and otherwise use every general string at
+    /// most once, except that the empty string and one long key also fill the first two
+    /// rows of equal strings. Repeating rows draw both sides from 80 strings. In both
+    /// layouts every 64th row compares a string with itself. After the sample, every 61st
+    /// row holds another kind of term on one side, and every 61st row at another offset
+    /// holds a pair that the generic comparison orders.
     fn mixed_rows(c: &MixedCorpus, repeat: bool) -> Vec<[Id; 2]> {
         let g = &c.general;
         let pick = |k: usize| g[k * 7919 % g.len()];
@@ -18162,10 +18198,28 @@ mod string_order_tests {
             .chain(c.prefix_pairs.iter().take(16).flat_map(|&(a, b)| [a, b]))
             .collect();
         let mut next = 0;
+        let mut equal = 0;
         (0..STRING_ORDER_ROWS)
             .map(|i| {
                 let mut row = if repeat {
-                    [hot[i * 7 % hot.len()], hot[(i * 13 + 5) % hot.len()]]
+                    let a = hot[i * 7 % hot.len()];
+                    if i % 64 == 33 {
+                        [a, a]
+                    } else {
+                        [a, hot[(i * 13 + 5) % hot.len()]]
+                    }
+                } else if i % 64 == 33 {
+                    // the empty string, a key of 5,000 bytes, then unused general strings
+                    let a = match equal {
+                        0 => c.prefix_pairs[0].0,
+                        1 => g[5],
+                        _ => {
+                            next += 1;
+                            pick(next - 1)
+                        }
+                    };
+                    equal += 1;
+                    [a, a]
                 } else if i % 16 == 7 {
                     let (a, b) = c.prefix_pairs[i / 16];
                     if (i / 16).is_multiple_of(2) {
@@ -18179,6 +18233,8 @@ mod string_order_tests {
                 };
                 if i >= STRING_ORDER_SAMPLE && i % 61 == 3 {
                     row[(i / 61) % 2] = c.others[(i / 61) % c.others.len()];
+                } else if i >= STRING_ORDER_SAMPLE && i % 61 == 31 {
+                    row = c.comparable[(i / 61) % c.comparable.len()].0;
                 }
                 row
             })
@@ -18187,10 +18243,12 @@ mod string_order_tests {
 
     /// Bypassed direct comparisons and floors keep the rows that the generic filter and
     /// code point order keep, over ASCII, multi-byte UTF-8, combining marks, proper
-    /// prefixes, long keys and interleaved language-tagged, directional, typed and IRI
-    /// terms, in both vocabulary codecs, for all four operators and in both modes. Pairs
-    /// that rarely repeat bypass the floor table without allocating it, and pairs that
-    /// repeat keep their floors in it.
+    /// prefixes, equal strings, long keys and interleaved language-tagged, directional,
+    /// typed and IRI terms, in both vocabulary codecs, for all four operators and in both
+    /// modes. Rows of language-tagged literals with one tag and rows of integers keep the
+    /// rows that their known order keeps, so the generic fallback keeps some of them.
+    /// Pairs that rarely repeat bypass the floor table without allocating it, and pairs
+    /// that repeat keep their floors in it.
     #[test]
     fn mixed_strings_compare_exactly_whether_floors_are_bypassed_or_kept() {
         use super::super::expr::CmpOp;
@@ -18219,22 +18277,37 @@ mod string_order_tests {
                         let generic =
                             evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
                         assert_eq!(mask, generic, "{label}");
-                        let mut strings = 0;
-                        for (i, [a, b]) in rows.iter().enumerate() {
+                        let keep = |ord: Ordering| match op {
+                            CmpOp::Lt => ord.is_lt(),
+                            CmpOp::Le => ord.is_le(),
+                            CmpOp::Gt => ord.is_gt(),
+                            CmpOp::Ge => ord.is_ge(),
+                        };
+                        let (mut strings, mut equal) = (0, 0);
+                        let (mut ordered, mut ordered_kept) = (0, 0);
+                        for (i, row) in rows.iter().enumerate() {
+                            let [a, b] = row;
+                            if let Some((_, ord)) = c.comparable.iter().find(|(p, _)| p == row) {
+                                assert_eq!(mask[i], keep(*ord), "{label} row {i}: {ord:?}");
+                                ordered += 1;
+                                ordered_kept += usize::from(mask[i]);
+                                continue;
+                            }
                             let (Some(sa), Some(sb)) = (c.text.get(&a.0), c.text.get(&b.0)) else {
                                 continue;
                             };
                             let ord = sa.as_str().cmp(sb.as_str());
-                            let keep = match op {
-                                CmpOp::Lt => ord.is_lt(),
-                                CmpOp::Le => ord.is_le(),
-                                CmpOp::Gt => ord.is_gt(),
-                                CmpOp::Ge => ord.is_ge(),
-                            };
-                            assert_eq!(mask[i], keep, "{label} row {i}: {sa:?} {op:?} {sb:?}");
+                            assert_eq!(mask[i], keep(ord), "{label} row {i}: {sa:?} {op:?} {sb:?}");
                             strings += 1;
+                            equal += usize::from(ord.is_eq());
                         }
                         assert!(strings > rows.len() * 9 / 10, "{label}: {strings}");
+                        // every 64th row, less the few that rows of other terms replace
+                        assert!(equal > rows.len() / 128, "{label}: {equal} equal rows");
+                        assert!(
+                            0 < ordered_kept && ordered_kept < ordered,
+                            "{label}: {ordered_kept} of {ordered} ordered other rows kept"
+                        );
                         let cache = ctx.floor_cache();
                         if repeat {
                             assert_eq!(cache.bypassed(), 0, "{label}");
@@ -18251,13 +18324,21 @@ mod string_order_tests {
         }
     }
 
-    /// One thread and four give the same masks and leave the floor cache in the same
-    /// state with the same retained charge after every mask, for a stream of pairs that
-    /// rarely repeat and for a stream of pairs that repeat.
+    /// One thread and four give the same masks and leave the floor cache with the same
+    /// bypass count, slots, entries, table bytes and reservation and the query with the
+    /// same retained charge after every mask, for a stream of pairs that rarely repeat
+    /// and for a stream of pairs that repeat. Each mask has one row more than
+    /// `PAR_THRESHOLD`, so the four-thread arm always splits the rows after the sample
+    /// over the pool in one part, whether it compares them directly or through floors,
+    /// and never leaves the choice to a timed sample.
     #[test]
     fn floor_bypass_and_floors_are_deterministic_across_thread_counts() {
         use super::super::expr::CmpOp;
-        let rows = STRING_ORDER_ROWS;
+        let rows = PAR_THRESHOLD + 1;
+        assert!(
+            rows <= STRING_ORDER_SAMPLE + PAR_THRESHOLD,
+            "one part after the sample"
+        );
         let masks = 6;
         let (s, ids) = word_store(masks * 2 * rows);
         // Strings adjacent in the vocabulary share no slot of a table, so no floor evicts
@@ -18334,9 +18415,12 @@ mod string_order_tests {
         }
     }
 
-    /// Colleague-shaped pairs of names that rarely repeat and names-shaped pairs of a few
+    /// Colleague-shaped pairs of names that never repeat and names-shaped pairs of a few
     /// repeated names stream through string order masks and keep the rows that the
-    /// decoded comparison keeps, on one thread and on four.
+    /// decoded comparison keeps, on one thread and on four. Each person's colleague has
+    /// a name of its own, so the two columns of the colleague shape share no string in
+    /// any join order and its mask bypasses the floor table, while the names shape keeps
+    /// its floors. The cursor's own floor cache shows which path each query took.
     #[test]
     fn streamed_name_pairs_match_the_decoded_comparison_on_any_thread_count() {
         use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
@@ -18349,7 +18433,8 @@ mod string_order_tests {
             let known = (i * 13 + 5) % people;
             writeln!(nt, "<urn:p:{i}> <urn:name> {} .", name(i)).unwrap();
             writeln!(nt, "<urn:p:{i}> <urn:nick> {} .", name(i % 40 * 150)).unwrap();
-            writeln!(nt, "<urn:p:{i}> <urn:colleague> <urn:p:{colleague}> .").unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:colleague> <urn:c:{i}> .").unwrap();
+            writeln!(nt, "<urn:c:{i}> <urn:name> {} .", name(people + colleague)).unwrap();
             writeln!(nt, "<urn:p:{i}> <urn:knows> <urn:p:{known}> .").unwrap();
         }
         let s = Store::in_memory(StoreOptions::default());
@@ -18392,8 +18477,7 @@ mod string_order_tests {
                         .num_threads(threads)
                         .build()
                         .unwrap();
-                    let before = STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed);
-                    let mut streamed = pool.install(|| {
+                    let (mut streamed, cache) = pool.install(|| {
                         let cursor_options = CursorOptions {
                             batch_rows: 1 << 16,
                             ..Default::default()
@@ -18408,12 +18492,23 @@ mod string_order_tests {
                                 streamed.push(row.values().iter().map(text).collect::<Vec<_>>());
                             }
                         }
-                        streamed
+                        let ctx = cursor.output_ctx();
+                        let cache = ctx.floor_cache();
+                        let state = (cache.bypassed(), cache.slots(), cache.entries());
+                        (streamed, state)
                     });
-                    assert!(
-                        STRING_ORDER_MASKS.load(AtomicOrdering::Relaxed) > before,
-                        "{label} {op} threads {threads}: a batch reaches the string order mask"
+                    let (bypassed, slots, entries) = cache;
+                    let path = format!(
+                        "{label} {op} threads {threads}: bypassed {bypassed}, slots {slots}, \
+                         entries {entries}"
                     );
+                    if label == "urn:name" {
+                        assert!(bypassed > 0, "{path}: the colleague shape bypasses floors");
+                        assert_eq!(slots, 0, "{path}: the floor table stays deferred");
+                    } else {
+                        assert_eq!(bypassed, 0, "{path}: the names shape keeps its floors");
+                        assert!(entries > 0, "{path}: the names shape keeps its floors");
+                    }
                     streamed.sort();
                     assert_eq!(streamed, decoded, "{label} {op} threads {threads}");
                 }

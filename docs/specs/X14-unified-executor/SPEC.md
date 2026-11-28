@@ -414,11 +414,19 @@ the admitted buffer fits the maximum decoded length and the optional decoder hea
 For other suffixes the growth check still uses the measured length. Scratch remains
 inside the decoding envelope, and the cursor's checkpoints still report cancellation
 and required decoding refusals. Unit tests compare bypassed and cached masks with the
-generic filter and with code point order over multi-byte UTF-8, proper prefixes, long
-keys and interleaved language-tagged, typed and IRI terms in both codecs, and check that
-one thread and four leave the same masks, cache state and retained charge. The implementation is
-ready for the [forge confirmation](#forge-confirmation-for-item-1088) of the streaming
-cost, which is pending.
+generic filter and with code point order over multi-byte UTF-8, equal strings, proper
+prefixes, long keys and interleaved language-tagged, typed and IRI terms in both codecs.
+Pairs of language-tagged literals with one tag and pairs of integers check that the
+generic fallback keeps the rows that their order keeps. A determinism test runs masks of
+one row more than `PAR_THRESHOLD`, which the four-thread pool splits after the sample,
+and checks that one thread and four give the same masks and, after every mask, the same
+bypass count, table slots, table entries, table bytes and cache reservation and the same
+retained query charge. It does not compare which floors occupy the slots. Cursor tests of
+the colleague and names shapes read the cursor's own floor cache and check that the
+colleague shape bypasses the table without allocating it and that the names shape keeps
+floors without bypassing. The implementation is ready for the
+[forge confirmation](#forge-confirmation-for-item-1088) of the streaming cost, which is
+pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with

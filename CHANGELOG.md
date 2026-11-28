@@ -7,11 +7,15 @@
 Order comparisons of two columns of stored strings skip the per-query floor cache when
 few of its lookups hit. The first eligible comparison estimates from a sample how often
 its strings repeat and defers the floor table when the estimate predicts fewer than one
-hit in eight lookups. A later comparison bypasses the table once 2,048 lookups have hit
-less often than that. A bypassed comparison reads the two keys directly through the
+hit in eight lookups. Between later comparisons, or between the parts of a large one, the
+cache bypasses the table when the lookups since its last check hit less often than that.
+The check needs at least 2,048 lookups. It skips a pass in which the table grew, and a
+table that the estimate sized above the first table's size must first serve lookups
+numbering half its slots. A bypassed comparison reads the two keys directly through the
 vocabulary's checked single-key walk, with scratch that each worker reuses and admits
-again only when it grows. Every fourth comparison probes the floors again, so inputs
-whose strings repeat in later batches return to the cache. A floor lookup uses the common
+again only when it grows. While the cache bypasses the table, every fourth comparison
+probes the floors again, so inputs whose strings repeat in later batches return to the
+cache. A floor lookup uses the common
 prefix length that both vocabulary codecs store and reads the preceding key only at a
 block boundary. Answers are unchanged, and the memory budget, cancellation and deadlines
 still apply to the bypassed comparison. This implements roadmap item 1088, which stays
