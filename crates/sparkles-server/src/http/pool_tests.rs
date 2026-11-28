@@ -559,3 +559,79 @@ async fn a_query_larger_than_the_whole_pool_answers_507_without_retry_after() {
     );
     assert_eq!(pool(&s).granted(), 0);
 }
+
+#[cfg(feature = "ontology")]
+#[tokio::test]
+async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
+    use sparkles::handles::ontology::OntologyRequest;
+    use sparkles::handles::ontology::classify::ClassifyRequest;
+    const TTL: &str = "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+        :A a owl:Class . :B a owl:Class ; rdfs:subClassOf :A . :C a owl:Class ; owl:equivalentClass :B .";
+    let classified = |state: &AppState| {
+        let ds = state.datasets()["ds"].clone();
+        ds.store
+            .load(&[Source::from_bytes(
+                TTL.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        ds.dataset
+            .ontology()
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &Default::default(),
+            )
+            .unwrap();
+    };
+    const KEPT: &str = "/$/ontology/ds/axioms?classification=kept";
+    let s = server(64, Duration::from_millis(200));
+    classified(&s.state);
+    let (status, headers, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["status"], "available", "{j}");
+    assert!(j["total"].as_u64().unwrap() >= 2, "{j}");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let admitted = pool(&s).stats().admitted;
+    assert!(admitted >= 1);
+    assert_eq!(pool(&s).granted(), 0);
+    // a busy pool refuses the same page for now, and a retry can pass
+    let held = pool(&s).try_grant(56 * MB).unwrap();
+    let (status, headers, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["budget"], "server-memory");
+    drop(held);
+    let (status, _, body) = get(&s.app, KEPT).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool(&s).granted(), 0);
+    // the asserted listing is not admitted to the pool
+    let before = pool(&s).stats().admitted;
+    let (status, _, body) = get(&s.app, "/$/ontology/ds/axioms").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(pool(&s).stats().admitted, before);
+    // a page past the request's memory limit cannot pass on a retry
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(64 * MB),
+    )
+    .unwrap();
+    state.limits.query_memory_bytes = Some(64);
+    let state = Arc::new(state);
+    state.attach("ds", DbType::Mem, None).unwrap();
+    classified(&state);
+    state.set_phase(Phase::Ready);
+    let app = router(state.clone());
+    let (status, headers, body) = get(&app, KEPT).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    assert!(!headers.contains_key(header::RETRY_AFTER));
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(state.catalog.pool().unwrap().granted(), 0);
+}

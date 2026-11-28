@@ -1150,9 +1150,11 @@ pub const PINNED_OPERATIONS: [&str; 7] = [
 ];
 
 /// As [`call`], with every read at `snap`, a snapshot of `ds` that a read transaction or
-/// a historical view holds ([`super::Ontologies::at_snapshot`]). Only the operations of
-/// [`PINNED_OPERATIONS`] are answered, and a classification that names a target is
-/// refused, since a pinned read writes nothing.
+/// a historical view holds ([`super::Ontologies::at_snapshot`]). Only these reads of
+/// [`PINNED_OPERATIONS`] are answered, checked before anything is read:
+/// `keptClassification`, `axioms` and `entity` with `classification: "kept"`,
+/// `hierarchy`, `individuals` and `term` with `inferences: true`, and `classify` with
+/// `projection: "frame"` and no target, since a pinned read writes nothing.
 pub fn call_at(
     ds: &Dataset,
     snap: std::sync::Arc<crate::store::Snapshot>,
@@ -1166,7 +1168,55 @@ pub fn call_at(
             PINNED_OPERATIONS.join(", ")
         )));
     }
+    let empty = Map::new();
+    let a = match args {
+        J::Null => &empty,
+        J::Object(o) => o,
+        _ => return Err(bad("the arguments are a JSON object")),
+    };
+    pinned_variant(op, a)?;
     call_on(&ds.ontology().at_snapshot(snap), op, args, opts)
+}
+
+/// Refuse a variant of a [`PINNED_OPERATIONS`] operation that a pinned read does not
+/// answer: an asserted entity or axiom read, an asserted browser read and a
+/// classification without a frame projection or with a target.
+fn pinned_variant(op: &str, a: &Map<String, J>) -> Result<()> {
+    match op {
+        "keptClassification" => Ok(()),
+        "axioms" | "entity" => {
+            if kept_selected(a)? {
+                Ok(())
+            } else {
+                Err(bad(format!(
+                    "a pinned ontology.{op} reads the kept classification: pass classification=kept"
+                )))
+            }
+        }
+        "hierarchy" | "individuals" | "term" => {
+            if boolean(a, "inferences")? == Some(true) {
+                Ok(())
+            } else {
+                Err(bad(format!(
+                    "a pinned ontology.{op} reads the materialization: pass inferences=true"
+                )))
+            }
+        }
+        "classify" => {
+            if projection_of(string(a, "projection")?)?.is_none() {
+                return Err(bad(
+                    "a pinned ontology.classify answers a frame projection: pass projection=frame",
+                ));
+            }
+            if a.get("target").is_some_and(|t| !t.is_null()) {
+                return Err(bad(
+                    "a pinned ontology.classify writes nothing: leave out 'target'",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(bad(format!("ontology.{op} has no pinned read"))),
+    }
 }
 
 fn call_on(handle: &super::Ontologies, op: &str, args: &J, opts: &QueryOptions) -> Result<J> {
@@ -2445,6 +2495,16 @@ fn frame_body(name: &str, c: &Classified, req: &OntologyRequest, q: &ClassifyQue
 pub fn decode_arguments(op: &str, bytes: &[u8]) -> Result<J> {
     if matches!(op, "classify" | "keptClassification") {
         decode_argument_object(bytes, op == "keptClassification", op == "classify")
+    } else if matches!(op, "axioms" | "entity") {
+        // a read that names the kept classification takes each selector once, and the
+        // asserted reads keep their legacy decoding, null included
+        let v: J = serde_json::from_slice(bytes)
+            .map_err(|e| bad(format!("invalid ontology JSON: {e}")))?;
+        if v.get("classification").is_some() {
+            decode_argument_object(bytes, true, false)
+        } else {
+            Ok(v)
+        }
     } else {
         // Unrelated legacy operations accept null as an empty argument object.
         serde_json::from_slice(bytes).map_err(|e| bad(format!("invalid ontology JSON: {e}")))

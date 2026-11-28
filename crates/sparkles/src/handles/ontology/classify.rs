@@ -386,8 +386,18 @@ impl Ontologies {
         opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
         // a run that skips the modules' pass answers differently, so it is not kept
-        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.skip_coverage;
-        let (publication, reused) = if keep {
+        let shared = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.skip_coverage;
+        // a pinned read of an older commit reuses that commit's kept result, and on a
+        // miss classifies without replacing the head's
+        let keep = shared && self.may_replace_kept(&snap);
+        let held = if shared && !keep {
+            self.kept_publication_at(req, &o, c.el_only)
+        } else {
+            None
+        };
+        let (publication, reused) = if let Some(p) = held {
+            (p, true)
+        } else if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
@@ -440,7 +450,7 @@ impl Ontologies {
                 "the taxonomy has no class <{about}>"
             )));
         }
-        let retained = keep
+        let retained = shared
             && self
                 .ds
                 .state()
@@ -472,6 +482,36 @@ impl Ontologies {
                 Some(self.write_taxonomy(req, &classified, target, c, &write_opts)?);
         }
         Ok(classified)
+    }
+
+    /// Whether a run at `snap` may replace the dataset's kept classification state. A
+    /// handle pinned to a commit older than the live head never does, so a read of a
+    /// held transaction or historical view cannot evict the head's kept result.
+    pub(super) fn may_replace_kept(&self, snap: &Snapshot) -> bool {
+        self.pinned.is_none() || snap.commit == self.ds.store().snapshot().commit
+    }
+
+    /// The kept publication of exactly the opened inputs and commit, if the slot holds
+    /// one, read without taking the flight.
+    fn kept_publication_at(
+        &self,
+        req: &OntologyRequest,
+        o: &Opened,
+        el_only: bool,
+    ) -> Option<Arc<KeptClassification>> {
+        let key = InputKey::of(self, req, &o.snapshot);
+        let p = self
+            .ds
+            .state()
+            .classify_cache
+            .lock()
+            .slot(el_only)
+            .publication
+            .clone()?;
+        (p.source.input == key
+            && p.source.commit == o.snapshot.commit
+            && p.source.el_only == el_only)
+            .then_some(p)
     }
 
     /// A classification through the dataset's kept classifier.

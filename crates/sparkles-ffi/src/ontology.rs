@@ -46,9 +46,12 @@ impl FfiDataset {
 impl FfiReadTxn {
     /// As `FfiDataset::ontology_call`, with every read at this transaction's snapshot,
     /// so that a read transaction or a historical view answers at its own commit
-    /// (roadmap item 588). Only the kept-classification, materialized and frame
-    /// projection reads of `wire::PINNED_OPERATIONS` are answered. A request whose `at`
-    /// names another state is refused, and so is a classification that writes.
+    /// (roadmap item 588). Only these reads of `wire::PINNED_OPERATIONS` are answered,
+    /// and their selectors are checked before dispatch: `keptClassification`, `axioms`
+    /// and `entity` with `classification: "kept"`, `hierarchy`, `individuals` and
+    /// `term` with `inferences: true`, and `classify` with `projection: "frame"` and no
+    /// target. A request whose `at` names another state is refused, and so is a snapshot
+    /// of another dataset or branch.
     pub fn ontology_call(
         &self,
         op: String,

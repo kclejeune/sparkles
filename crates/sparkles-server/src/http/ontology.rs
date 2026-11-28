@@ -279,6 +279,18 @@ pub(super) async fn summary(
 /// `about`, one page at a time (`limit`, `offset`), as JSON or as a functional-style
 /// document (`format=ofn`). `assertions=true` adds the assertions the store holds.
 pub(super) async fn axioms(
+    st: St,
+    name: Path<String>,
+    p: Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let kept = kept_requested(&uri);
+    let answer = axioms_read(st, name, p, uri, headers).await;
+    if kept { no_store(answer) } else { answer }
+}
+
+async fn axioms_read(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -288,34 +300,32 @@ pub(super) async fn axioms(
     let ds = dataset(&st, &name)?;
     let params = Params::from_query(&uri);
     let req = request_of(&st, &ds, &params)?;
-    if let Some(a) = kept_args(
-        &params,
-        &headers,
-        &["type", "about", "assertions", "limit", "offset"],
-    )? {
+    if let Some(a) = kept_args(&params, &headers, &["type", "about", "limit", "offset"])? {
         if params.get("format").is_some_and(|f| f != "json") {
             return Err(bad("classification=kept answers JSON: leave out 'format'"));
         }
         let query = onto::wire::kept_axiom_query_of(&a).map_err(ontology_error)?;
         query.validate(&req).map_err(ontology_error)?;
-        let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
-        return no_store(
-            blocking(move || {
-                let found = ds
-                    .dataset
-                    .ontology()
-                    .kept_axioms(&req, &query, &opts)
-                    .map_err(ontology_error)?;
-                let body = onto::wire::kept_axioms_body(&ds.name, &found, &renderer(&ds))
-                    .map_err(ontology_error)?;
-                Ok(with_commit(
-                    Json(body).into_response(),
-                    &ds,
-                    found.read.commit,
-                ))
-            })
-            .await,
-        );
+        // the server admits this read to the query memory pool, whose grant the
+        // page's rows are charged to
+        let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+        let (cancel, _guard) = cancel_on_drop();
+        opts.cancel = Some(cancel);
+        return blocking(move || {
+            let found = ds
+                .dataset
+                .ontology()
+                .kept_axioms(&req, &query, &opts)
+                .map_err(ontology_error)?;
+            let body = onto::wire::kept_axioms_body(&ds.name, &found, &renderer(&ds))
+                .map_err(ontology_error)?;
+            Ok(with_commit(
+                Json(body).into_response(),
+                &ds,
+                found.read.commit,
+            ))
+        })
+        .await;
     }
     let types = match params.get("type") {
         None => None,
@@ -444,6 +454,18 @@ pub(super) async fn entities(
 /// instances of a class and the types and property assertions of an individual from the
 /// store, at most `limit` of each.
 pub(super) async fn entity(
+    st: St,
+    name: Path<String>,
+    p: Extension<Principal>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> ApiResult {
+    let kept = kept_requested(&uri);
+    let answer = entity_read(st, name, p, uri, headers).await;
+    if kept { no_store(answer) } else { answer }
+}
+
+async fn entity_read(
     State(st): St,
     Path(name): Path<String>,
     Extension(p): Extension<Principal>,
@@ -485,8 +507,14 @@ pub(super) async fn entity(
         }
         None => None,
     };
-    let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
-    let read = blocking(move || {
+    let mut opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
+    // a kept read stops when its client goes away
+    let _guard = kept.is_some().then(|| {
+        let (cancel, guard) = cancel_on_drop();
+        opts.cancel = Some(cancel);
+        guard
+    });
+    blocking(move || {
         let handle = ds.dataset.ontology();
         let opts = handle.anchored(&opts).map_err(ontology_error)?;
         let o = handle.open(&req, &opts).map_err(ontology_error)?;
@@ -500,12 +528,13 @@ pub(super) async fn entity(
         }
         Ok(with_commit(Json(j).into_response(), &ds, o.snapshot.commit))
     })
-    .await;
-    if kept_args.is_some() {
-        no_store(read)
-    } else {
-        read
-    }
+    .await
+}
+
+/// Whether a request names the kept classification with `classification`, whatever
+/// its value, so that every answer to it, a refusal included, is never cached.
+fn kept_requested(uri: &Uri) -> bool {
+    Params::from_query(uri).get("classification").is_some()
 }
 
 /// The selectors of a read of the kept classification through `GET .../axioms` or
@@ -539,6 +568,19 @@ fn kept_args(
     }
     if !onto::wire::kept_selected(&a).map_err(ontology_error)? {
         return Ok(None);
+    }
+    // a kept read takes each selector once, `graph` apart, and booleans as written
+    for (key, _) in &params.0 {
+        if key != "graph" && params.all(key).len() > 1 {
+            return Err(bad(format!("duplicate selector '{key}'")));
+        }
+    }
+    for key in ["inferences", "assertions"] {
+        if let Some(value) = params.get(key)
+            && !matches!(value, "true" | "false")
+        {
+            return Err(bad(format!("{key}: true or false")));
+        }
     }
     numbers(&mut a, &["offset", "limit"])?;
     Ok(Some(a))

@@ -953,10 +953,55 @@ impl Ontologies {
     /// snapshot, as if the request named its commit, without resolving history again,
     /// so a pinned snapshot stays readable after retention prunes its commit. A request
     /// whose `at` names anything other than `commit:N` of the snapshot is refused, and
-    /// so are edits, entity removals and classifications that write a taxonomy.
+    /// so are edits, entity removals, classifications that write a taxonomy, diffs and
+    /// entity searches. Every read refuses a snapshot of another dataset or branch
+    /// before it reads a cache, and [`open_at`](Self::open_at) and
+    /// [`kept_entity_at_opened`](Self::kept_entity_at_opened) refuse a snapshot or an
+    /// opened ontology at another state than the pin.
     pub fn at_snapshot(mut self, snap: Arc<Snapshot>) -> Ontologies {
         self.pinned = Some(snap);
         self
+    }
+
+    /// The pinned snapshot, once it is known to be a state of this handle's dataset and
+    /// branch, whose caches key their entries by commit alone.
+    pub(crate) fn pin(&self) -> Result<Option<&Arc<Snapshot>>> {
+        let Some(snap) = &self.pinned else {
+            return Ok(None);
+        };
+        let store = self.ds.store();
+        if snap.dataset_id != store.owner_dataset_id() || snap.branch_id != store.branch_id() {
+            return Err(Error::invalid(
+                "a pinned ontology read takes a snapshot of its own dataset and branch",
+            ));
+        }
+        Ok(Some(snap))
+    }
+
+    /// Refuse a read at `snap` through a pinned handle unless `snap` is a view of the
+    /// pinned state: the same dataset, branch and commit.
+    pub(crate) fn check_pinned_at(&self, snap: &Snapshot) -> Result<()> {
+        if let Some(pin) = self.pin()?
+            && (snap.dataset_id != pin.dataset_id
+                || snap.branch_id != pin.branch_id
+                || snap.commit != pin.commit)
+        {
+            return Err(Error::invalid(format!(
+                "a pinned ontology read answers at commit:{} of its own dataset and branch",
+                pin.commit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse a read through a pinned handle that cannot answer at the pin.
+    pub(crate) fn refuse_pinned(&self, what: &str) -> Result<()> {
+        if self.pinned.is_some() {
+            return Err(Error::invalid(format!(
+                "{what}: a pinned ontology read answers only at its own commit"
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse a write through a handle pinned with [`Ontologies::at_snapshot`].
@@ -1239,7 +1284,7 @@ impl Ontologies {
     ) -> Result<(Arc<Snapshot>, QueryOptions)> {
         let defaults = self.ds.with_query_defaults(opts);
         let opts = crate::overview::one_deadline(&defaults)?.into_owned();
-        if let Some(snap) = &self.pinned {
+        if let Some(snap) = self.pin()? {
             return match &req.at {
                 None => Ok((snap.clone(), opts)),
                 Some(crate::history::At::Commit(n)) if *n == snap.commit => {
@@ -1287,6 +1332,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<Opened> {
         req.validate()?;
+        self.check_pinned_at(snap)?;
         let access = opts.graphs.as_ref().map(|a| a.bound(snap));
         let view = match &access {
             Some(a) => a.masked(snap)?,
@@ -2374,6 +2420,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<OntologyDiff> {
         req.validate()?;
+        self.refuse_pinned("a diff reads two states of the history")?;
         if req.inferences {
             return Err(Error::invalid(
                 "a diff compares the asserted axioms: leave out 'inferences'",

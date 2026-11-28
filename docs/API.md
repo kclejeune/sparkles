@@ -1964,8 +1964,8 @@ also apply. A stopped read returns an error, never partial counts or conformance
 
 `GET /$/ontology/{ds}/axioms` lists the axioms, 100 at a time by default and at most
 10,000 (`limit`, `offset`, and `next` in the answer). `type` keeps the axiom types it
-lists, comma separated, and `about` keeps the axioms that mention an IRI. An `about` IRI
-that the ontology neither declares nor uses is `404`. `assertions=true` adds the
+lists, comma separated, and `about` keeps the axioms that mention an IRI. In an asserted
+listing, an `about` IRI that the ontology neither declares nor uses is `404`. `assertions=true` adds the
 assertions the store holds, which the listing streams from the graphs. Each axiom comes
 in functional-style syntax (`ofn`), with the dataset's prefixes, and in its JSON form
 (`axiom`), with the graph it was read from. `format=ofn` answers one functional-style
@@ -1981,13 +1981,20 @@ first of its group appears only in its group's equivalence. The answer has the k
 `commit`, `status`, `reason`, `result`, `outcome`, `activity` and `staleCommit`, with
 `source: "keptClassification"`, `axioms`, `total`, `offset`, `limit` and `next`. `axioms`
 and `total` are null unless the status is `available`, so a miss never reads as an empty
-listing, and with `about` the `entity` member reports whether the class is present. `limit` is from 1 to 1,000, and a nonzero `offset` needs `resultId` and
-`at=commit:N`. The page walks the retained taxonomy and builds only its own rows, whose
-estimated bytes count against the request's memory limit and the server pool. A page past
-the request's limit or the whole pool is `507`, and one that the busy pool cannot take is
-`503`. `elOnly` reads the kept EL-only classification. The selector refuses
-`inferences=true`, `assertions=true` and `format=ofn`, and its answers are
-`Cache-Control: no-store`.
+listing. With `about`, the `entity` member reports whether the class is present, and a class
+that the kept result does not hold answers `200` with `entity.present: false` and no
+axioms rather than `404`. `limit` is from 1 to 1,000, and a nonzero `offset` needs
+`resultId` and `at=commit:N`. The page walks the retained taxonomy in its own order and
+builds only its own rows, whose estimated bytes count against the request's memory limit
+and the server pool. The server admits a kept listing to its query memory pool and to the
+query class's rate and concurrency limits, as it admits a SPARQL query. A page past the
+request's limit or the whole pool is `507`, and one that the busy pool cannot take is
+`503`. `elOnly` reads the kept EL-only classification. The selector takes each parameter
+once, apart from `graph`, and `inferences` and `assertions` only as `true` or `false`. It
+refuses `inferences=true`, `assertions=true` and `format=ofn`. Every answer of the route
+to a request that names `classification`, its own refusals included, is
+`Cache-Control: no-store`. The rate limiter and the pool admission answer before the
+route, and their refusals do not carry the header.
 
 `GET /$/ontology/{ds}/entities` lists the entities the ontology declares or, in a lenient
 read, types by their use, as `{kind, iri}` in IRI order, 100 at a time by default and at
@@ -2176,7 +2183,9 @@ for an individual. With `inferences=true` the lists include the
 materialized closure, such as the inferred superclasses of a class.
 
 With `classification=kept` the answer adds a `classification` member, which reads the
-dataset's kept classification without classifying, mapping or warming anything on a miss.
+dataset's kept classification. The entity report beside it still opens and maps the
+asserted ontology as every entity read does, and the kept lookup itself classifies, maps
+and warms nothing more on a miss.
 It has the members of the kept read below, `commit`, `status`, `reason`, `result`,
 `outcome`, `entity`, `activity` and `staleCommit`, with `source: "keptClassification"` and
 `covers: ["namedClass"]`. `parents`, `children` and `equivalents` are the first pages of
@@ -2184,8 +2193,10 @@ the class's direct parent groups, direct child groups and equivalent named class
 page form of the kept read, and are null unless the class is present in an available result.
 `limit` bounds each page from 1 to 1,000, `lang` or `Accept-Language` selects their labels,
 and `elOnly` and `resultId` select the result as the kept read does. The asserted accessors
-beside it are unchanged. The selector refuses `inferences=true`, and its answers are
-`Cache-Control: no-store`.
+beside it are unchanged. The selector takes each parameter once, apart from `graph`, and
+`inferences` and `assertions` only as `true` or `false`. It refuses `inferences=true`.
+Every answer of the route to a request that names `classification`, its own refusals
+included, is `Cache-Control: no-store`.
 
 ```json
 { "dataset": "uni", "commit": 12, "iri": "http://ex.org/Professor", "kinds": ["Class"],
@@ -2371,10 +2382,20 @@ Python `Dataset.ontology.kept_classification`, Node.js
 `Dataset.ontology.keptClassification` and JVM `SparklesOntology.keptClassification`,
 with a `SparklesOnt` convenience and an operation/cancellation overload. These adapters
 omit the inherited false inferences default rather than sending a refused selector.
-The library also answers `Ontologies::kept_entity` and `Ontologies::kept_axioms`, and
-`Ontologies::at_snapshot` pins a handle to a snapshot that a read transaction or a
-historical view holds, so that its reads answer at that commit without resolving history
-again. The JVM's `keptClassification`, `keptAxioms`, `keptEntity`, frame projection and
+The library's `Ontologies::kept_entity` and `Ontologies::kept_axioms` are typed reads of
+the kept classification in their own right, and the `classification=kept` selector
+belongs to HTTP and the wire calls. `Ontologies::at_snapshot` pins a handle to a snapshot
+that a read transaction or a historical view holds, so that its reads answer at that
+commit without resolving history again. A pinned read refuses a snapshot of another
+dataset or branch before it reads a cache, and `Ontologies::open_at` and
+`Ontologies::kept_entity_at_opened` refuse a snapshot or an opened ontology of another
+state. A pinned handle refuses diffs and entity searches, which read
+other states. A classification through a handle pinned to a commit older than the head
+reuses that commit's kept result while the dataset holds it, and otherwise classifies
+without replacing the head's kept result. The FFI's `FfiReadTxn::ontology_call` answers
+only `keptClassification`, `axioms` and `entity` with `classification=kept`,
+`hierarchy`, `individuals` and `term` with `inferences=true`, and `classify` with
+`projection=frame` and no target. The JVM's `keptClassification`, `keptAxioms`, `keptEntity`, frame projection and
 materialized hierarchy, individual and term reads answer a pinned `DatasetGraphSparkles`
 and an active read transaction at their own commit, and the live dataset outside a
 transaction at the head or at `OntologyRead.at`. An `OntologyRead.at` other than the pinned

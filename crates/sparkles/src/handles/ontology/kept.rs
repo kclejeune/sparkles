@@ -27,6 +27,10 @@ pub struct InputKey {
     pub graphs: Vec<String>,
     pub imports: &'static str,
     pub mode: &'static str,
+    /// the digest of the import map and vocabulary resources that the imports resolve
+    /// through, which can change without a commit, or zero when imports are not read
+    #[serde(skip)]
+    pub import_targets: u64,
 }
 impl InputKey {
     pub(super) fn of(h: &Ontologies, req: &OntologyRequest, snap: &Snapshot) -> Self {
@@ -44,6 +48,10 @@ impl InputKey {
                 sparkles_reasoner::inputs::ImportMode::Fetch => "fetch",
             },
             mode: req.mode.as_str(),
+            import_targets: match req.imports {
+                sparkles_reasoner::inputs::ImportMode::None => 0,
+                _ => req.import_targets.digest(),
+            },
         }
     }
     fn owned_bytes(&self) -> usize {
@@ -858,6 +866,7 @@ impl Ontologies {
         opts: &QueryOptions,
     ) -> Result<KeptEntityRead> {
         query.validate(req)?;
+        self.check_pinned_at(&o.snapshot)?;
         self.kept_entity_at(req, &o.snapshot, query, opts)
     }
     fn kept_entity_at(
@@ -946,49 +955,58 @@ impl Ontologies {
         let about_node = about.as_ref().and_then(|c| t.node_of(c));
         // a subclass axiom names only the first class of each group
         let about_is_rep = matches!((&about, about_node), (Some(c), Some(n)) if t.node(n).classes.first() == Some(c));
-        let groups: Vec<usize> = match about_node {
-            None if about.is_some() => Vec::new(),
-            None => (0..t.nodes().len()).collect(),
-            Some(n) => {
-                let mut ids = vec![n];
-                if about_is_rep {
-                    ids.extend(t.node(n).children.iter().copied());
-                }
-                ids.sort_unstable();
-                ids.dedup();
-                ids
-            }
-        };
         let end = query.offset.saturating_add(query.limit);
         let mut total = 0usize;
         let mut items: Vec<sparkles_owl::Axiom> = Vec::new();
         let mut charged = 0u64;
         let charge = Charge::new(&opts);
-        for (seen, &i) in groups.iter().enumerate() {
-            if seen % 4096 == 0 {
-                check(&opts)?;
+        // a taxonomy whose children are not in node order is read from a charged copy
+        let copied: Option<(Vec<usize>, u64)> = match about_node {
+            Some(n) if about_is_rep && !t.node(n).children.is_sorted() => {
+                let children = &t.node(n).children;
+                let bytes = (children.len() as u64 + 1).saturating_mul(8);
+                charged += charge.take(bytes)?;
+                let mut ids = Vec::with_capacity(children.len() + 1);
+                ids.push(n);
+                ids.extend(children.iter().copied());
+                ids.sort_unstable();
+                ids.dedup();
+                Some((ids, bytes))
             }
+            _ => None,
+        };
+        let mut work = 0usize;
+        // one group's axioms, polling the request's controls inside large groups
+        let mut visit = |i: usize| -> Result<()> {
+            poll(&opts, &mut work)?;
             let n = t.node(i);
             let own = about_node.is_none_or(|a| a == i);
             if eq && own && n.classes.len() > 1 {
                 if total >= query.offset && total < end {
-                    charged += charge.take(axiom_bytes(n.classes.iter()))?;
-                    items.push(sparkles_owl::Axiom::equivalent_classes(
-                        n.classes
-                            .iter()
-                            .map(|c| sparkles_owl::ClassExpression::Class(c.clone())),
-                    ));
+                    let mut bytes = 64u64;
+                    for c in &n.classes {
+                        poll(&opts, &mut work)?;
+                        bytes = bytes.saturating_add(class_bytes(c));
+                    }
+                    charged += charge.take(bytes)?;
+                    let mut members = Vec::with_capacity(n.classes.len());
+                    for c in &n.classes {
+                        poll(&opts, &mut work)?;
+                        members.push(sparkles_owl::ClassExpression::Class(c.clone()));
+                    }
+                    items.push(sparkles_owl::Axiom::equivalent_classes(members));
                 }
                 total += 1;
             }
             // node 1 is the bottom group, below every class, with no parents listed
             if !sub || i == 1 {
-                continue;
+                return Ok(());
             }
             let Some(rep) = n.classes.first() else {
-                continue;
+                return Ok(());
             };
             for &parent in &n.parents {
+                poll(&opts, &mut work)?;
                 let mentions = about_node.is_none()
                     || (about_is_rep
                         && (i == about_node.unwrap_or(usize::MAX) || Some(parent) == about_node));
@@ -999,11 +1017,54 @@ impl Ontologies {
                     continue;
                 };
                 if total >= query.offset && total < end {
-                    charged += charge.take(axiom_bytes([rep, q].into_iter()))?;
+                    charged += charge.take(64 + class_bytes(rep) + class_bytes(q))?;
                     items.push(sparkles_owl::Axiom::sub_class_of(rep.clone(), q.clone()));
                 }
                 total += 1;
             }
+            Ok(())
+        };
+        match about_node {
+            // an absent class is in no axiom
+            None if about.is_some() => {}
+            // every group, in the taxonomy's order, without copying the node list
+            None => {
+                for i in 0..t.nodes().len() {
+                    visit(i)?;
+                }
+            }
+            // the class's own group, and for a first class the groups of its direct
+            // children, which name it as their parent, merged in the taxonomy's order
+            Some(n) if about_is_rep => {
+                if let Some((ids, _)) = &copied {
+                    for &i in ids {
+                        visit(i)?;
+                    }
+                } else {
+                    let mut own = Some(n);
+                    let mut prev = None;
+                    let mut rest = t.node(n).children.iter().copied().peekable();
+                    loop {
+                        let next = match (own, rest.peek().copied()) {
+                            (Some(a), Some(b)) if b < a => rest.next(),
+                            (Some(_), _) => own.take(),
+                            (None, _) => rest.next(),
+                        };
+                        let Some(i) = next else { break };
+                        if prev != Some(i) {
+                            visit(i)?;
+                        }
+                        prev = Some(i);
+                    }
+                }
+            }
+            Some(n) => visit(n)?,
+        }
+        // the copy is gone once the page is built
+        if let Some((ids, bytes)) = copied {
+            drop(ids);
+            charge.give_back(bytes);
+            charged -= bytes;
         }
         answer.axioms = Some(items);
         answer.total = Some(total);
@@ -1294,9 +1355,39 @@ pub struct KeptAxioms {
     /// the page's bytes, charged to the memory pool's grant while the answer lives
     _charge: Option<super::dl_query::Charged>,
 }
-/// The estimated bytes of an axiom over `classes`, for the memory budget.
-fn axiom_bytes<'a>(classes: impl Iterator<Item = &'a sparkles_owl::Class>) -> u64 {
-    classes.map(|c| c.as_str().len() as u64 + 64).sum::<u64>() + 64
+/// The estimated bytes of one class of an axiom, for the memory budget.
+fn class_bytes(c: &sparkles_owl::Class) -> u64 {
+    c.as_str().len() as u64 + 64
+}
+
+/// How many steps of a kept axiom scan run between polls of the request's controls.
+const POLL_EVERY: usize = 1024;
+
+/// Count one step of a kept axiom scan and poll the request's controls every
+/// [`POLL_EVERY`] steps, so that a large group cannot outlast a cancellation.
+fn poll(opts: &QueryOptions, work: &mut usize) -> Result<()> {
+    #[cfg(test)]
+    SCAN_STEPS.with(|n| {
+        let steps = n.get() + 1;
+        n.set(steps);
+        if CANCEL_AT_STEP.with(|c| c.get()) == Some(steps)
+            && let Some(flag) = &opts.cancel
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    if (*work).is_multiple_of(POLL_EVERY) {
+        check(opts)?;
+    }
+    *work += 1;
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    /// the steps of kept axiom scans on this thread
+    static SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// the step at which a test's scan raises its cancellation flag
+    static CANCEL_AT_STEP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 /// The memory charge of a page of kept axioms: the request's own memory limit and the
 /// server pool's grant, asked before each row is built.
@@ -1325,18 +1416,24 @@ impl Charge {
                 requested: used,
             }));
         }
+        // the pool's own refusal says whether a retry can pass: more than the whole
+        // pool, or memory that other requests hold for now
         if let Some(g) = &self.grant
-            && g.charge(bytes).is_err()
+            && let Err(err) = g.charge(bytes)
         {
             self.release();
-            return Err(Error::BudgetExceeded(crate::Budget {
-                kind: crate::BudgetKind::ServerMemory,
-                limit: g.granted(),
-                requested: used,
-            }));
+            return Err(err);
         }
         self.used.set(used);
         Ok(bytes)
+    }
+    /// Give back `bytes` of what [`take`](Self::take) charged, once they are freed.
+    fn give_back(&self, bytes: u64) {
+        let bytes = bytes.min(self.used.get());
+        if let Some(g) = &self.grant {
+            g.release(bytes);
+        }
+        self.used.set(self.used.get() - bytes);
     }
     fn release(&self) {
         if let Some(g) = &self.grant {

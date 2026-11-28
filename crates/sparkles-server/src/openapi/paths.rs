@@ -814,7 +814,7 @@ fn ontology(p: &mut Paths) {
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/axioms", "getOntologyAxioms", "Ontology", "Ontology axioms"))
-            .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. `about` an IRI that the ontology neither declares nor uses is `404`.")
+            .doc("The axioms of the ontology with a type in `type` and mentioning `about`, one page at a time, in functional-style syntax and in their JSON form, or as one functional-style document with `format=ofn`. The assertions the store holds are listed with `assertions=true`. In an asserted listing, `about` an IRI that the ontology neither declares nor uses is `404`. A `classification=kept` listing instead answers `200` with `entity.present: false` and no axioms for a class the kept result does not hold. A kept listing is admitted to the server's query memory pool and counts the rows it builds against the request's memory limit and the pool. A page past the request's limit or the whole pool is `507`, and one that the busy pool cannot take is `503`.")
             .see("ontology")
             .param("at")
             .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
@@ -835,7 +835,7 @@ fn ontology(p: &mut Paths) {
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 404, 408]),
+            .errors(&[400, 404, 408, 503, 507]),
     );
     p.add(
         read(op(GET, "/$/ontology/{ds}/entities", "listOntologyEntities", "Ontology", "Ontology entities"))

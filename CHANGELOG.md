@@ -11,11 +11,15 @@ take `classification=kept`. The entity report gains a
 pages of the class's direct parents, children and equivalents. The axiom listing pages
 the `SubClassOf` and `EquivalentClasses` axioms that the kept taxonomy infers, in the order
 of a classification's `format=ofn`, walking the retained taxonomy and charging each page's
-rows to the memory budget. A miss classifies nothing and answers null pages, and the
-answers are `Cache-Control: no-store`.
+rows to the memory budget and the server's query memory pool, which admits the HTTP
+listing. A miss classifies nothing and answers null pages, and every answer of the routes
+to a request that names the selector, their own refusals included, is
+`Cache-Control: no-store`.
 
 `Ontologies::at_snapshot` and `FfiReadTxn::ontology_call` answer reads at a snapshot that a
-read transaction or a historical view holds. On the JVM, `keptClassification`, the new
+read transaction or a historical view holds. They refuse a snapshot of another dataset or
+branch, and a pinned classification of an older commit never replaces the head's kept
+result. On the JVM, `keptClassification`, the new
 `keptAxioms` and `keptEntity`, the frame projection and the materialized hierarchy,
 individual and term reads now answer a dataset returned by `at()` and an active read
 transaction at their own commit, where they threw `JenaTransactionException` before. They

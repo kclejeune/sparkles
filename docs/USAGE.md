@@ -6747,8 +6747,11 @@ equivalents. Both answer null pages on a miss rather than classifying.
 
 These reads, the frame projection and the materialized hierarchy, individual and term
 reads answer a dataset returned by `at()` and an active read transaction at their own
-commit, so a read transaction opened before a later commit keeps reading the result it
-began with. The live dataset outside a transaction reads the head or `OntologyRead.at`.
+commit, so a read transaction opened before a later commit keeps reading that commit. The
+pin fixes the commit and not the dataset's shared classification, which a classification
+of a later commit can replace, after which a kept read of the pinned commit reports
+`mismatch` or `unavailable`. A strict materialized read still needs a recorded
+materialization that matches its commit. The live dataset outside a transaction reads the head or `OntologyRead.at`.
 They throw `JenaTransactionException` in a write transaction before native work or
 flushing buffered writes, since they never read uncommitted changes. Other ontology
 methods keep their existing behavior.

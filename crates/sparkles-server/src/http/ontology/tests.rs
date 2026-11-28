@@ -4688,3 +4688,83 @@ async fn kept_entity_and_axioms_routes_read_the_kept_classification_without_clas
     .await;
     assert!(plain.json().get("classification").is_none());
 }
+
+#[tokio::test]
+async fn kept_route_refusals_are_never_cached_and_take_strict_selectors() {
+    let s = server();
+    let professor = enc("http://ex.org/Professor");
+    // a refusal before the read, a missing dataset included, is no-store too
+    for (uri, status) in [
+        (
+            "/$/ontology/missing/axioms?classification=kept".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            format!("/$/ontology/missing/entity?iri={professor}&classification=kept"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/$/ontology/t/axioms?classification=kept&offset=1".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/$/ontology/t/entity?iri={professor}&classification=kept&limit=1001"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/$/ontology/t/axioms?classification=bogus".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let r = get(&s.app, &uri).await;
+        assert_eq!(r.status, status, "{uri}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+    for query in [
+        "classification=kept&inferences=maybe",
+        "classification=kept&assertions=maybe",
+        "classification=kept&inferences=false&inferences=true",
+        "classification=kept&limit=1&limit=2",
+        "classification=kept&type=SubClassOf&type=EquivalentClasses",
+        "classification=kept&about=urn:a&about=urn:b",
+    ] {
+        let r = get(&s.app, &format!("/$/ontology/t/axioms?{query}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{query}");
+    }
+    for query in [
+        "classification=kept&inferences=maybe",
+        "classification=kept&assertions=maybe",
+        "classification=kept&assertions=false&assertions=true",
+        "classification=kept&limit=1&limit=2",
+    ] {
+        let r = get(
+            &s.app,
+            &format!("/$/ontology/t/entity?iri={professor}&{query}"),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{query}: {}", r.text());
+    }
+    // the selectors that are written once and as booleans are answered
+    let r = get(
+        &s.app,
+        "/$/ontology/t/axioms?classification=kept&inferences=false&assertions=false",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // an asserted read keeps its own path and caching
+    let r = get(&s.app, "/$/ontology/missing/axioms").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(
+        r.headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
+    let r = get(&s.app, "/$/ontology/t/axioms?assertions=true&limit=1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        r.headers
+            .get(header::CACHE_CONTROL)
+            .is_none_or(|v| v.as_bytes() != b"no-store")
+    );
+}

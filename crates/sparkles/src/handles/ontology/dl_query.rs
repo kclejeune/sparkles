@@ -579,7 +579,8 @@ impl Ontologies {
             ))
         };
         if q.answers.classes() {
-            let keep = opts.graphs.is_none() && o.snapshot.cacheable;
+            let keep =
+                opts.graphs.is_none() && o.snapshot.cacheable && self.may_replace_kept(&o.snapshot);
             let (consistent, d, excluded) = if keep {
                 answer.incremental = true;
                 // the kept saturation reads the defining axiom beside the ontology's, and
