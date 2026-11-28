@@ -484,6 +484,56 @@ def cases(n: int, inconsistent: bool) -> str:
     return "\n".join(out)
 
 
+def check_deadline_answer(r: dict, full: dict, want: str) -> str | None:
+    """Check the answer `r` of a classification under a deadline against the full run
+    `full`, whose consistency is `want`, and return the consistency of a partial answer.
+
+    A deadline that stops the modules' pass after the saturation answers in full for the
+    axioms the run took, with every class open and the consistency unknown. Such an
+    answer is not partial and not complete, and `stats.coverageStopped` marks it."""
+    assert r["classes"] == full["classes"]
+    assert r["incompleteCount"] == len(r["incomplete"])
+    if not r["partial"]:
+        if r["stats"]["coverageStopped"]:
+            assert not r["complete"], "a stopped modules' pass is presented as complete"
+            assert r["consistency"] == "unknown"
+            assert len(r["incomplete"]) + 2 >= r["classes"]
+            return None
+        assert r["complete"] and r["consistency"] == want
+        return None
+    assert not r["complete"], "a partial answer is presented as complete"
+    assert r["consistency"] in (want, "unknown")
+    if r["consistency"] == "unknown":
+        assert len(r["incomplete"]) + 2 >= r["classes"]
+    return r["consistency"]
+
+
+def test_a_stopped_modules_pass_is_answered_but_not_partial() -> None:
+    """The answer of a deadline that falls in the modules' pass, after the saturation,
+    which the deadline ladder of `partial_answers` reaches by timing alone."""
+    body = f"{PREFIXES} INSERT DATA {{ {cases(20, True)} }}"
+    d = sparkles.Dataset()
+    d.update(body)
+    full = d.ontology.classify(partial=True, threads=1, limit=10000)
+    assert full["complete"] and not full["partial"] and not full["stats"]["coverageStopped"]
+    assert check_deadline_answer(full, full, "inconsistent") is None
+    # every class but owl:Thing and owl:Nothing is open
+    names = [f"{EX}open{i}" for i in range(full["classes"] - 2)]
+    stopped = {
+        **full,
+        "complete": False,
+        "consistency": "unknown",
+        "incomplete": names,
+        "incompleteCount": len(names),
+        "stats": {**full["stats"], "coverageStopped": True},
+    }
+    assert check_deadline_answer(stopped, full, "inconsistent") is None
+    with pytest.raises(AssertionError, match="presented as complete"):
+        check_deadline_answer({**stopped, "complete": True}, full, "inconsistent")
+    with pytest.raises(AssertionError):
+        check_deadline_answer({**stopped, "consistency": "inconsistent"}, full, "inconsistent")
+
+
 def partial_answers(inconsistent: bool) -> list[str]:
     """Classify the cases under deadlines that find the saturation, check every answer and
     return the consistencies of the partial ones.
@@ -519,16 +569,9 @@ def partial_answers(inconsistent: bool) -> list[str]:
         except sparkles.QueryTimeoutError:
             return False
         answered += 1
-        assert r["classes"] == full["classes"]
-        if not r["partial"]:
-            assert r["complete"] and r["consistency"] == want
-            return True
-        assert not r["complete"], "a partial answer is presented as complete"
-        assert r["incompleteCount"] == len(r["incomplete"])
-        assert r["consistency"] in (want, "unknown")
-        if r["consistency"] == "unknown":
-            assert len(r["incomplete"]) + 2 >= r["classes"]
-        seen.append(r["consistency"])
+        c = check_deadline_answer(r, full, want)
+        if c is not None:
+            seen.append(c)
         return True
 
     def after(ms: int) -> int:
