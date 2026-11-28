@@ -7048,12 +7048,16 @@ impl Store {
         // a store opened to write without its required guard bypasses it on every write
         let unguarded = g.is_none() && self.guard_required() && self.opts.unvalidated_writes;
         if opts.bypass_validation || unguarded {
-            let mut summary = ValidationSummary::empty(
-                GuardStatus::Bypassed,
-                GuardMode::Off,
-                Severity::Violation,
+            let summary = g.as_ref().map_or_else(
+                || {
+                    ValidationSummary::empty(
+                        GuardStatus::Bypassed,
+                        GuardMode::Off,
+                        Severity::Violation,
+                    )
+                },
+                |guard| guard.bypass_summary(),
             );
-            summary.language = language;
             // a dry run bypasses nothing: the guard, the metrics and the log see no write
             if opts.dry_run.is_some() {
                 return Ok(Some(Arc::new(summary)));
@@ -9938,9 +9942,11 @@ pub fn named(iri: &str) -> NamedNode {
 fn guard_required_by(root: &Path) -> bool {
     match std::fs::read(root.join(crate::guard::config::CONFIG_FILE)) {
         Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)
-            .map(|j| j.get("mode").and_then(|m| m.as_str()) != Some("off"))
+            .map(|j| {
+                j.get("guards").is_some() || j.get("mode").and_then(|m| m.as_str()) != Some("off")
+            })
             .unwrap_or(true),
-        Err(_) => false,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
 

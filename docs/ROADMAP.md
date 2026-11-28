@@ -226,7 +226,7 @@ once Waves A, B and C clear their prerequisites.
   item 14 and pin rebasing,
   per-quad periods, graph feeds and settings history in item 52. Remote and archive
   cloning and relink ship in item 45, GraphQL Phase 2 in item 37, Fuseki and ARQ
-  compatibility leftovers in items 38, 39, 51 and 76, combined ShEx guards in item 54,
+  compatibility leftovers in items 38, 39, 51 and 76,
   shape-driven form gaps in items 612 to 615, and degraded-index startup in item 402.
 
 ### Wave E: competitive benchmarks and scale optimization
@@ -488,7 +488,6 @@ and deferrals. Any accepted slowdown keeps its named follow-up under the enginee
 | [F21](specs/F21-ontology-api.md#outcome) | 539, 559, 565, 578 | Enforce the read budget, measure the A7 targets, fetch imports through the outbound policy, and read inferences and entity reports over MCP and the CLI. |
 | [F19](specs/F19-mappings-and-virtual-graphs/SPEC.md#outcome) | 43, 230, 233, 234, 236, 237, 238, 239, 404, 450 | Finish the named source, UI/task, conformance, function and term-identity gaps before claiming Phase 1 complete. Phase 2 virtual graphs must match materialized SPARQL answers with pushdown, access, cancellation and source-failure behavior tested. |
 | [G01](specs/G01-geosparql/SPEC.md#outcome) | 24 | Complete per-row nearest-neighbour joins, QLever's spatial syntax, metric-property rewrites, polygon approximations, datum shifts and curved GML segments as item 24 lists them. Keep intentional default divergences explicit, since item 70's Jena-compatible mode is not adopted. |
-| [G02](specs/G02-shex/SPEC.md#outcome) | 54 | Complete combined guards, graph-plus-file schemas and CLI outbound controls with the adopted ShEx conformance and incremental/full equivalence tests. Unsupported reference syntax remains a stated language boundary rather than a claim of universal ShEx parity. |
 | [P01](specs/P01-python-bindings.md#outcome) | 32, 33, 40, 58 | Complete release/platform and further async administration and bulk coverage, reusable plans and the remaining bounded per-call and footprint assessment. Validate package installation and the Python API suite on the claimed runtimes while preserving cancellation, term identity and snapshots. |
 | [P03](specs/P03-query-extensions.md#outcome) | 25 | Complete dynamic registered dispatch, foreign callbacks, batching and the adopted aggregate arities. Verify captured-view access, duplicate invocation, error, cancellation and transaction behavior, and measure callback costs. |
 | [P04](specs/P04-jvm-bindings/SPEC.md#outcome) | 25, 32, 33, 58, 76, 405 | Complete the named callback, plan, integration-harness, metrics and release gaps with the accepted Jena contract tests. Keep fallback BGP batching and optional module/allocator/transaction choices explicit, and substantiate performance claims with matched bridge measurements. |
@@ -866,6 +865,7 @@ numbered item when it is ready to start.
 | 44 | **A local-first engine** in WebAssembly that syncs through RDF Patch and branches. | [F20](specs/F20-local-first-engine.md) | XL |
 | 72 | **JSON query languages,** and a Datalog surface syntax for rules and queries. | [C24](specs/C24-json-query-languages.md), [F17](specs/F17-query-time-reasoning.md) | M–L |
 | 78 | **Incremental write-time validation** of recursive SHACL shapes and of SHACL-SPARQL constraints not anchored at the focus node. | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 1350 | **Combined write-time validation editor.** The dataset panel displays both guards and edits standalone settings. Let administrators configure both guards in the panel with independent modes, baseline policies and sources. | [G02](specs/G02-shex/OUTCOME.md#guards-schema-sources-and-cli-controls) | S |
 | 82 | **Cheaper vector catch-up and measured half-precision recall.** Catch-up should scan only new rows, binary16 recall needs measuring on Euclidean and offset dot-product data, and a measurement should pick the worker pool. A test should cancel a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 250 | **Chinese segmentation after SmartChineseAnalyzer,** and Kuromoji's normal and extended modes and user dictionaries for `ja-dict` and `ko-dict`. `zh-dict` segments by jieba's frequencies today. `ja-dict` and `ko-dict` should also cut a run of unknown characters inside a surrogate pair where Lucene does, which they do before the pair. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 251 | **Analyzers for the other languages of jena-text,** such as Greek, Arabic, Persian and Hindi, that reproduce Lucene's tokens as the analyzers for nine languages do. | [F03](specs/F03-full-text-search/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
@@ -1211,7 +1211,6 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 51 | **ARQ.** Parallel LATERAL, user DESCRIBE handlers, and the remaining client options and builder methods. Sparkles does not evaluate `shortest(…)`, and ARQ does not either. | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
 | 52 | **History.** Pin rebasing, periods per quad, change feeds per graph, reconstruction of expired states, and history of settings. Restore the derived text index of a named snapshot from backup. Let indexed snapshot builds run while RDF commits continue. | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
 | 53 | **Inference settings.** Input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy. | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 54 | **ShEx.** Combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls. | [G02](specs/G02-shex/OUTCOME.md#roadmap-follow-ups-2026-10-12) | M |
 | 55 | **Completions and OpenAPI.** Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas. This follow-up is outside the completion of formatting, linting and command-line tools. | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | **Legacy MCP resource subscriptions.** | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 74 | **RDF Patch.** Patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs. | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
@@ -1301,6 +1300,7 @@ for them.
 
 ## Completed
 
+- **54.** A dataset can enforce SHACL and ShEx together and return ordered reports for both checks. ShEx schemas can combine ShExR named graphs with a copied file. The ShEx validation and guard-setting commands accept the outbound policy flags. [G02](specs/G02-shex/OUTCOME.md#guards-schema-sources-and-cli-controls)
 - **560.** The shared dataset quota excludes the unused write-ahead log and delta vocabulary space of each branch independently. [X09](specs/X09-group-commit-by-default.md#phase-4)
 - **561.** The shared dataset quota excludes unused space in each open change-log segment. It counts the records and the indexes of sealed segments. [X09](specs/X09-group-commit-by-default.md#phase-4)
 

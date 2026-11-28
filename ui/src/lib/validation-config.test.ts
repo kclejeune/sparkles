@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { WriteValidation } from './api';
+import type { SingleWriteValidation } from './api';
 import { guardConfig, guardForm } from './validation-config';
 const validation = (
   language: 'shacl' | 'shex',
-  config: WriteValidation['config'],
-): WriteValidation => ({ language, config, status: {} as WriteValidation['status'] });
+  config: SingleWriteValidation['config'],
+): SingleWriteValidation => ({ language, config, status: {} as SingleWriteValidation['status'] });
 
 describe('editable guard configuration', () => {
   it('keeps every mode, so re-saving an off guard leaves it off', () => {
@@ -66,6 +66,14 @@ describe('editable guard configuration', () => {
       graphs: ['urn:shape:a', 'urn:shape:b'],
     });
     expect(guardConfig(f, v).threshold).toBe('warning');
+  });
+  it('keeps a ShEx file source together with its schema graphs', () => {
+    const v = validation('shex', {
+      mode: 'warn',
+      schema: { inline: '<urn:S> @<urn:G>', format: 'shexc', graphs: ['urn:schemas'] },
+      shapeMap: '<urn:n>@<urn:S>',
+    });
+    expect(guardConfig(guardForm(v), v).schema).toEqual(v.config.schema);
   });
   it('rejects invalid budgets and missing or stale language sources before dispatch', () => {
     const f = { ...guardForm(null), text: '<urn:S> a <http://www.w3.org/ns/shacl#NodeShape> .' };

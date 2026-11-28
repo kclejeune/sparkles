@@ -91,24 +91,7 @@ impl Dataset {
             });
             let guard = source
                 .write_guard()
-                .map(|guard| -> Result<_> {
-                    match guard {
-                        #[cfg(feature = "shacl")]
-                        crate::write_guard::WriteGuard::Shacl(g) => {
-                            Ok(crate::write_guard::WriteGuard::Shacl(
-                                g.fork_for_store(ds.store())
-                                    .map_err(crate::catalog::component)?,
-                            ))
-                        }
-                        #[cfg(feature = "shex")]
-                        crate::write_guard::WriteGuard::Shex(g) => {
-                            Ok(crate::write_guard::WriteGuard::Shex(
-                                g.fork_for_store(ds.store())
-                                    .map_err(crate::catalog::component)?,
-                            ))
-                        }
-                    }
-                })
+                .map(|guard| guard.fork_for_store(ds.store()))
                 .transpose()?;
             ds.set_write_guard(guard);
         }

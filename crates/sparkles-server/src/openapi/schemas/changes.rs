@@ -149,7 +149,7 @@ fn previews(put: &mut dyn FnMut(&str, J)) {
                     "results",
                 ],
                 json!({
-                    "language": string_enum(&["shacl", "shex"]),
+                    "language": string_enum(&["shacl", "shex", "combined"]),
                     "status": string_enum(&["passed", "warned", "rejected", "skipped", "bypassed"]),
                     "mode": string_enum(&["reject", "warn", "off"]),
                     "strategy": string_enum(&["full", "incremental", "none"]),
@@ -166,6 +166,7 @@ fn previews(put: &mut dyn FnMut(&str, J)) {
                         "items": any_object("A SHACL result, or a ShEx result-map entry."),
                         "description": "The first `limit` results, blocking first.",
                     },
+                    "guards": array(sref("ValidationSummary")),
                     "shapesError": string(),
                     "introduced": { "type": "integer", "description": "Grandfather mode: the blocking results the write introduced." },
                     "focusNodes": { "type": "integer", "description": "The focus nodes an incremental validation validated." },

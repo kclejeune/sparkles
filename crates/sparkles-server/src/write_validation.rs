@@ -93,28 +93,19 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
                     }
                     j
                 }
+                #[cfg(all(feature = "shacl", feature = "shex"))]
+                Validation::Combined(_) => v.json()["config"].take(),
             };
             (j, None)
         }
     };
-    // `source` paths of a configuration file
-    for key in ["shapes", "schema"] {
-        let Some(src) = j.get_mut(key) else { continue };
-        if src.is_object()
-            && src.get("inline").is_none()
-            && src.get("file").is_none()
-            && let (Some(s), Some(dir)) = (src.get("source").and_then(J::as_str), &dir)
-        {
-            let file = dir.join(s);
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("reading {}", file.display()))?;
-            if key == "schema" && src.get("base").is_none() {
-                src["base"] = json!(sparkles_shex_base(&file));
-            }
-            src["source"] = json!(file.display().to_string());
-            src["inline"] = json!(text);
+    // Resolve administrative source paths relative to the configuration file.
+    if let Some(entries) = j.get_mut("guards").and_then(J::as_array_mut) {
+        for entry in entries {
+            resolve_sources(entry, dir.as_deref())?;
         }
     }
+    resolve_sources(&mut j, dir.as_deref())?;
     // a stored SHACL configuration keeps its inline shapes in the guard
     #[cfg(feature = "shacl")]
     if path.is_none()
@@ -123,10 +114,12 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
     {
         j["shapes"]["inline"] = json!(t);
     }
-    let language: GuardLanguage = match j.get("language") {
-        None | Some(J::Null) => GuardLanguage::Shacl,
-        Some(l) => serde_json::from_value(l.clone())
+    let language: GuardLanguage = match (j.get("language"), j.get("guards")) {
+        (None, Some(_)) => GuardLanguage::Combined,
+        (None | Some(J::Null), None) => GuardLanguage::Shacl,
+        (Some(l), None) => serde_json::from_value(l.clone())
             .with_context(|| format!("unknown language {l} (\"shacl\" or \"shex\")"))?,
+        _ => bail!("--validate: use guards without a top-level language"),
     };
     use sparkles::handles::GuardOutcome;
     let guard = ds.dataset.validation().guard();
@@ -155,6 +148,18 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
             };
             guard.set_shex(cfg, &resolver)?
         }
+        #[cfg(all(feature = "shacl", feature = "shex"))]
+        GuardLanguage::Combined => {
+            let configs = sparkles::write_guard::parse_configs(j)?;
+            let budget = sparkles::outbound::RequestBudget::new(&st.outbound);
+            let resolver = sparkles_shex::FileResolver {
+                dirs: dir.into_iter().collect(),
+                outbound: Some((st.outbound.clone(), budget)),
+                limits: st.shex_import_limits,
+                ..Default::default()
+            };
+            guard.set_guards(configs, &resolver)?
+        }
         #[allow(unreachable_patterns)]
         l => bail!("--validate: built without the `{}` feature", l.name()),
     };
@@ -172,6 +177,9 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
                 s.millis
             )
         }
+        GuardOutcome::Retained => {
+            format!("write-time validation on /{name} kept its existing guard")
+        }
         GuardOutcome::NotConforming(s) if path.is_some() => bail!(
             "--validate {spec}: /{name} does not pass ({}); fix the data or use mode \"warn\" first",
             counts(&s)
@@ -183,6 +191,54 @@ pub fn validate_at_startup(st: &crate::state::AppState, spec: &str) -> Result<St
         ),
         _ => format!("write-time validation on /{name} is off"),
     })
+}
+
+/// Read a local shapes file without allocating more than the source limit requires.
+#[cfg(any(feature = "shacl", feature = "shex"))]
+pub(crate) fn read_shapes_file(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 16 << 20;
+    let mut bytes = Vec::new();
+    let mut file = std::fs::File::open(path)?.take(MAX_BYTES);
+    file.read_to_end(&mut bytes)?;
+    let mut extra = [0];
+    anyhow::ensure!(
+        file.into_inner().read(&mut extra)? == 0,
+        "SHACL shapes exceed 16 MiB"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+
+/// Read local sources for a startup validation configuration.
+#[cfg(any(feature = "shacl", feature = "shex"))]
+fn resolve_sources(entry: &mut J, dir: Option<&std::path::Path>) -> Result<()> {
+    use anyhow::Context;
+    for key in ["shapes", "schema"] {
+        let Some(src) = entry.get_mut(key) else {
+            continue;
+        };
+        if src.is_object()
+            && src.get("inline").is_none()
+            && src.get("file").is_none()
+            && let (Some(s), Some(dir)) = (src.get("source").and_then(J::as_str), dir)
+        {
+            let file = dir.join(s);
+            let read = || -> Result<String> {
+                #[cfg(feature = "shex")]
+                if key == "schema" {
+                    return sparkles_shex::guard::read_schema_file(&file);
+                }
+                read_shapes_file(&file)
+            };
+            let text = read().with_context(|| format!("reading {}", file.display()))?;
+            if key == "schema" && src.get("base").is_none() {
+                src["base"] = json!(sparkles_shex_base(&file));
+            }
+            src["source"] = json!(file.display().to_string());
+            src["inline"] = json!(text);
+        }
+    }
+    Ok(())
 }
 
 /// The base IRI of a schema file (its `file:` URL).
@@ -208,6 +264,21 @@ mod tests {
         let store = Store::open(dir.path(), Default::default()).unwrap();
         assert!(install(&store).unwrap().is_none());
         assert!(!store.guard_required());
+    }
+
+    #[cfg(feature = "shacl")]
+    #[test]
+    fn startup_validation_bounds_shapes_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.ttl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len((16 << 20) + 1)
+            .unwrap();
+        let mut entry = json!({"shapes": {"source": "oversized.ttl"}});
+        let err = resolve_sources(&mut entry, Some(dir.path())).unwrap_err();
+        assert!(format!("{err:#}").contains("SHACL shapes exceed 16 MiB"));
+        assert!(entry["shapes"].get("inline").is_none());
     }
 
     /// A database with a ShEx configuration (and its schema copy).

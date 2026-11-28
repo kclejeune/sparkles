@@ -317,3 +317,22 @@ fn empty_and_alias_declarations() {
         "{text}"
     );
 }
+
+#[test]
+fn rdf_graph_expression_depth_is_bounded() {
+    use std::fmt::Write as _;
+    let mut ttl = String::from(
+        "@prefix sx: <http://www.w3.org/ns/shex#> .\n[] a sx:Schema; sx:start _:n0 .\n",
+    );
+    for i in 0..129 {
+        let child = i + 1;
+        writeln!(ttl, "_:n{i} a sx:ShapeNot; sx:shapeExpr _:n{child} .").unwrap();
+    }
+    ttl.push_str("_:n129 a sx:Shape .");
+    let error = from_text(&ttl, RdfFormat::Turtle, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("schema expression nesting exceeds 128")
+    );
+}

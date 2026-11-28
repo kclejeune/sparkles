@@ -352,6 +352,7 @@ pub fn rejection_text(e: &sparkles::Error) -> Option<String> {
     let (lang, what) = match s.language {
         sparkles::guard::GuardLanguage::Shacl => ("SHACL", "blocking result"),
         sparkles::guard::GuardLanguage::Shex => ("ShEx", "nonconformant association"),
+        sparkles::guard::GuardLanguage::Combined => ("SHACL and ShEx", "blocking result"),
     };
     Some(match &s.shapes_error {
         Some(err) => {

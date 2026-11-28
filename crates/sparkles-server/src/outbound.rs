@@ -16,9 +16,9 @@ use std::time::Duration;
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct OutboundArgs {
-    /// Let SERVICE and LOAD reach loopback, private (RFC 1918), shared (100.64.0.0/10)
-    /// and unique-local (fc00::/7) addresses (the default of the local query and
-    /// update); link-local ones (169.254.169.254) need --outbound-allow
+    /// Let outbound HTTP reach loopback, private (RFC 1918), shared (100.64.0.0/10)
+    /// and unique-local (fc00::/7) addresses (the local command default).
+    /// Link-local addresses (169.254.169.254) need --outbound-allow.
     #[arg(long, conflicts_with = "outbound_block_private")]
     pub outbound_allow_private: bool,
     /// Refuse loopback, private, shared and unique-local destinations (the default of
@@ -30,18 +30,17 @@ pub struct OutboundArgs {
     /// link-local ones included)
     #[arg(long, value_name = "HOST_OR_CIDR")]
     pub outbound_allow: Vec<String>,
-    /// Total time of one SERVICE or LOAD request, in seconds
+    /// Total time of one outbound HTTP request, in seconds
     #[arg(long, value_name = "SECS", default_value_t = sparkles::outbound::DEFAULT_TIMEOUT.as_secs_f64())]
     pub outbound_timeout: f64,
-    /// Largest SERVICE or LOAD response, in MiB (decompressed)
+    /// Largest outbound HTTP response, in MiB (decompressed)
     #[arg(long, value_name = "N", default_value_t = sparkles::outbound::DEFAULT_MAX_RESPONSE_BYTES >> 20)]
     pub outbound_max_mb: u64,
-    /// Bytes all the SERVICE calls and LOADs of one query or update may receive, in MiB
+    /// Total MiB all outbound calls for an operation may receive
     /// [default: 4 × --outbound-max-mb]
     #[arg(long, value_name = "N")]
     pub outbound_request_max_mb: Option<u64>,
-    /// Time all the SERVICE calls and LOADs of one query or update may take, summed, in
-    /// seconds [default: 4 × --outbound-timeout]
+    /// Total seconds all outbound calls for an operation may take [default: 4 × --outbound-timeout]
     #[arg(long, value_name = "SECS")]
     pub outbound_request_timeout: Option<f64>,
     /// Inputs per request of `SERVICE <loop:bulk:…>` (Jena's serviceBulkBindingCount)
@@ -64,7 +63,7 @@ impl OutboundArgs {
         self.policy_with(!sparkles::outbound::BLOCK_PRIVATE_BY_DEFAULT)
     }
 
-    /// The policy of the local `query` and `update`: private destinations are allowed
+    /// The policy of local commands: private destinations are allowed
     /// unless `--outbound-block-private`.
     pub fn local_policy(&self) -> Result<OutboundPolicy> {
         self.policy_with(true)
@@ -103,7 +102,10 @@ impl OutboundArgs {
         if self.service_parallel_max == 0 {
             bail!("--service-parallel-max must be at least 1");
         }
-        let timeout = Duration::from_secs_f64(self.outbound_timeout);
+        let timeout = Duration::try_from_secs_f64(self.outbound_timeout)
+            .context("--outbound-timeout exceeds the supported range")?;
+        let request_timeout = Duration::try_from_secs_f64(request_timeout)
+            .context("--outbound-request-timeout exceeds the supported range")?;
         Ok(OutboundPolicy {
             allow_private: (allow_private || self.outbound_allow_private)
                 && !self.outbound_block_private,
@@ -112,7 +114,7 @@ impl OutboundArgs {
             connect_timeout: timeout.min(sparkles::outbound::DEFAULT_CONNECT_TIMEOUT),
             max_response_bytes: self.outbound_max_mb.saturating_mul(1 << 20),
             max_request_bytes: request_mb.saturating_mul(1 << 20),
-            request_timeout: Duration::from_secs_f64(request_timeout),
+            request_timeout,
             service_bulk_size: self.service_bulk_size.min(self.service_bulk_max),
             service_bulk_max: self.service_bulk_max,
             service_parallel_max: self.service_parallel_max,

@@ -1,4 +1,4 @@
-import type { ValidationConfig, ValidationSource, WriteValidation } from './api';
+import type { ValidationConfig, ValidationSource, SingleWriteValidation } from './api';
 
 export type GuardForm = {
   language: 'shacl' | 'shex';
@@ -19,7 +19,7 @@ export type GuardForm = {
 };
 const lines = (s: string) => s.split(/\s+/).filter(Boolean);
 
-export function guardForm(v: WriteValidation | null): GuardForm {
+export function guardForm(v: SingleWriteValidation | null): GuardForm {
   const c = v?.config;
   const src = v?.language === 'shex' ? c?.schema : c?.shapes;
   return {
@@ -58,7 +58,10 @@ export function guardForm(v: WriteValidation | null): GuardForm {
 }
 
 /** Preserve source metadata when reusing it, and replace it when changing sources. */
-export function guardConfig(f: GuardForm, previous: WriteValidation | null): ValidationConfig {
+export function guardConfig(
+  f: GuardForm,
+  previous: SingleWriteValidation | null,
+): ValidationConfig {
   if (!Number.isFinite(f.timeoutSeconds) || f.timeoutSeconds <= 0)
     throw new Error('Timeout must be positive.');
   if (!Number.isInteger(f.reportLimit) || f.reportLimit < 1 || f.reportLimit > 10000)
@@ -84,9 +87,8 @@ export function guardConfig(f: GuardForm, previous: WriteValidation | null): Val
     ) {
       source.prefixes = previous.config.schema.prefixes;
     }
-    // SHACL can combine inline shapes with named shape graphs.
-    if (f.language === 'shacl' && lines(f.sourceGraphs).length)
-      source.graphs = lines(f.sourceGraphs);
+    const graphs = lines(f.sourceGraphs);
+    if (graphs.length) source.graphs = graphs;
   }
   const config: ValidationConfig = {
     language: f.language,

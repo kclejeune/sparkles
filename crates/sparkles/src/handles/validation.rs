@@ -49,6 +49,8 @@ pub enum GuardOutcome {
     Installed(ValidationSummary),
     /// mode `reject` was refused: the current state does not pass
     NotConforming(ValidationSummary),
+    /// An unchanged guard was retained when the other guard was removed.
+    Retained,
     /// validation is off (mode `off`)
     Removed,
 }
@@ -70,6 +72,7 @@ impl GuardSetting {
     #[cfg(feature = "shacl")]
     pub fn set_shacl(&self, cfg: sparkles_shacl::guard::ValidationConfig) -> Result<GuardOutcome> {
         use sparkles_shacl::guard::{SetOutcome, set_config};
+        let _update = self.ds.state().validation_update.lock();
         Ok(
             match set_config(self.ds.store(), Some(cfg)).map_err(super::from_anyhow)? {
                 SetOutcome::Installed(g, s) => {
@@ -94,6 +97,7 @@ impl GuardSetting {
         resolver: &dyn sparkles_shex::Resolver,
     ) -> Result<GuardOutcome> {
         use sparkles_shex::guard::{SetOutcome, set_config};
+        let _update = self.ds.state().validation_update.lock();
         Ok(
             match set_config(self.ds.store(), Some(cfg), resolver).map_err(super::from_anyhow)? {
                 SetOutcome::Installed(g, s) => {
@@ -109,9 +113,35 @@ impl GuardSetting {
         )
     }
 
+    /// Install one SHACL and one ShEx guard in the given order. Both evaluate the
+    /// same head before their configuration replaces the installed guard.
+    #[cfg(all(feature = "shacl", feature = "shex"))]
+    pub fn set_guards(
+        &self,
+        mut configs: Vec<crate::write_guard::GuardConfig>,
+        resolver: &dyn sparkles_shex::Resolver,
+    ) -> Result<GuardOutcome> {
+        use crate::write_guard::GuardConfig;
+        let update = self.ds.state().validation_update.lock();
+        if configs.len() == 1 {
+            let config = configs.pop().expect("one guard config");
+            if let Some(outcome) = crate::write_guard::combined::retain(&self.ds, &config)? {
+                return Ok(outcome);
+            }
+            drop(update);
+            return match config {
+                GuardConfig::Shacl(cfg) => self.set_shacl(cfg),
+                GuardConfig::Shex(cfg) => self.set_shex(cfg, resolver),
+            };
+        }
+        crate::write_guard::combined::set(&self.ds, configs, resolver)
+    }
+
     /// Remove the configuration and the guard. Either language's removal takes every
     /// validation file away.
     pub fn reset(&self) -> Result<()> {
+        #[cfg(any(feature = "shacl", feature = "shex"))]
+        let _update = self.ds.state().validation_update.lock();
         #[cfg(feature = "shacl")]
         sparkles_shacl::guard::set_config(self.ds.store(), None).map_err(super::from_anyhow)?;
         #[cfg(all(feature = "shex", not(feature = "shacl")))]

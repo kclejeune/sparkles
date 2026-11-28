@@ -13,7 +13,7 @@
     oncancel,
   }: {
     target: string;
-    current: api.WriteValidation | null;
+    current: api.SingleWriteValidation | null;
     prefixes: PrefixMap;
     onsaved: (target: string) => void;
     oncancel: () => void;
@@ -137,7 +137,7 @@
       <textarea class="input mono" rows="8" required bind:value={form.text}></textarea></label
     >
   {/if}
-  {#if form.source === 'graphs' || (form.source === 'inline' && form.language === 'shacl')}
+  {#if form.source === 'graphs' || form.source === 'inline'}
     <label
       >{form.language === 'shacl' ? 'Shape' : 'Schema'} graph IRIs (one per line)
       <textarea class="input mono" rows="3" bind:value={form.sourceGraphs}></textarea></label

@@ -273,6 +273,7 @@ describe('savePlan', () => {
   const warn = { language: 'shacl' as const, mode: 'warn' as const };
   it('waits for a passing check under a rejecting guard', () => {
     expect(savePlan(reject, 0, null)).toBe('check');
+    expect(savePlan({ language: 'combined', mode: 'reject' }, 0, null)).toBe('check');
     expect(savePlan(reject, 0, { conforms: false, rejected: true, current: false })).toBe('check');
     expect(savePlan(reject, 0, { conforms: false, rejected: true, current: true })).toBe('blocked');
     expect(savePlan(reject, 0, { conforms: true, rejected: false, current: true })).toBe('save');

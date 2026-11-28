@@ -9825,10 +9825,11 @@ since only a materialization fetches imports and records them.
 
 The design and its rationale are in [C10 Write-time SHACL validation](specs/C10-write-time-validation.md). The ShEx guard is described in [G02 ShEx](specs/G02-shex/README.md).
 
-A dataset can validate every write against SHACL shapes or a ShEx schema before it
-commits. It uses one language at a time. The configuration lives in the database
-directory as `validation.json`. SHACL writes format 2 and also reads format 1 without
-`language`. ShEx writes format 3 and also reads format 2:
+A dataset can validate every write against SHACL shapes, a ShEx schema, or both
+before it commits. The configuration lives in `validation.json` in the database
+directory. Standalone SHACL writes format 2 and reads format 1 without `language`.
+Standalone ShEx reads formats 2 and 3. A combined guard or a ShEx schema that uses
+both a graph and a file requires format 4.
 
 ```json
 { "format": 2, "language": "shacl", "mode": "reject", "shapes": { "graphs": ["urn:x-shapes:main"] },
@@ -9862,8 +9863,16 @@ directory as `validation.json`. SHACL writes format 2 and also reads format 1 wi
 | `threshold` | — | Not accepted. Every nonconformant association blocks. |
 | `baseline` | `strict`, `grandfather` | As for SHACL. In grandfather mode a write is blocked only by the nonconformant associations it introduces. When a write changes a schema graph, the state before it is judged under the old schema, so its associations are compared with those the old schema gave. |
 
+A ShEx schema can give `graphs` alongside `inline` on a PUT or `file` when reusing
+a stored copy. The combined schema allows cross-references in either direction.
+Duplicate shape or triple-expression labels and two definitions of `START` are errors.
+A copied file is closed over its imports at setup. The graph portion is read from the
+candidate state and cannot contain imports. The file source and its closed copy are
+limited to 16 MiB each. The named graphs can supply up to 100,000 triples and 16 MiB of
+decoded term data.
+
 A copied schema's `copySha256` is checked before the guard is installed or a stored
-source is reused in a settings change. A mismatch or a missing digest in format 3 is an
+source is reused in a settings change. A mismatch or a missing digest in format 3 or 4 is an
 error and leaves writes requiring a guard refused. Restore the configured copy or set
 the schema again to replace it. A settings change that reuses the copy checks it against
 the stored `validation.json`. The `format` and `copySha256` a `PUT` sends do not change
@@ -9895,15 +9904,50 @@ import bodies or externs, so an EXTERNAL shape is a `400`. Labels the schema doe
 define, START without a start shape, and SPARQL node selectors are `400` too. Node
 selectors are refused because every validated write would run them.
 
+### Combined guard configuration
+
+Send the two guard configurations in evaluation order. Each entry has its own
+`language`, `mode`, graph selection, report limit and baseline policy.
+
+```json
+{
+  "format": 4,
+  "guards": [
+    { "language": "shacl", "mode": "reject", "shapes": { "graphs": ["urn:shapes:main"] } },
+    { "language": "shex", "mode": "warn", "schema": { "graphs": ["urn:schemas:main"] },
+      "shapeMap": "{FOCUS a <urn:Person>}@<urn:PersonShape>" }
+  ]
+}
+```
+
+Both guards evaluate the same candidate state on a write or merge. If either rejects,
+the candidate is not published. A failed evaluation such as a timeout also aborts the
+write. The server returns a combined write summary with `language: "combined"` and a
+`guards` array containing each language's regular summary in order. The
+`Sparkles-Validation` header describes the combined decision and includes
+`lang=combined`, `shacl-status` and `shex-status`. Combined rejections use JSON. Graph-restricted writers get the
+rejection status without guard findings.
+
+`GET` returns `config.guards` and `status.guards` for a combined guard. For a combined
+configuration, supply file sources inline. Each can hold up to 16 MiB, subject to the
+request body limit. The database keeps both source copies in the atomic configuration
+file. Two sources at the limit can produce a file of 32 MiB or more after JSON escaping.
+The store reads this file when it opens. Use named graphs or smaller source files to
+keep the configuration file small. Standalone guard summaries and status keep their flat format. To drop one of the
+guards while preserving the other's live baseline, send a format 4 list containing just
+the unchanged configuration entry returned by `GET`.
+
 | Method | Path | Description |
 |---|---|---|
 | GET | `/$/validation/{ds}` | `{ language, config, unionDefaultGraph, status }`, or `{ config: null, unionDefaultGraph }`. `unionDefaultGraph` says whether the server serves the union of the graphs as the default graph, which a `default` data graph then validates. `status` holds the mode, the shape count, the `baseline` of the last commit with its counts by severity, counters and warnings. It also holds `lastCheck`, the last validated write, and `recentRejections`, the last ten rejected writes. Each of these has the time, the commit kind, the status, the strategy, the counts, the focus nodes validated, the fallback reason and the first result. SHACL adds `incremental`, with the number of shapes validated incrementally and the shapes validated in full on every write. ShEx adds `associations`, the size of the result map. |
-| PUT | `/$/validation/{ds}` | Sets the configuration, in either language, and replaces the other language's files. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
+| PUT | `/$/validation/{ds}` | Replaces the guard configuration with a standalone guard or a format 4 guard list. The current data is validated under the writer lock. A `reject` configuration on data that does not pass is refused with `409` and the summary. `400` for a bad configuration, or for shapes or a schema that cannot be used. `501` for a language this binary was built without. |
 | DELETE | `/$/validation/{ds}` | Turns validation off (`204`) and removes every validation file. |
 
 The dataset page's **Write-time validation** panel lets an administrator configure or
-disable the guard on a writable server. It covers both SHACL and ShEx, with shapes or a
-schema taken from source graphs or given inline, and it sets the mode, baseline, data
+disable the guard on a writable server. It shows both sections of a combined guard.
+Its editor configures a standalone SHACL or ShEx guard, with sources taken from named
+graphs, supplied inline, or both. The combined editor is tracked in
+[roadmap item 1350](ROADMAP.md#tier-4-worth-doing-not-urgent). It sets the mode, baseline, data
 selection, inferences, timeout and report limit. For an in-memory dataset, `GET`
 returns the guard configuration with its inline source, so the settings can be edited
 without supplying the source again. A persistent dataset keeps its copy of the source

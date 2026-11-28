@@ -155,10 +155,8 @@ pub fn guard_shapes(
     guard: Option<WriteGuard>,
     store: &Store,
 ) -> Option<(sparkles_shacl::guard::ValidationConfig, oxrdf::Graph)> {
-    #[allow(irrefutable_let_patterns)]
-    let WriteGuard::Shacl(g) = guard? else {
-        return None;
-    };
+    let guard = guard?;
+    let g = guard.shacl()?;
     let cfg = g.config().clone();
     let mut graph = oxrdf::Graph::new();
     let snap = store.snapshot();
@@ -325,9 +323,7 @@ pub fn draft_of(
     r: DraftRequest,
 ) -> Result<(draft::Draft, u64)> {
     #[cfg(feature = "shacl")]
-    let has_guard = guard
-        .as_ref()
-        .is_some_and(|v| v.language() == crate::guard::GuardLanguage::Shacl);
+    let has_guard = guard.as_ref().is_some_and(|v| v.shacl().is_some());
     #[cfg(not(feature = "shacl"))]
     let has_guard = false;
     let source = match r.source.as_deref() {
@@ -485,4 +481,28 @@ mod backing_refusal_tests {
             matches!(backing.backs_with_options("urn:C","urn:p",false,&QueryOptions { max_memory_bytes:Some(16 << 10),no_cache:true,..Default::default() }),Err(Error::BudgetExceeded(b)) if b.kind==crate::BudgetKind::Memory)
         );
     }
+}
+
+#[cfg(all(test, feature = "shacl", feature = "shex"))]
+#[test]
+fn graphql_draft_defaults_to_shapes_with_a_combined_guard() {
+    let ds = Dataset::memory();
+    let configs = crate::write_guard::parse_configs(serde_json::json!({
+        "format": 4,
+        "guards": [
+            {"language": "shex", "mode": "reject", "schema": {"inline": "<urn:Shex> {}"}, "shapeMap": "<urn:n>@<urn:Shex>"},
+            {"language": "shacl", "mode": "reject", "shapes": {"inline":
+                "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:Shape> a sh:NodeShape ; sh:targetClass <urn:C> ; sh:property [ sh:path <urn:name> ; sh:minCount 1 ; sh:maxCount 1 ] ."}}
+        ]
+    }))
+    .unwrap();
+    ds.validation()
+        .guard()
+        .set_guards(configs, &sparkles_shex::NoImports)
+        .unwrap();
+    let (draft, _) = ds.graphql().draft("test", DraftRequest::default()).unwrap();
+    assert_eq!(draft.source, "shapes");
+    assert_eq!(draft.types[0].class, "urn:C");
+    assert_eq!(draft.types[0].fields[0].path, "urn:name");
+    assert!(draft.types[0].fields[0].required);
 }

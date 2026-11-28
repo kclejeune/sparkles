@@ -941,7 +941,14 @@ fn build_bounded_receipt_map(
         let val_rem = max_extra_bytes.saturating_sub(base_extra);
         // `,"validation":` is 14 bytes.
         let key_overhead = 14usize;
-        if val_rem > key_overhead {
+        if !v.guards.is_empty() {
+            if json_serialized_len_bounded(v.as_ref(), val_rem.saturating_sub(key_overhead))
+                .is_some()
+                && let Ok(report) = serde_json::to_value(v)
+            {
+                rm.insert("validation".into(), report);
+            }
+        } else if val_rem > key_overhead {
             let mut shell = sparkles::guard::ValidationSummary {
                 language: v.language,
                 status: v.status,
@@ -962,6 +969,7 @@ fn build_bounded_receipt_map(
                 focus_nodes: v.focus_nodes,
                 fallback: v.fallback.clone(),
                 report_turtle: None,
+                guards: Vec::new(),
             };
             if let Some(shell_len) =
                 json_serialized_len_bounded(&shell, val_rem.saturating_sub(key_overhead))

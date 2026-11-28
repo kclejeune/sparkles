@@ -206,6 +206,9 @@ pub struct DatasetState {
     pub query_reasoning: RwLock<Option<crate::reasoning::QuerySetting>>,
     /// the installed write-time validation (`validation.json`)
     pub validation: RwLock<Option<WriteGuard>>,
+    /// Serializes settings changes through publication to the dataset handle.
+    #[cfg(any(feature = "shacl", feature = "shex"))]
+    pub(crate) validation_update: Mutex<()>,
     /// why the write guard that `validation.json` asks for is not installed
     pub guard_error: RwLock<Option<String>>,
     /// the last schema reports computed, most recently used last, kept for their
@@ -720,6 +723,8 @@ impl Dataset {
             rdfs: RwLock::new(rdfs),
             query_reasoning: RwLock::new(query_reasoning),
             validation: RwLock::new(validation),
+            #[cfg(any(feature = "shacl", feature = "shex"))]
+            validation_update: Mutex::new(()),
             guard_error: RwLock::new(guard_error),
             schema_cache: Mutex::new(Vec::new()),
             #[cfg(feature = "ontology")]

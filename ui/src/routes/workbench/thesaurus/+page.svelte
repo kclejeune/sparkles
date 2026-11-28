@@ -1275,6 +1275,8 @@
                       >Enforce the SKOS rules on writes</button
                     >
                   </p>
+                {:else if guard?.language === 'combined'}
+                  <p class="pad faint small">The dataset validates writes with SHACL and ShEx.</p>
                 {:else if guard}
                   <p class="pad faint small">
                     The dataset validates writes with its own {guard.config.mode} guard.

@@ -746,18 +746,21 @@ impl Forms {
         let empty = || Arc::new(Shapes::default());
         match settings.shapes {
             ShapesSource::Guard => match self.ds.write_guard() {
-                Some(crate::write_guard::WriteGuard::Shacl(g)) => {
+                Some(guard) => {
+                    let Some(g) = guard.shacl() else {
+                        return Ok((
+                            empty(),
+                            vopts,
+                            Some(
+                                "the write-time guard validates ShEx, and forms read SHACL".into(),
+                            ),
+                        ));
+                    };
                     let Some(o) = g.data_graph_options(snap) else {
                         return Ok((g.shapes(), vopts, None));
                     };
                     Ok((g.shapes(), o, None))
                 }
-                #[cfg(feature = "shex")]
-                Some(crate::write_guard::WriteGuard::Shex(_)) => Ok((
-                    empty(),
-                    vopts,
-                    Some("the write-time guard validates ShEx, and forms read SHACL".into()),
-                )),
                 None => Ok((
                     empty(),
                     vopts,

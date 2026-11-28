@@ -3243,13 +3243,22 @@ export type ValidationConfig = {
   updated?: string;
 };
 
-export type WriteValidation = {
+export type SingleWriteValidation = {
   language: 'shacl' | 'shex';
   config: ValidationConfig;
   /** Whether the server serves the union of the graphs as the default graph */
   unionDefaultGraph?: boolean;
   status: WriteValidationStatus;
 };
+
+export type CombinedWriteValidation = {
+  language: 'combined';
+  config: { format: 4; guards: ValidationConfig[] };
+  unionDefaultGraph?: boolean;
+  status: { guards: { language: 'shacl' | 'shex'; status: WriteValidationStatus }[] };
+};
+
+export type WriteValidation = SingleWriteValidation | CombinedWriteValidation;
 
 /** Replace the guard configuration after validating it against the head. */
 export const setWriteValidation = (ds: string, config: ValidationConfig) =>

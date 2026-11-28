@@ -146,7 +146,11 @@
             .then(({ validation: w, unionDefaultGraph }) => {
               if (ds !== name) return;
               unionDefault = unionDefaultGraph;
-              guardGraph = w ? fixGraph(w.config.dataGraph, unionDefaultGraph) : 'choose';
+              const config =
+                w?.language === 'combined'
+                  ? w.config.guards.find((guard) => guard.language === p.state)
+                  : w?.config;
+              guardGraph = config ? fixGraph(config.dataGraph, unionDefaultGraph) : 'choose';
             })
             .catch(() => {
               if (ds === name) guardGraph = 'choose';

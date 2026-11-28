@@ -152,6 +152,7 @@ fn read(g: &Graph) -> R<Schema> {
         declared: FxHashSet::default(),
         te_defined: FxHashSet::default(),
         open: Vec::new(),
+        copied_bytes: std::cell::Cell::new(0),
     };
     r.schema(&root)
 }
@@ -164,22 +165,58 @@ struct Reader<'g> {
     te_defined: FxHashSet<Term>,
     /// the blank nodes being read in place (one inside itself is a cycle)
     open: Vec<Term>,
+    copied_bytes: std::cell::Cell<usize>,
 }
 
 impl Reader<'_> {
-    fn objects(&self, s: &Term, p: &str) -> Vec<Term> {
+    // A small RDF graph can describe a shared tree whose expansion is much larger
+    // than the graph itself. Charge before copying each term into the expanded AST.
+    fn charge(&self, bytes: usize) -> R<()> {
+        const MAX_COPIED_BYTES: usize = 64 << 20;
+        let total = self.copied_bytes.get().saturating_add(bytes);
+        if total > MAX_COPIED_BYTES {
+            return Err("schema expansion exceeds 64 MiB".into());
+        }
+        self.copied_bytes.set(total);
+        Ok(())
+    }
+
+    fn copy(&self, term: TermRef<'_>) -> R<Term> {
+        let bytes = match term {
+            TermRef::NamedNode(n) => n.as_str().len(),
+            TermRef::BlankNode(n) => n.as_str().len(),
+            TermRef::Literal(l) => l
+                .value()
+                .len()
+                .saturating_add(l.datatype().as_str().len())
+                .saturating_add(l.language().map_or(0, str::len)),
+            TermRef::Triple(_) => return Err("ShExR values cannot be RDF triple terms".into()),
+        };
+        self.charge(std::mem::size_of::<Term>().saturating_add(bytes))?;
+        Ok(term.into_owned())
+    }
+
+    fn objects(&self, s: &Term, p: &str) -> R<Vec<Term>> {
         let Some(s) = as_subject(s) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         self.g
             .objects_for_subject_predicate(s, &sx(p))
-            .map(TermRef::into_owned)
+            .map(|term| self.copy(term))
             .collect()
+    }
+
+    fn push_open(&mut self, t: &Term) -> R<()> {
+        if self.open.len() >= 128 {
+            return Err("schema expression nesting exceeds 128".into());
+        }
+        self.open.push(t.clone());
+        Ok(())
     }
 
     /// The one value of `sx:p`, if any.
     fn one(&self, s: &Term, p: &str) -> R<Option<Term>> {
-        let mut v = self.objects(s, p);
+        let mut v = self.objects(s, p)?;
         match v.len() {
             0 => Ok(None),
             1 => Ok(v.pop()),
@@ -205,6 +242,7 @@ impl Reader<'_> {
                 if found.is_some() {
                     return Err(format!("{} has more than one ShEx type", name(s)));
                 }
+                self.charge(local.len().saturating_add(std::mem::size_of::<String>()))?;
                 found = Some(local.to_string());
             }
         }
@@ -227,7 +265,7 @@ impl Reader<'_> {
             let one = |p: &NamedNode| {
                 let mut it = self.g.objects_for_subject_predicate(s, p);
                 match (it.next(), it.next()) {
-                    (Some(x), None) => Ok(x.into_owned()),
+                    (Some(x), None) => self.copy(x),
                     _ => Err(bad()),
                 }
             };
@@ -250,7 +288,7 @@ impl Reader<'_> {
     fn members(&self, s: &Term, p: &str) -> R<Vec<Term>> {
         let first = NamedNode::from(rdf::FIRST);
         let mut out = Vec::new();
-        for v in self.objects(s, p) {
+        for v in self.objects(s, p)? {
             let is_list = v == Term::from(rdf::NIL.into_owned())
                 || as_subject(&v)
                     .is_some_and(|c| self.g.object_for_subject_predicate(c, &first).is_some());
@@ -344,7 +382,7 @@ impl Reader<'_> {
                             name(t)
                         ));
                     }
-                    self.open.push(t.clone());
+                    self.push_open(t)?;
                     let e = self.shape_expr_at(t, &ty);
                     self.open.pop();
                     e
@@ -398,7 +436,7 @@ impl Reader<'_> {
     /// The members of ShEx 2.2 drafts that no published form kept are errors that name
     /// the feature.
     fn no_2_2(&self, n: &Term) -> R<()> {
-        if !self.objects(n, "restricts").is_empty() {
+        if !self.objects(n, "restricts")?.is_empty() {
             return Err(format!(
                 "{}: sx:restricts is ShEx 2.2, which is not supported",
                 name(n)
@@ -643,17 +681,20 @@ impl Reader<'_> {
             // a label defined elsewhere (an imported schema)
             return Ok(TripleExpr::Include(label(t)?));
         };
-        if self.labelled(t) {
+        let id = if self.labelled(t) {
+            let id = label(t)?;
             if !self.te_defined.insert(t.clone()) {
-                return Ok(TripleExpr::Include(label(t)?));
+                return Ok(TripleExpr::Include(id));
             }
-            return self.triple_expr_at(t, &ty, Some(label(t)?));
-        }
-        if self.open.contains(t) {
-            return Err(format!("the triple expression {} contains itself", name(t)));
-        }
-        self.open.push(t.clone());
-        let e = self.triple_expr_at(t, &ty, None);
+            Some(id)
+        } else {
+            if self.open.contains(t) {
+                return Err(format!("the triple expression {} contains itself", name(t)));
+            }
+            None
+        };
+        self.push_open(t)?;
+        let e = self.triple_expr_at(t, &ty, id);
         self.open.pop();
         e
     }

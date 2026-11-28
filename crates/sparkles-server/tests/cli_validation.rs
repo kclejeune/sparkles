@@ -227,3 +227,93 @@ fn schema_in_a_graph_from_the_command_line() {
     );
     assert_ne!(o.status.code(), Some(0));
 }
+
+#[cfg(feature = "shacl")]
+#[test]
+fn cli_combines_guards_and_schema_sources() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(
+        dir.join("data.ttl"),
+        "<urn:alice> a <urn:C> ; <urn:p> <urn:bob> .",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("graph.ttl"),
+        sparkles_shex::Schema::parse_shexc("<urn:G> IRI", None)
+            .unwrap()
+            .to_shexr_turtle(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("file.shex"), "<urn:F> { <urn:p> @<urn:G> }").unwrap();
+    std::fs::write(dir.join("shapes.ttl"), "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <urn:C> ; sh:property [ sh:path <urn:p> ; sh:minCount 1 ] .").unwrap();
+
+    for args in [
+        &["load", "--loc", "db", "data.ttl"][..],
+        &["load", "--loc", "db", "--graph", "urn:schema", "graph.ttl"][..],
+        &[
+            "validation",
+            "--loc",
+            "db",
+            "--mode",
+            "reject",
+            "--lang",
+            "combined",
+            "--shapes",
+            "shapes.ttl",
+            "--schema-graph",
+            "urn:schema",
+            "--schema",
+            "file.shex",
+            "--shape-map",
+            "{FOCUS a <urn:C>}@<urn:F>",
+        ][..],
+    ] {
+        let o = sparkles(dir, args);
+        assert!(o.status.success(), "{args:?}: {}", err(&o));
+    }
+    let status = sparkles(
+        dir,
+        &["validation", "--loc", "db", "--status", "--format", "json"],
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["config"]["format"], 4);
+    assert_eq!(
+        status["config"]["guards"][1]["schema"]["graphs"][0],
+        "urn:schema"
+    );
+    for extra in [
+        &[][..],
+        &["--shapes", "guard"][..],
+        &["--shapes", "none"][..],
+    ] {
+        let mut args = vec!["schema", "--loc", "db", "--format", "json"];
+        args.extend_from_slice(extra);
+        let o = sparkles(dir, &args);
+        assert!(o.status.success(), "{args:?}: {}", err(&o));
+        let schema: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        if extra.last() == Some(&"none") {
+            assert!(schema.get("constraints").is_none(), "{schema}");
+        } else {
+            let sources = schema["constraints"]["sources"].as_array().unwrap();
+            assert_eq!(sources.len(), 2, "{sources:?}");
+            assert_eq!(sources[0]["threshold"], "violation");
+            assert_eq!(sources[1]["graphs"][0], "urn:schema");
+        }
+    }
+    let o = sparkles(
+        dir,
+        &[
+            "update",
+            "--loc",
+            "db",
+            "INSERT DATA { <urn:bob> a <urn:C> }",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(3), "{}{}", out(&o), err(&o));
+    assert!(
+        err(&o).contains("SHACL") && err(&o).contains("ShEx"),
+        "{}",
+        err(&o)
+    );
+}

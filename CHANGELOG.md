@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Combined SHACL and ShEx write-time validation
+
+A dataset can enforce both languages with independent modes, data graphs and baseline
+policies. Writes and merges evaluate both guards on the same candidate state and return
+one report section per guard. ShEx can combine a checked file copy with ShExR from named
+graphs. Both `shex validate` and `validation` accept the local outbound policy flags
+for schema imports.
+
 ### Dataset storage quota accounting
 
 Dataset quotas now exclude unused write-ahead log, delta vocabulary and change-log
@@ -1445,6 +1453,10 @@ Claims without validity keep their record and payload digests. `ClaimInput` has 
 
 ### Format
 
+A combined guard writes the ordered guard list and both inline sources in
+`validation.json` format 4. A standalone ShEx guard with a graph and file schema also
+writes format 4. Standalone formats 1 through 3 remain readable.
+
 The first-release format cutoff of item 479 implements X16 Phase 1. `dataset.json` is written
 as `format` 2 with `minimumReader` 5 or more, and a `format` 1 file or one that requires a
 reader below 5 is refused with the dump-and-reload message. The generation index is
@@ -1702,6 +1714,11 @@ item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics
 each evaluation child.
 
 ### Compatibility
+
+Combined configurations add the `combined` write-summary language with a `guards`
+array. Clients reading status for a dataset with both validators can read the
+configuration and status sections for each language. Standalone guards retain their
+existing response fields.
 
 - The enabled full-text index status can include an optional `pendingConfig`
   field during online configuration. Existing status fields and the disabled

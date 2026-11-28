@@ -2634,39 +2634,53 @@ fn main() -> Result<()> {
 fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
     if let Some(sparkles::Error::Rejected(r)) = e.downcast_ref::<sparkles::Error>() {
         eprintln!("{r}");
-        for res in r.summary.results.iter().take(10) {
-            let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
-            if r.summary.language == sparkles::guard::GuardLanguage::Shex {
-                // a ShEx result: node, shape (or START) and the first failure
-                let shape = match res["shape"]["type"].as_str() {
-                    Some("start") => "START".to_string(),
-                    _ => t("shape"),
-                };
-                let reason = res["reason"].as_str().unwrap_or("");
-                eprintln!("  {} @ {shape}: {reason}", t("node"));
-                continue;
-            }
-            let msg = res["messages"][0].as_str().unwrap_or("");
-            eprintln!(
-                "  {} at {}{}",
-                t("sourceConstraintComponent")
-                    .rsplit('#')
-                    .next()
-                    .unwrap_or(""),
-                t("focusNode"),
-                if msg.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {msg}")
+        if r.summary.guards.is_empty() {
+            print_validation_findings(&r.summary);
+        } else {
+            for section in &r.summary.guards {
+                eprintln!("{} ({}):", section.language.title(), section.status.name());
+                if let Some(error) = &section.shapes_error {
+                    eprintln!("  {error}");
                 }
-            );
-        }
-        if r.summary.blocking > 10 {
-            eprintln!("  … {} more", r.summary.blocking - 10);
+                print_validation_findings(section);
+            }
         }
         std::process::exit(3);
     }
     e
+}
+
+fn print_validation_findings(s: &sparkles::guard::ValidationSummary) {
+    for res in s.results.iter().take(10) {
+        let t = |k: &str| res[k]["value"].as_str().unwrap_or("").to_string();
+        if s.language == sparkles::guard::GuardLanguage::Shex {
+            // a ShEx result: node, shape (or START) and the first failure
+            let shape = match res["shape"]["type"].as_str() {
+                Some("start") => "START".to_string(),
+                _ => t("shape"),
+            };
+            let reason = res["reason"].as_str().unwrap_or("");
+            eprintln!("  {} @ {shape}: {reason}", t("node"));
+            continue;
+        }
+        let msg = res["messages"][0].as_str().unwrap_or("");
+        eprintln!(
+            "  {} at {}{}",
+            t("sourceConstraintComponent")
+                .rsplit('#')
+                .next()
+                .unwrap_or(""),
+            t("focusNode"),
+            if msg.is_empty() {
+                String::new()
+            } else {
+                format!(": {msg}")
+            }
+        );
+    }
+    if s.blocking > 10 {
+        eprintln!("  … {} more", s.blocking - 10);
+    }
 }
 
 /// The input graphs that `sparkles infer` was given, or `None` when it was given none of
@@ -5244,7 +5258,7 @@ fn run() -> Result<()> {
 }
 
 /// The constraints layer of `sparkles schema`: the sources of `--shapes`, or else the
-/// shapes of the database's write-time SHACL validation, if any.
+/// shapes and schemas of the database's write-time validation, if any.
 fn schema_constraints(
     store: &sparkles::store::Store,
     snap: &sparkles::store::Snapshot,
@@ -5253,18 +5267,31 @@ fn schema_constraints(
     let req = http::ShapesRequest::from_values(shapes).map_err(anyhow::Error::msg)?;
     #[cfg(feature = "shacl")]
     {
-        use sparkles_shacl::constraints::{configured_source, graphs_source};
         let mut layer = sparkles::schema::ConstraintsLayer::default();
         if req.guard != Some(false) {
-            match sparkles_shacl::guard::configured_shapes(store)? {
-                Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
-                None => match shex_guard_source(store)? {
-                    Some(s) => layer.sources.push(s),
-                    None if req.guard == Some(true) => {
-                        bail!("the database has no write-time validation")
-                    }
-                    None => {}
-                },
+            #[cfg(feature = "shex")]
+            if let Some(guard) = write_validation::install(store)? {
+                if let Some(g) = guard.shacl() {
+                    layer
+                        .sources
+                        .push(sparkles_shacl::constraints::guard_source(g));
+                }
+                if let Some(g) = guard.shex() {
+                    layer
+                        .sources
+                        .push(sparkles_shex::constraints::guard_source(g));
+                }
+            }
+            #[cfg(not(feature = "shex"))]
+            if let Some((cfg, shapes)) = sparkles_shacl::guard::configured_shapes(store)? {
+                layer
+                    .sources
+                    .push(sparkles_shacl::constraints::configured_source(
+                        &cfg, &shapes,
+                    ));
+            }
+            if layer.sources.is_empty() && req.guard == Some(true) {
+                bail!("the database has no write-time validation");
             }
         }
         for g in req.graphs.iter().filter(|g| *g != "default") {
@@ -5273,7 +5300,12 @@ fn schema_constraints(
             }
         }
         if !req.graphs.is_empty() {
-            layer.sources.push(graphs_source(snap, &req.graphs)?);
+            layer
+                .sources
+                .push(sparkles_shacl::constraints::graphs_source(
+                    snap,
+                    &req.graphs,
+                )?);
         }
         Ok((!layer.is_empty()).then_some(layer))
     }
@@ -5285,21 +5317,6 @@ fn schema_constraints(
         }
         Ok(None)
     }
-}
-
-/// The source of the schema of the database's write-time ShEx validation, if it has one.
-#[cfg(all(feature = "shacl", feature = "shex"))]
-fn shex_guard_source(
-    store: &sparkles::store::Store,
-) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
-    Ok(sparkles_shex::guard::install(store)?.map(|g| sparkles_shex::constraints::guard_source(&g)))
-}
-
-#[cfg(all(feature = "shacl", not(feature = "shex")))]
-fn shex_guard_source(
-    _store: &sparkles::store::Store,
-) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
-    Ok(None)
 }
 
 /// `sparkles schema --format text`: the constraints layer, one line per property shape.

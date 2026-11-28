@@ -1363,7 +1363,7 @@ const FALLBACKS: [&str; 7] = [
 pub struct ValidationMetrics {
     dataset: String,
     /// by [`sparkles::guard::GuardLanguage::index`]
-    by_language: [LanguageCounters; 2],
+    by_language: [LanguageCounters; sparkles::guard::GuardLanguage::ALL.len()],
 }
 
 /// The validation counters of one language.
@@ -1410,6 +1410,19 @@ impl sparkles::guard::GuardObserver for ValidationMetrics {
         elapsed: Duration,
     ) {
         use sparkles::guard::{GuardStatus, Strategy};
+        if let Ok(summary) = outcome
+            && !summary.guards.is_empty()
+        {
+            for guard in &summary.guards {
+                self.observe(
+                    guard.language,
+                    kind,
+                    Ok(guard),
+                    Duration::from_millis(guard.millis),
+                );
+            }
+            return;
+        }
         let m = &self.by_language[language.index()];
         let status = match outcome {
             Ok(s) => match s.status {
@@ -1521,7 +1534,12 @@ fn validation_totals(st: &AppState) -> BTreeMap<(String, &'static str), Validati
         let configured = d.validation.read().as_ref().map(|v| v.language());
         for language in sparkles::guard::GuardLanguage::ALL {
             let vm = &d.validation_metrics;
-            if configured != Some(language) && !vm.seen(language) {
+            let active = if configured == Some(sparkles::guard::GuardLanguage::Combined) {
+                language != sparkles::guard::GuardLanguage::Combined
+            } else {
+                configured == Some(language)
+            };
+            if !active && !vm.seen(language) {
                 continue;
             }
             let m = &vm.by_language[language.index()];

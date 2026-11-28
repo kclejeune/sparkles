@@ -351,9 +351,17 @@ impl ShaclGuard {
 
     /// An independent guard for a memory branch, retaining only immutable schema data.
     pub fn fork_for_store(&self, store: &Store) -> Result<Arc<Self>> {
+        let fork = self.fork_detached(&store.snapshot())?;
+        store.set_guard(Some(fork.clone()));
+        store.set_guard_required(true);
+        Ok(fork)
+    }
+
+    #[doc(hidden)]
+    pub fn fork_detached(&self, snap: &Snapshot) -> Result<Arc<Self>> {
         let loaded = if let Some(graphs) = &self.cfg.shapes.graphs {
             Loaded::new(Shapes::from_store_graphs_with(
-                &store.snapshot(),
+                snap,
                 graphs,
                 self.file_shapes.as_deref(),
             )?)
@@ -363,10 +371,7 @@ impl ShaclGuard {
         let mut fork = Self::new(self.cfg.clone(), loaded, None);
         fork.file_shapes = self.file_shapes.clone();
         *fork.tuning.write() = *self.tuning.read();
-        let fork = Arc::new(fork);
-        store.set_guard(Some(fork.clone()));
-        store.set_guard_required(true);
-        Ok(fork)
+        Ok(Arc::new(fork))
     }
 
     pub fn config(&self) -> &ValidationConfig {
@@ -776,6 +781,8 @@ impl ShaclGuard {
                 baseline,
                 exact,
             });
+        } else {
+            self.discard_pending(seq);
         }
         let mut s =
             ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, self.cfg.threshold);
@@ -1070,6 +1077,7 @@ fn summarize(
         focus_nodes: Some(focus_nodes),
         fallback: fallback.map(|f| f.name().to_string()),
         report_turtle,
+        guards: Vec::new(),
     }
 }
 
@@ -1406,7 +1414,7 @@ pub enum SetOutcome {
 pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOutcome> {
     let root = store.root().map(Path::to_path_buf);
     let txn = store.write_as(CommitKind::Transaction);
-    let Some(mut cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
+    let Some(cfg) = cfg.filter(|c| c.mode != GuardMode::Off) else {
         store.set_guard(None);
         store.set_guard_required(false);
         if let Some(r) = &root {
@@ -1416,31 +1424,13 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         drop(txn);
         return Ok(SetOutcome::Removed);
     };
-    cfg.check()?;
     let view = Arc::new(txn.view());
-    let head = txn.base().commit;
-    let (shapes, file_shapes) = load_shapes(&cfg, root.as_deref(), &view)?;
-    let loaded = Loaded::new(shapes);
-    let probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
-    let checked = probe.full(
-        &view,
-        &loaded,
-        Before::Establish,
-        &WriteOptions::default(),
-        None,
-        head,
-    )?;
-    let summary = checked.summary;
-    if cfg.mode == GuardMode::Reject
-        && cfg.baseline == BaselinePolicy::Strict
-        && summary.blocking > 0
-    {
+    let head = view.commit;
+    let (mut guard, summary) = prepare(cfg, root.as_deref(), &view, true)?;
+    if guard.rejects_initial(&summary) {
         return Ok(SetOutcome::NotConforming(summary));
     }
-    cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
-    // written as format 2, whatever was given
-    cfg.format = 2;
-    cfg.language = Some(GuardLanguage::Shacl);
+    let cfg = &mut guard.cfg;
     let mut persist = None;
     if let Some(r) = &root {
         // a ShEx configuration this one replaces leaves nothing behind
@@ -1448,7 +1438,7 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         StatusFile::remove(r)?;
         if let Some(text) = cfg.shapes.inline.take() {
             // the shapes file is Turtle, whatever the syntax given
-            let syntax = inline_syntax(&cfg)?;
+            let syntax = inline_syntax(cfg)?;
             let text = if syntax == ShapesSyntax::default() {
                 text
             } else {
@@ -1461,24 +1451,115 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
         } else if cfg.shapes.file.is_none() {
             let _ = std::fs::remove_file(r.join(SHAPES_FILE));
         }
-        let bytes = serde_json::to_vec_pretty(&cfg)?;
+        let bytes = serde_json::to_vec_pretty(cfg)?;
         write_atomic(&r.join(CONFIG_FILE), &bytes)?;
         persist = Some((r.clone(), sha256_hex(&bytes)));
     }
-    let mut guard = ShaclGuard::new(cfg, loaded, persist);
-    guard.file_shapes = file_shapes;
-    let guard = Arc::new(guard);
-    let baseline = baseline_of(&summary, head);
+    guard.persist = persist;
     if let Some((r, hash)) = &guard.persist {
-        StatusFile::of(&baseline, hash).write(r)?;
+        StatusFile::of(&baseline_of(&summary, head), hash).write(r)?;
     }
-    *guard.baseline.lock() = Some(baseline);
-    *guard.exact.lock() = Some(checked.exact);
-    guard.last_full.store(summary.millis, Ordering::Relaxed);
+    let guard = Arc::new(guard);
     store.set_guard(Some(guard.clone()));
     store.set_guard_required(true);
     drop(txn);
     Ok(SetOutcome::Installed(guard, summary))
+}
+
+/// Build a guard on a caller-owned writer snapshot without changing the store.
+#[doc(hidden)]
+pub fn prepare_detached(
+    cfg: ValidationConfig,
+    snap: &Arc<Snapshot>,
+    establish: bool,
+) -> Result<(Arc<ShaclGuard>, ValidationSummary)> {
+    anyhow::ensure!(
+        cfg.shapes.file.is_none(),
+        "shapes: give the file source inline"
+    );
+    let (guard, summary) = prepare(cfg, None, snap, establish)?;
+    Ok((Arc::new(guard), summary))
+}
+
+fn prepare(
+    mut cfg: ValidationConfig,
+    root: Option<&Path>,
+    snap: &Arc<Snapshot>,
+    establish: bool,
+) -> Result<(ShaclGuard, ValidationSummary)> {
+    cfg.check()?;
+    let (shapes, file_shapes) = load_shapes(&cfg, root, snap)?;
+    let loaded = Loaded::new(shapes);
+    cfg.format = 2;
+    cfg.language = Some(GuardLanguage::Shacl);
+    if establish {
+        cfg.updated = Some(sparkles_core::guard::config::now_rfc3339());
+    }
+    let mut guard = ShaclGuard::new(cfg, loaded.clone(), None);
+    guard.file_shapes = file_shapes;
+    let summary = if establish {
+        let checked = guard.full(
+            snap,
+            &loaded,
+            Before::Establish,
+            &WriteOptions::default(),
+            None,
+            snap.commit,
+        )?;
+        let summary = checked.summary;
+        *guard.baseline.lock() = Some(baseline_of(&summary, snap.commit));
+        *guard.exact.lock() = Some(checked.exact);
+        guard.last_full.store(summary.millis, Ordering::Relaxed);
+        summary
+    } else {
+        ValidationSummary::empty(GuardStatus::Skipped, guard.cfg.mode, guard.cfg.threshold)
+    };
+    Ok((guard, summary))
+}
+
+impl ShaclGuard {
+    /// Promote a detached guard under the drained store writer, after its standalone
+    /// configuration has been published. Keep the old guard readable as part of the pair.
+    #[doc(hidden)]
+    pub fn retain_persistent(
+        &self,
+        cfg: ValidationConfig,
+        root: &Path,
+        hash: String,
+        head: u64,
+    ) -> (Arc<Self>, Option<StatusFile>) {
+        let baseline = self.baseline.lock().clone();
+        let exact = self.exact.lock().clone();
+        let status = baseline
+            .as_ref()
+            .filter(|b| b.commit == head && b.conforms.is_some() && exact.is_some())
+            .map(|b| StatusFile::of(b, &hash));
+        let guard = Self {
+            cfg,
+            loaded: RwLock::new(self.loaded.read().clone()),
+            pending: Mutex::new(Vec::new()),
+            baseline: Mutex::new(baseline),
+            exact: Mutex::new(exact),
+            counters: self.counters.clone(),
+            last_full: AtomicU64::new(self.last_full.load(Ordering::Relaxed)),
+            tuning: RwLock::new(*self.tuning.read()),
+            history: self.history.clone(),
+            persist: Some((root.to_path_buf(), hash)),
+            file_shapes: self.file_shapes.clone(),
+        };
+        (Arc::new(guard), status)
+    }
+
+    /// Discard a candidate's state when a different guard refused it.
+    #[doc(hidden)]
+    pub fn discard_pending(&self, seq: u64) {
+        self.pending.lock().retain(|p| p.seq < seq);
+    }
+
+    #[doc(hidden)]
+    pub fn rejects_initial(&self, summary: &ValidationSummary) -> bool {
+        self.cfg.mode == GuardMode::Reject && self.cfg.baseline.is_strict() && summary.blocking > 0
+    }
 }
 
 #[cfg(test)]

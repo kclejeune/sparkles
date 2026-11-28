@@ -107,12 +107,12 @@ mod handlers {
     fn language_of(j: &J) -> ApiResult<GuardLanguage> {
         match j.get("language") {
             None | Some(J::Null) => Ok(GuardLanguage::Shacl),
-            Some(l) => serde_json::from_value(l.clone()).map_err(|_| {
-                err(
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid configuration: unknown language {l} (\"shacl\" or \"shex\")"),
-                )
-            }),
+            Some(l) if l == "shacl" => Ok(GuardLanguage::Shacl),
+            Some(l) if l == "shex" => Ok(GuardLanguage::Shex),
+            Some(l) => Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid configuration: unknown language {l} (\"shacl\" or \"shex\")"),
+            )),
         }
     }
 
@@ -142,8 +142,17 @@ mod handlers {
             o.entry("format").or_insert(json!(guard::CONFIG_FORMAT));
         }
         let cfg: ShexValidationConfig = serde_json::from_value(j).map_err(invalid)?;
+        Ok(ds
+            .dataset
+            .validation()
+            .guard()
+            .set_shex(cfg, &resolver(st))?)
+    }
+
+    #[cfg(feature = "shex")]
+    fn resolver(st: &AppState) -> sparkles_shex::FileResolver {
         let budget = sparkles::outbound::RequestBudget::new(&st.outbound);
-        let resolver = sparkles_shex::FileResolver {
+        sparkles_shex::FileResolver {
             dirs: match &st.file_loads {
                 sparkles::sparql::FileLoads::Under(d) => vec![d.clone()],
                 _ => Vec::new(),
@@ -152,8 +161,17 @@ mod handlers {
             outbound: Some((st.outbound.clone(), budget)),
             limits: st.shex_import_limits,
             ..Default::default()
-        };
-        Ok(ds.dataset.validation().guard().set_shex(cfg, &resolver)?)
+        }
+    }
+
+    #[cfg(all(feature = "shacl", feature = "shex"))]
+    fn set_guards(st: &AppState, ds: &Dataset, j: J) -> ApiResult<GuardOutcome> {
+        let configs = sparkles::write_guard::parse_configs(j)?;
+        Ok(ds
+            .dataset
+            .validation()
+            .guard()
+            .set_guards(configs, &resolver(st))?)
     }
 
     pub(in crate::http) async fn get(
@@ -178,13 +196,26 @@ mod handlers {
         if let Some(o) = j.as_object_mut() {
             o.remove("updated");
         }
-        let language = language_of(&j)?;
+        let language = if j.get("guards").is_some() {
+            GuardLanguage::Combined
+        } else {
+            language_of(&j)?
+        };
         blocking(move || {
             let outcome = match language {
                 #[cfg(feature = "shacl")]
                 GuardLanguage::Shacl => set_shacl(&ds, j)?,
                 #[cfg(feature = "shex")]
                 GuardLanguage::Shex => set_shex(&st, &ds, j)?,
+                #[cfg(all(feature = "shacl", feature = "shex"))]
+                GuardLanguage::Combined => set_guards(&st, &ds, j)?,
+                #[cfg(not(all(feature = "shacl", feature = "shex")))]
+                GuardLanguage::Combined => {
+                    return Err(err(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "combined validation needs both the `shacl` and `shex` features",
+                    ));
+                }
                 #[allow(unreachable_patterns)]
                 l => {
                     let _ = (&st, j);

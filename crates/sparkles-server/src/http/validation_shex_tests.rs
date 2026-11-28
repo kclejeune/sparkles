@@ -488,3 +488,59 @@ async fn legacy_copy_is_upgraded_by_a_formatless_keep_source_put() {
         )
     );
 }
+
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn combined_guards_return_ordered_reports_and_keep_both_validation_routes() {
+    let (_dir, _st, app) = server(|_| {}).await;
+    fix_carol(&app).await;
+    let mut shex = shex(SCHEMA, MAP);
+    shex["mode"] = json!("warn");
+    let shacl = json!({
+        "language": "shacl", "mode": "reject",
+        "shapes": {"inline": "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetClass <http://ex.org/Person> ; sh:property [ sh:path <http://xmlns.com/foaf/0.1/name> ; sh:minCount 1 ] ."}
+    });
+    let conf = json!({"format": 4, "guards": [shex, shacl]});
+    let r = put_config(&app, &conf).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["config"]["guards"][0]["language"], "shex");
+
+    let r = send(
+        &app,
+        Request::post("/v/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .header(header::ACCEPT, "text/turtle")
+            .body(Body::from(
+                "INSERT DATA { <urn:Dave> a <http://ex.org/Person> }",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    assert!(r.header("sparkles-validation").contains("lang=combined"));
+    assert!(
+        r.header("sparkles-validation")
+            .contains("shacl-status=rejected")
+    );
+    assert!(
+        r.header("sparkles-validation")
+            .contains("shex-status=warned")
+    );
+    assert!(r.header("content-type").starts_with("application/json"));
+    let report = r.json();
+    let sections = report["validation"]["guards"].as_array().unwrap();
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0]["status"], "warned");
+    assert_eq!(sections[1]["status"], "rejected");
+    assert_eq!(sections[0]["results"][0]["node"]["value"], "urn:Dave");
+    assert_eq!(sections[1]["results"][0]["focusNode"]["value"], "urn:Dave");
+
+    for uri in [
+        "/v/shacl?shapes=guard&format=json",
+        "/v/shex?schema=guard&node=%3Chttp%3A%2F%2Fex.org%2Falice%3E",
+    ] {
+        let r = send(&app, Request::post(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+        assert_eq!(r.json()["conforms"], true, "{uri}");
+    }
+}

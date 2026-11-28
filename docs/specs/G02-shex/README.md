@@ -2,7 +2,7 @@
 
 > **Status:** implemented in part (Phases 1–2 and most of Phase 3, including the supported ShEx 2.2 subset)
 
-ShExC, ShExJ and ShExR validation, persisted typing and incremental write guards are available within the supported language subset. Combined guards and remaining selector controls are tracked under item 54.
+ShExC, ShExJ and ShExR validation, persisted typing and incremental write guards are available within the supported language subset. [Item 54](OUTCOME.md#guards-schema-sources-and-cli-controls) adds combined SHACL and ShEx guards, graph and file schema composition, and CLI outbound controls.
 
 ## Documents
 
