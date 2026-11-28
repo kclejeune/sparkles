@@ -794,7 +794,7 @@ route of growth in place. Pred itself keeps ground-bodied partners, since a cand
 left them out broke the return of facts over `f(u)` that hold under a marker. The growth is
 cut where the routes above make those partners and not in Pred.
 
-Six obligations stay open. The first is the assumption of the third part, that a
+Six obligations were left open when the cut landed. The first is the assumption of the third part, that a
 ground-bodied clause outside the query context whose literal is false in the model, or a
 replacement of the shape that Pred sends, reaches the query context or the root by Pred.
 The second is the holder of such a clause. A clause with a ground body and a literal over
@@ -808,12 +808,91 @@ as a pivot. The argument needs to show that such a body cannot arise in this par
 construction or how its literal is discharged. The fifth is a live clause in mode `129` that
 subsumes a producer and drops the returned body literal. The sixth is that counting is not
 covered and that the filter of the return is checked only against the uses of the return
-that the argument names. No measured run loses an entailment to any of them, and all six
-stay with item 1220's proof, which item 823 waits for. An earlier design also proposed
+that the argument names. No measured run loses an entailment to any of them. Item 1220's
+proof, which item 823 waits for, takes them up, and the next paragraphs record which of them
+it closes. An earlier design also proposed
 selecting one ground body literal for Join and pruning a product early against the store.
 The consult on the design found that the first needs the holder argument above, which is
 open, and that the second breaks the product's guarantee that every union reaches the
 redundancy test, so neither was built.
+
+Item 1220's proof work closes the fourth and fifth obligations and the finite part of the
+sixth, and an independent audit of the proof checked each argument against the code. The
+fourth cannot arise. The body of a clause of a context other than the root holds only atoms
+over x, the packed role atoms of predecessor edges and literals over constants. The core and
+the hypotheses give atoms over x. The universals, the propagation of a universal, the
+qualified roles and the at-most rule add role atoms, and each is the role atom of a
+predecessor edge. `ground_trigger` admits a
+marker's literal only over constants. Pred and Pred over `f_e(u)` carry only body literals over
+constants, and the receiver of a returned root clause resolves the whole root body away. Every
+other rule takes the union of its premises' bodies and rewrites only literals of the head. A
+ground-bodied clause therefore has a body literal over constants, which Join takes as its
+pivot. This settles the shape of the pivot, and the discharge still needs a live producer of
+the literal in the query context.
+
+The flags follow the bodies. A clause of a context other than the root that reaches the rules
+gets its flags from its body before the rules run, and no root clause gets either flag, so no
+clause with an empty body is cut. A saturation that stops after the store marks a clause
+processed and before the rules run on it can leave that clause with the initial flags, which
+are both off, so the census reads finished saturations only. The discharge in the query context holds for a body
+of plain ground literals that are each produced. A literal is produced when a clause with an
+empty body has that exact literal as a maximum and every other literal of its head is false in
+the stage of facts. A literal that holds in the model without such a clause, such as an
+equality of two constants that rewrite to the same constant, is outside the argument. Under
+that hypothesis each Join removes one ground body literal and keeps the false residues, in
+either order of arrival, until the query context reaches a contradiction or a false clause
+that the stage of facts covers.
+
+The fifth obligation is vacuous under the hypotheses that the argument already uses. The store
+compares literals in both sides of a clause without substitution, so a live clause that
+subsumes a producer has a literally empty body. If it drops the returned literal, its head lies
+inside the false rest of the producer's head, and the stage of facts would falsify a live
+clause with an empty body. If it keeps the literal, that literal is still a maximum and the
+subsumer is itself an eligible producer. The filter of the return passes every use of the
+return that the argument makes in a finished saturation. These are the return of a denial to
+the query context with its one productive premise and the Join that removes the literals that
+the root produces. Both orders of arrival reach the filtered product, and the filter reads the
+body of the holder and never the returned clause. Counting in the sixth obligation belongs to
+item 1229. The first three obligations, the completeness of the repaired selection and item
+1220's Eq and Factor query case stay open. The next target is a context that is neither the
+query context nor the root and that holds a conditional clause over `f_e(u)`, which the
+second obligation is about. The audit did not check the construction of the stage of facts,
+so the closed arguments stay relative to it.
+
+The unit tests of `rooted_lemma_tests` check the flags and the bodies after every finished
+saturation of the `shoi` fixtures, the hand cases with nominals, keys and the universal
+property, the fixtures of item 1061 and eleven ontologies built for this item. Each runs in
+the default arm, in the cut with the selection off and in the uncut control, under both
+strategies and with counting under the cautious one. A setting of the three switches and
+the Join exemption for the test's thread lets one test binary run every arm. The census
+computes the expected flags from the literals' terms and not from the rule's own test, and it
+reads the bodies of every stored clause, processed or not. It fails on a flag that differs
+from the body, on a body of a context other than the root that holds a literal over
+`f_e(u)` or a literal over x or y of the kind that holds constants, and on a fixture that
+does not parse. Over the whole family, an arm that cuts must meet ground-bodied clauses and
+ground-bodied clauses with a head over `f_e(u)` outside a query context, which are the
+holders of the second obligation, and the uncut arm must cut nothing. These totals show that
+the family reaches the cases and do not show it for each file. Each of the eleven ontologies must give HermiT 1.4.5's unsatisfiable classes and its
+subsumptions between declared classes in full in the arms that cut. Two of them, built
+around item 1220's query case, are regressions of the taxonomy only, since no test shows
+that their runs reach a query-shaped Eq or Factor step. A mutation that lets markers carry literals over
+`f_e(u)` makes the census fail on `shoi-000` and on the first hand case. Two ontologies
+with two ground body literals in a successor's clause miss their subsumption with the
+selection on and without the repair of Hyper's partners. A third, whose clause in the query
+context has two ground body literals and an empty head, loses the unsatisfiable class
+without the Join exemption. Tests check that both controls still lose. A set of 1,500
+generated ontologies is built around the open obligations. Each has a query context that
+mentions one individual and a successor that mentions another, with successor terms of
+constants made in the successor or in the root, equalities between such a term and a
+constant under a marker, facts at that constant derived in the root, named classes reused
+as successors and residues on edges. Its 9,000 runs in the three arms, on one thread under
+the cautious strategy and on four under the eager one, give 8,889 complete answers and none
+that differs from HermiT. In the census of its cautious runs, the default arm and the cut
+meet 3,937 and 4,763 ground-bodied clauses with a head over `f_e(u)` outside a query
+context, and neither breaks the flags or holds a body over `f_e(u)`. With counting, the default arm gives
+2,992 complete answers on the same set and none that differs. The run with the selection on
+and without the repair also gives none that differs there, so the set has not shown that it
+can find a loss of that kind, and its agreement is weak evidence for the open obligations.
 
 The cut finishes the ontologies of the item. The measured set holds 104 generated input
 files around g1-051_p0012, which are g1-051_p0011, g1-051_p0012, g1-051_p0121, 17 one-axiom

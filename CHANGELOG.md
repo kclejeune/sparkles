@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Lemmas of the rooted selection and ground-body cut
+
+Item 1220's proof work closes the fourth and fifth obligations of item 1250's ground-body
+cut and the finite part of the sixth, and an independent audit checked each argument against
+the code. No body of a context other than the root holds a literal over a successor term of
+a constant, so a ground body literal is always over constants and Join takes it as its pivot.
+The flags of the selection and the cut follow the bodies of the clauses that reach the rules,
+so no clause with an empty body is cut. The fifth obligation is vacuous under the hypotheses
+of the stage of facts, since a live subsumer of a producer has a literally empty body. The
+filter of the return passes every use of the return that the argument makes. The discharge in
+the query context is stated for literals that a clause with an empty body produces in that
+exact form, and not for every literal that holds in the model. Unit tests check the bodies
+and the flags after every finished saturation of the `shoi`, nominal, key and top-property
+fixtures and eleven new ones, in the default arm, the cut with the selection off and the
+uncut control, with expected flags computed independently of the rules. The census of the
+query case now reads every maximal literal of a clause, not only the first. A setting of the
+three switches and the Join exemption for a test's thread lets one test binary run every arm.
+The first three obligations, counting, the completeness of the repaired selection and the Eq
+and Factor query case stay open. A set of 1,500 generated ontologies built around them gives
+no answer that differs from HermiT 1.4.5. The rules are unchanged.
+
 ### SERVICE enhancer cache slices, disk tier, management functions and parallel requests
 
 The cache of remote SERVICE results keys an entry without the outermost LIMIT and OFFSET
