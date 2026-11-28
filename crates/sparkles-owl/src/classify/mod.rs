@@ -9350,6 +9350,12 @@ impl Saturation {
             // the kept contexts name the clauses of the last run's table by id
             Some(mut d) if reuse => {
                 debug_assert_eq!(d.eager, limits.expansion == Expansion::Eager);
+                // the repair's table lives as long as the rooted run's contexts, which no
+                // run keeps (item 1247)
+                debug_assert!(
+                    d.mtab.get().is_none(),
+                    "a kept run holds the repair's table"
+                );
                 d.begin_run();
                 d
             }

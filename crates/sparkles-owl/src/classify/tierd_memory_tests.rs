@@ -1332,7 +1332,7 @@ fn mrep_regs_rreach_replay_avoids_tombstone_rehash_and_credits_freed_vec() {
         "rreach must credit freed regs vectors back (credited={})",
         sink.credited
     );
-    let dl_bytes = super::dl_rules::dl(&st).expect("dl state").bytes();
+    let dl_bytes = super::dl_rules::dl(&st).expect("dl state").bytes() + run.mtab_bytes();
     assert_eq!(
         sink.live,
         std::mem::size_of::<super::saturate::Extra>() + dl_bytes,
@@ -1474,6 +1474,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
         // `head_bytes` (`32 * 8 = 256 B`) from the unwound TOP clause.
         let committed_st = std::mem::size_of::<super::saturate::Extra>()
             + super::dl_rules::dl(&st).map_or(0, |d| d.bytes())
+            + run2.mtab_bytes()
             + run2.lits.bytes();
         assert_eq!(
             live.load(Ordering::Relaxed),
@@ -1523,7 +1524,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
             );
             assert!(x.store.next(&ix3, Some(&ord), &mut max).is_some());
         }
-        let before_dl = super::dl_rules::dl(&st).unwrap().bytes();
+        let before_dl = super::dl_rules::dl(&st).unwrap().bytes() + run3.mtab_bytes();
         let live = Arc::new(AtomicUsize::new(0));
         let mut sink = PanicOnPollSink {
             run: &run3,
@@ -1536,7 +1537,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
             let _ = super::dl_root::rret(&ix3, &mut st, cid, &mut sink);
         }));
         assert!(res.is_err(), "expected simulated go_on panic inside rret");
-        let after_dl = super::dl_rules::dl(&st).unwrap().bytes();
+        let after_dl = super::dl_rules::dl(&st).unwrap().bytes() + run3.mtab_bytes();
         assert_eq!(
             live.load(Ordering::Relaxed),
             after_dl.saturating_sub(before_dl),
@@ -2006,7 +2007,8 @@ fn rreach_replay_callback_panic_drops_vec_before_crediting_retained_memory() {
         "detached registration vector must be deallocated before credit_dl runs"
     );
     let expected_live = std::mem::size_of::<super::saturate::Extra>()
-        + super::dl_rules::dl(&st).expect("dl state").bytes();
+        + super::dl_rules::dl(&st).expect("dl state").bytes()
+        + run.mtab_bytes();
     assert_eq!(
         live.load(Ordering::Relaxed),
         expected_live,
@@ -10595,4 +10597,112 @@ fn split_round4_pre_plan_counts_retained_split_metadata() {
     run.branch_neq = Box::new([(1, 2)]);
     let metadata = run.split_meta_bytes();
     assert_eq!(sat.pre_plan_live_bytes(0), before + metadata);
+}
+
+/// The ledger of the marker repair's table tests (item 1247).
+struct MTabLedger<'a> {
+    run: &'a DlRun,
+    live: usize,
+}
+
+impl Sink for MTabLedger<'_> {
+    fn send(&mut self, _: Ex, _: Concl) {}
+    fn me(&mut self, _: Concl) {}
+    fn dl(&self) -> &DlRun {
+        self.run
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        self.live += bytes;
+        true
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        assert!(kept <= admitted);
+        self.live -= admitted - kept;
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.live = self.live.saturating_sub(bytes);
+    }
+    fn worked(&mut self, _: usize) {}
+}
+
+/// Item 1247: a rooted run without the marker repair makes no table for the repair, and
+/// its contexts name no slot, while a run with it gives each context that holds repair
+/// state its own slot of the run's table, which the run's ledger holds.
+#[test]
+fn the_marker_repair_state_is_in_a_table_that_only_a_run_with_the_repair_makes() {
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let slot = |st: &State| super::dl_rules::dl(st).map_or(0, |x| x.mslot);
+    for mode in [0, MREPAIR_ON | super::dl_rules::MREPAIR_CF] {
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let mut sink = MTabLedger { run: &run, live: 0 };
+        let mut root_st = State::default();
+        super::dl_root::init(&ix, &mut root_st, &mut sink);
+        let mut ctxs: Vec<State> = (0..3).map(|_| State::default()).collect();
+        for (i, st) in ctxs.iter_mut().enumerate() {
+            let me = 100 + i as Ex;
+            assert!(super::dl_root::redge(&mut root_st, me, 0, &mut sink));
+            if mode != 0 {
+                assert!(super::dl_root::rreach(
+                    &ix,
+                    me,
+                    st,
+                    super::index::TOP,
+                    &mut sink
+                ));
+            }
+        }
+        let named: Vec<u32> = std::iter::once(&root_st)
+            .chain(&ctxs)
+            .map(slot)
+            .filter(|&s| s != 0)
+            .collect();
+        if mode == 0 {
+            assert!(
+                run.mtab.get().is_none(),
+                "a run without the repair made the table"
+            );
+            assert!(
+                named.is_empty(),
+                "a context names a slot without the repair"
+            );
+            assert_eq!(run.mtab_bytes(), 0);
+        } else {
+            let tab = run.mtab.get().expect("the repair makes its table");
+            assert_eq!(named.len(), 4, "the root and the three reached contexts");
+            let mut distinct = named.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct, named, "each context has a slot of its own");
+            assert_eq!(
+                tab.len(),
+                named.len(),
+                "a slot for each context that holds one"
+            );
+            assert!(run.mtab_bytes() > 0 && sink.live >= run.mtab_bytes());
+        }
+    }
+}
+
+/// A context's repair state is taken out of its slot once at a time (item 1247), so that a
+/// handler that reached its context's rules again while it held the state would panic in
+/// the tests rather than lose a change.
+#[test]
+#[should_panic(expected = "taken once at a time")]
+fn a_context_s_repair_state_is_taken_once_at_a_time() {
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let mut run = DlRun::new(false, Default::default());
+    run.mrepair = MREPAIR_ON;
+    let mut sink = MTabLedger { run: &run, live: 0 };
+    let mut st = State::default();
+    super::dl_root::init(&ix, &mut st, &mut sink);
+    let x = super::dl_rules::dl(&st).expect("dl state");
+    let _held = super::dl_root::mrep_get(x, &sink);
+    let _again = super::dl_root::mrep_get(x, &sink);
 }

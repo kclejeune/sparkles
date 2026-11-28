@@ -1074,6 +1074,8 @@ pub struct DlRun {
     /// [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and [`MREPAIR_NO_RETURN`]
     /// and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
     pub mrepair: u8,
+    /// the marker repair's state of the run's contexts, made with its first use (item 1247)
+    pub(super) mtab: std::sync::OnceLock<std::sync::Arc<super::dl_root::MTab>>,
     /// whether item 1061 phase 1 unit-only provenance-tagged shared root facts and
     /// constants-only successor replay deduplication are enabled (default off, behind
     /// `SPARKLES_ROOTED_SHARED_FACTS=1`)
@@ -1135,8 +1137,8 @@ pub const MREPAIR_NO_REPLAY: u8 = 64;
 /// arrival and late-premise replay. A product with a ground body then never arises, which
 /// would go back to the root and out again through each alternative condition of its body
 /// atoms. On whenever [`Limits::rooted_marker_repair`](super::Limits) is, which it is by
-/// default (`MREPAIR_ON | MREPAIR_CF`, items 1250 and 1231); `SPARKLES_ROOTED_MARKER_REPAIR=1` selects
-/// unfiltered [`MREPAIR_ON`] for comparison.
+/// default (`MREPAIR_ON | MREPAIR_CF`, items 1250 and 1231);
+/// `SPARKLES_ROOTED_MARKER_REPAIR=1` selects unfiltered [`MREPAIR_ON`] for comparison.
 pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
@@ -1162,6 +1164,12 @@ impl DlRun {
                     .len()
                     .saturating_mul(std::mem::size_of::<(u32, u32)>()),
             )
+    }
+    /// The bytes of the marker repair's table of the run's contexts, 0 without it, for tests
+    /// that recount the contexts' bytes.
+    #[cfg(test)]
+    pub(super) fn mtab_bytes(&self) -> usize {
+        self.mtab.get().map_or(0, |t| t.bytes())
     }
     pub fn bytes(&self) -> usize {
         self.table.unadmitted_bytes()
@@ -1734,6 +1742,10 @@ pub struct DlSt {
     /// carried remainder `< WORK_READS` of clause-blocker scan reads across calls so
     /// repeated short scans still accrue global work (item 896, R1a)
     blocker_reads: u8,
+    /// in a rooted run with row 1231's marker repair, one more than the index of the
+    /// context's slot in the run's [`MTab`](super::dl_root::MTab), 0 for none, which the
+    /// padding after the flags above holds (item 1247)
+    pub(super) mslot: u32,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
     pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor

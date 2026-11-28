@@ -7686,7 +7686,7 @@ mod horn_accounting_tests {
         assert!(out1.reserve_data(first));
         assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
 
-        let before_st = st.bytes();
+        let before_st = st.bytes() + dl.mtab_bytes();
         let retained;
         {
             let mut m2 = Marks::default();
@@ -7718,7 +7718,7 @@ mod horn_accounting_tests {
             // count and their sum is unchanged.
             let sizes = dl.table.get(cid).body().len() * std::mem::size_of::<usize>();
             assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
-            retained = st.bytes() - before_st;
+            retained = st.bytes() + dl.mtab_bytes() - before_st;
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
             assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
             assert_eq!(
