@@ -9861,3 +9861,90 @@ fn directional_string_function_compatibility_and_results() {
         assert_eq!(rows.len(), expected_count, "delta: {scan_q}");
     }
 }
+
+/// Cursor BIND reuse across batches answers what the eager executor answers, whether the
+/// keys repeat only across batches (sparse), within every batch (dense) or never (cheap
+/// and unique), with or without the expression cache. A tight memory budget either gives the
+/// same rows or refuses the query with a memory budget error, and with the expression cache,
+/// which BIND reuse needs, none of these queries is refused when ordinary evaluation fits.
+#[test]
+fn bind_reuse_across_batches_matches_eager_for_sparse_dense_and_unique_keys() {
+    const ROWS: usize = 40_960;
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..ROWS {
+        data += &format!(
+            "<urn:r:{i}> <urn:sparse> \"k{}\" ; <urn:dense> \"d{}\" ; <urn:unique> \"u{i}\" .\n",
+            i % 16_384,
+            i % 64
+        );
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let snap = store.snapshot();
+    let queries = [
+        "SELECT ?s ?h WHERE { ?s <urn:sparse> ?k BIND(SHA256(STR(?k)) AS ?h) }",
+        "SELECT ?s ?h WHERE { ?s <urn:dense> ?k BIND(UCASE(STR(?k)) AS ?h) }",
+        "SELECT ?s ?h WHERE { ?s <urn:unique> ?k BIND(STR(?k) AS ?h) }",
+    ];
+    for text in queries {
+        let eager = query(snap.clone(), text, &Default::default())
+            .unwrap()
+            .application_rows();
+        assert_eq!(eager.len(), ROWS, "{text}");
+        let eager = bag(eager);
+        let mut ordinary_fits = false;
+        for cache in [false, true] {
+            let optimizations = Some(sparkles_core::sparql::Optimizations {
+                expr_cache: cache,
+                ..Default::default()
+            });
+            for batch in [1000, 4096] {
+                let opts = QueryOptions {
+                    optimizations,
+                    ..Default::default()
+                };
+                let cursor = select_cursor(snap.clone(), text, &opts, &options(batch)).unwrap();
+                assert_eq!(
+                    bag(all(cursor)),
+                    eager,
+                    "{text} cache={cache} batch={batch}"
+                );
+            }
+            let tight = QueryOptions {
+                max_memory_bytes: Some(1 << 20),
+                optimizations,
+                ..Default::default()
+            };
+            let outcome =
+                select_cursor(snap.clone(), text, &tight, &options(4096)).and_then(|mut cursor| {
+                    let mut rows = Vec::new();
+                    while let Some(batch) = cursor.next_batch()? {
+                        for row in 0..batch.len() {
+                            rows.push(batch.row(row)?.values().to_vec());
+                        }
+                    }
+                    Ok(rows)
+                });
+            match outcome {
+                Ok(rows) => {
+                    assert_eq!(bag(rows), eager, "{text} cache={cache} under 1 MiB");
+                    ordinary_fits |= !cache;
+                }
+                Err(Error::BudgetExceeded(b)) => {
+                    assert_eq!(b.kind, BudgetKind::Memory);
+                    assert!(
+                        !(cache && ordinary_fits),
+                        "{text}: BIND reuse refused a query that ordinary evaluation fits"
+                    );
+                }
+                Err(other) => panic!("{text} cache={cache} under 1 MiB: {other}"),
+            }
+        }
+    }
+}

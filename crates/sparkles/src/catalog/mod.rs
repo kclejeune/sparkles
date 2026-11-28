@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -23,6 +23,7 @@ mod delete_fs;
 mod gate;
 #[cfg(test)]
 mod lifecycle_tests;
+mod registry_io;
 mod rename;
 mod restore;
 #[cfg(test)]
@@ -170,11 +171,11 @@ struct Entry {
 pub const CONFIG_FILE: &str = "config.json";
 
 #[derive(Serialize, Deserialize, Default)]
-struct Registry {
-    datasets: Vec<RegistryEntry>,
+struct Registry<R = crate::reasoning::ReasoningRecord> {
+    datasets: Vec<RegistryEntry<R>>,
 }
 #[derive(Serialize, Deserialize)]
-struct RegistryEntry {
+struct RegistryEntry<R = crate::reasoning::ReasoningRecord> {
     name: String,
     #[serde(rename = "type")]
     kind: DatasetKind,
@@ -182,8 +183,7 @@ struct RegistryEntry {
     id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revision: Option<Uuid>,
-    #[serde(default)]
-    reasoning: Option<crate::reasoning::ReasoningRecord>,
+    reasoning: Option<R>,
 }
 
 /// What `config.json` keeps for a persistent dataset whose store is closed while the
@@ -191,7 +191,56 @@ struct RegistryEntry {
 struct Detached {
     id: Option<Uuid>,
     revision: Option<Uuid>,
-    reasoning: Option<crate::reasoning::ReasoningRecord>,
+    reasoning: DetachedReasoning,
+}
+
+/// A row left closed by deferred startup already has a durable record in the
+/// registry. Keep only its location until a legacy root needs that fallback.
+#[derive(Clone)]
+enum DetachedReasoning {
+    Registry(RegistryRecord),
+    Current(Option<Arc<crate::reasoning::ReasoningRecord>>),
+}
+
+/// A slice of the registry file opened at startup. Atomic saves can replace
+/// its directory entry while a deferred dataset still needs the original bytes.
+#[derive(Clone)]
+struct RegistryRecord {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(test)]
+thread_local! { static SPAN_DECODE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+enum SavedRecord {
+    Open(Arc<crate::dataset::RecordedReasoning>),
+    Closed(DetachedReasoning),
+}
+
+impl DetachedReasoning {
+    fn read(&self) -> Result<Option<crate::reasoning::ReasoningRecord>> {
+        match self {
+            Self::Current(record) => Ok(record.as_deref().cloned()),
+            Self::Registry(record) => {
+                #[cfg(test)]
+                SPAN_DECODE_BYTES.set(SPAN_DECODE_BYTES.get() + record.len);
+                let mut file = record.file.lock();
+                file.seek(SeekFrom::Start(record.offset))?;
+                let reader = BufReader::new((&mut *file).take(record.len));
+                serde_json::from_reader(reader)
+                    .map(Some)
+                    .map_err(|e| Error::Corrupt(format!("{CONFIG_FILE}: {e}")))
+            }
+        }
+    }
+}
+
+impl From<Option<crate::reasoning::ReasoningRecord>> for DetachedReasoning {
+    fn from(record: Option<crate::reasoning::ReasoningRecord>) -> Self {
+        Self::Current(record.map(Arc::new))
+    }
 }
 
 /// Why a registered dataset is closed: the message, which names paths, and a stable
@@ -216,11 +265,14 @@ fn failure_kind(e: &Error) -> &'static str {
     }
 }
 
+type IndexSettingsSources = Arc<dyn Fn(&str) -> crate::store::IndexSettingsSource + Send + Sync>;
+
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     /// Keep the startup-verified database parent open for managed deletes.
     databases: Option<RecoveryDir>,
     options: RwLock<CatalogOptions>,
+    index_settings_sources: RwLock<Option<IndexSettingsSources>>,
     /// the caches every dataset opened by this catalog reads through
     caches: Option<SharedCaches>,
     /// the pool its datasets' queries take grants from
@@ -368,7 +420,8 @@ impl Catalog {
         let lock = lock_dir(&dir)?;
         let catalog_dir = RecoveryDir::open(&dir)?;
         let intents = delete::read_intents_at(&catalog_dir)?;
-        let registry = match read_registry_at(&catalog_dir)? {
+        let mut records = BTreeMap::new();
+        let registry = match read_registry_with_locations(&catalog_dir, Some(&mut records))? {
             Some(registry) => registry,
             None => {
                 let staged_swaps =
@@ -419,6 +472,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
+                index_settings_sources: Default::default(),
                 entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
@@ -442,7 +496,9 @@ impl Catalog {
                     Detached {
                         id: e.id,
                         revision: e.revision,
-                        reasoning: e.reasoning,
+                        reasoning: records
+                            .remove(&e.name)
+                            .map_or_else(|| None.into(), DetachedReasoning::Registry),
                     },
                 );
                 catalog.inner.opening.lock().insert(e.name.clone());
@@ -451,7 +507,7 @@ impl Catalog {
             }
             let ds = catalog.open_dataset(&e.name, e.kind, None)?;
             if ds.reasoning_record().is_none() {
-                *ds.state().reasoning.write() = e.reasoning;
+                ds.state().restore_reasoning(e.reasoning)?;
             }
             catalog.inner.entries.write().insert(
                 e.name,
@@ -518,17 +574,22 @@ impl Catalog {
         // them. The check above makes this lock infallible, so the dataset always
         // reaches its final state.
         let _g = self.manage_internal();
-        let result = match opened {
-            Ok(ds) => {
-                let reasoning = self
+        let opened = opened.and_then(|ds| {
+            if ds.state().read_reasoning().is_none() {
+                let fallback = self
                     .inner
                     .detached
                     .lock()
                     .get(name)
-                    .and_then(|d| d.reasoning.clone());
-                if ds.reasoning_record().is_none() {
-                    *ds.state().reasoning.write() = reasoning;
-                }
+                    .map(|entry| entry.reasoning.read())
+                    .transpose()?
+                    .flatten();
+                ds.state().restore_reasoning(fallback)?;
+            }
+            Ok(ds)
+        });
+        let result = match opened {
+            Ok(ds) => {
                 self.publish_reattached(name, ds);
                 Ok(())
             }
@@ -620,6 +681,7 @@ impl Catalog {
                     .pool_bytes
                     .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
+                index_settings_sources: Default::default(),
                 entries: Arc::new(RwLock::new(BTreeMap::new())),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
@@ -648,6 +710,21 @@ impl Catalog {
     /// Datasets that are already open keep their options.
     pub fn set_defaults(&self, dataset: DatasetOptions) {
         self.inner.options.write().dataset = dataset;
+    }
+    /// Supply the server's declared index settings to the catalog's stores.
+    #[doc(hidden)]
+    pub fn set_index_settings_sources(
+        &self,
+        source: impl Fn(&str) -> crate::store::IndexSettingsSource + Send + Sync + 'static,
+    ) {
+        let source = Arc::new(source);
+        *self.inner.index_settings_sources.write() = Some(source.clone());
+        for (name, entry) in self.inner.entries.read().iter() {
+            entry
+                .dataset
+                .store()
+                .set_index_settings_source(source(name));
+        }
     }
     pub fn dir(&self) -> Option<&Path> {
         self.inner.dir.as_deref()
@@ -896,23 +973,41 @@ impl Catalog {
             ..self.inner.options.read().dataset.clone()
         }
     }
+    fn index_settings_source(&self, name: &str) -> Option<crate::store::IndexSettingsSource> {
+        self.inner
+            .index_settings_sources
+            .read()
+            .as_ref()
+            .map(|source| source(name))
+    }
+    fn apply_index_settings_source(&self, name: &str, store: &Store) {
+        if let Some(source) = self.index_settings_source(name) {
+            store.set_index_settings_source(source);
+        }
+    }
     fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
         let mut opts = self.dataset_options(name);
         if let Some(c) = &self.inner.caches {
             opts.store.shared = Some(c.scope());
         }
         match kind {
-            DatasetKind::Memory => Ok(Dataset::from_store_with(
-                Store::in_memory(opts.store.clone()),
-                opts,
-            )),
-            DatasetKind::Persistent => Dataset::open_with(
-                match loc {
+            DatasetKind::Memory => {
+                let store = Store::in_memory(opts.store.clone());
+                self.apply_index_settings_source(name, &store);
+                Ok(Dataset::from_store_with(store, opts))
+            }
+            DatasetKind::Persistent => {
+                let root = match loc {
                     Some(p) => p.to_path_buf(),
                     None => self.database_dir(name)?,
-                },
-                opts,
-            ),
+                };
+                let store = Store::open_with_index_settings(
+                    &root,
+                    opts.store.clone(),
+                    self.index_settings_source(name),
+                )?;
+                Dataset::try_from_store_with(store, opts)
+            }
         }
     }
     /// Why a registered persistent dataset cannot be opened in place, when its root
@@ -943,7 +1038,8 @@ impl Catalog {
             opts.store.shared = Some(caches.scope());
         }
         let store = Store::open_existing(&self.database_dir(name)?, opts.store.clone(), expected)?;
-        Ok(Dataset::from_store_with(store, opts))
+        self.apply_index_settings_source(name, &store);
+        Dataset::try_from_store_with(store, opts)
     }
     fn require_determinate_registry(&self, name: &str) -> Result<()> {
         if self.inner.pending_registry_commits.lock().contains(name) {
@@ -1297,7 +1393,7 @@ impl Catalog {
             Detached {
                 id: Some(dataset.dataset_id()),
                 revision,
-                reasoning: dataset.reasoning_record(),
+                reasoning: dataset.reasoning_record().into(),
             },
         );
     }
@@ -1374,7 +1470,7 @@ impl Catalog {
             Detached {
                 id: Some(id),
                 revision,
-                reasoning,
+                reasoning: reasoning.into(),
             },
         );
         self.inner.refused.lock().insert(
@@ -1469,7 +1565,9 @@ impl Catalog {
                         kind: DatasetKind::Memory,
                         id: None,
                         revision: None,
-                        reasoning: entry.dataset.reasoning_record(),
+                        reasoning: Some(SavedRecord::Open(
+                            entry.dataset.state().recorded_reasoning(),
+                        )),
                     },
                 );
                 if let Err(e) = self
@@ -1481,6 +1579,7 @@ impl Catalog {
                 }
             }
             entry.dataset.alias = Some(Arc::from(to));
+            self.apply_index_settings_source(to, entry.dataset.store());
             observe(RenameEvent::Publishing(entry.dataset.state().open_id));
             self.inner.entries.write().insert(to.into(), entry);
             return Ok(self.get(to).expect("renamed"));
@@ -1525,7 +1624,7 @@ impl Catalog {
         let original = Detached {
             id: Some(id),
             revision,
-            reasoning,
+            reasoning: reasoning.into(),
         };
         if let Err(error) = rename::prepare(dir, from, to, id) {
             return Err(self.roll_back_rename(from, to, original, error, &mut observe));
@@ -1550,7 +1649,7 @@ impl Catalog {
                     Detached {
                         id: Some(id),
                         revision,
-                        reasoning: ds.reasoning_record(),
+                        reasoning: ds.reasoning_record().into(),
                     },
                 );
             }
@@ -1610,7 +1709,7 @@ impl Catalog {
                         Detached {
                             id: original.id,
                             revision: r.revision.or(original.revision),
-                            reasoning: r.reasoning,
+                            reasoning: r.reasoning.into(),
                         },
                     ),
                     None => (from.to_string(), original),
@@ -1710,8 +1809,9 @@ impl Catalog {
             origin: Some(origin),
             ..self.dataset_options(name)
         };
+        self.apply_index_settings_source(name, &store);
         let ds = Dataset::from_store_with(store, opts);
-        *ds.state().reasoning.write() = reasoning;
+        ds.state().restore_reasoning(reasoning)?;
         self.inner.entries.write().insert(
             name.into(),
             Entry {
@@ -1860,8 +1960,8 @@ impl Catalog {
         let _g = self.manage()?;
         self.save_locked()
     }
-    fn registry_locked(&self) -> Registry {
-        let mut datasets: Vec<RegistryEntry> = self
+    fn registry_locked(&self) -> Registry<SavedRecord> {
+        let mut datasets: Vec<_> = self
             .inner
             .entries
             .read()
@@ -1874,7 +1974,7 @@ impl Catalog {
                 revision: (e.kind == DatasetKind::Persistent)
                     .then_some(e.revision)
                     .flatten(),
-                reasoning: e.dataset.reasoning_record(),
+                reasoning: Some(SavedRecord::Open(e.dataset.state().recorded_reasoning())),
             })
             .collect();
         // A dataset closed for a swap or after a failed rename is still registered.
@@ -1885,14 +1985,14 @@ impl Catalog {
                     kind: DatasetKind::Persistent,
                     id: d.id,
                     revision: d.revision,
-                    reasoning: d.reasoning.clone(),
+                    reasoning: Some(SavedRecord::Closed(d.reasoning.clone())),
                 });
             }
         }
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
         Registry { datasets }
     }
-    fn replace_registry_locked(&self, dir: &Path, registry: &Registry) -> Result<()> {
+    fn replace_registry_locked(&self, dir: &Path, registry: &Registry<SavedRecord>) -> Result<()> {
         #[cfg(test)]
         if FAIL_REGISTRY_REPLACE.get() > 0 {
             FAIL_REGISTRY_REPLACE.set(FAIL_REGISTRY_REPLACE.get() - 1);
@@ -1900,10 +2000,7 @@ impl Catalog {
         }
         let _intent_lock = self.inner.delete_intents.lock();
         delete::settle_reused_identities(dir, registry)?;
-        let bytes = sparkles_core::formats::settings_to_vec(CONFIG_FILE, registry)?;
-        let path = dir.join(CONFIG_FILE);
-        let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-        Ok(sparkles_core::fsutil::replace_via(&path, &tmp, &bytes)?)
+        Ok(registry.replace(dir)?)
     }
 
     fn save_locked(&self) -> Result<()> {
@@ -1936,7 +2033,7 @@ impl Catalog {
             kind: DatasetKind::Persistent,
             id: Some(dataset.dataset_id()),
             revision,
-            reasoning: dataset.reasoning_record(),
+            reasoning: Some(SavedRecord::Open(dataset.state().recorded_reasoning())),
         };
         match registry
             .datasets
@@ -1989,7 +2086,7 @@ impl Catalog {
             Detached {
                 id: Some(ds.dataset_id()),
                 revision: entry.revision,
-                reasoning: ds.reasoning_record(),
+                reasoning: ds.reasoning_record().into(),
             },
         );
         Ok(Some(ds))
@@ -2186,31 +2283,124 @@ fn read_registry(dir: &Path) -> Result<Registry> {
 }
 
 fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
+    read_registry_with_locations(dir, None)
+}
+
+/// Identity checks during a save or delete only need the row headers. Serde
+/// skips each reasoning value directly from the buffered registry descriptor.
+fn read_registry_identities(dir: &RecoveryDir) -> Result<Option<Registry<serde::de::IgnoredAny>>> {
+    open_registry(dir)?
+        .map(|file| registry_identities(&file))
+        .transpose()
+}
+
+fn registry_identities(file: &File) -> Result<Registry<serde::de::IgnoredAny>> {
     #[derive(Deserialize)]
-    struct Header {
+    struct Index {
         format: Option<serde_json::Value>,
+        datasets: Vec<RegistryEntry<serde::de::IgnoredAny>>,
     }
-
-    use std::io::ErrorKind;
-
-    let mut file = match dir.open_file(OsStr::new(CONFIG_FILE), false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.kind() == ErrorKind::InvalidData => {
+    let mut input = BufReader::new(file);
+    let index: Index = match serde_json::from_reader(&mut input) {
+        Ok(index) => index,
+        Err(error) => {
+            // A newer format may have changed the row shape as well.
+            input.rewind()?;
+            if let Ok(header) = serde_json::from_reader::<_, RegistryHeader>(input) {
+                header.version()?;
+            }
             return Err(Error::Corrupt(format!("{CONFIG_FILE}: {error}")));
         }
-        Err(error) => return Err(error.into()),
+    };
+    let registry = Registry {
+        datasets: index.datasets,
+    };
+    validate_registry(
+        RegistryHeader {
+            format: index.format,
+        }
+        .version()?,
+        &registry,
+    )?;
+    Ok(registry)
+}
+
+fn open_registry(dir: &RecoveryDir) -> Result<Option<File>> {
+    match dir.open_file(OsStr::new(CONFIG_FILE), false) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            Err(Error::Corrupt(format!("{CONFIG_FILE}: {error}")))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_registry_with_locations(
+    dir: &RecoveryDir,
+    locations: Option<&mut BTreeMap<String, RegistryRecord>>,
+) -> Result<Option<Registry>> {
+    let Some(mut file) = open_registry(dir)? else {
+        return Ok(None);
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let corrupt = |error| Error::Corrupt(format!("{CONFIG_FILE}: {error}"));
-    let header: Header = serde_json::from_slice(&bytes).map_err(corrupt)?;
-    // Older catalog registries omit the version and persistent identities.
-    let format = sparkles_core::formats::check_settings(
-        CONFIG_FILE,
-        &serde_json::json!({ "format": header.format }),
-    )?;
+    let header: RegistryHeader = serde_json::from_slice(&bytes).map_err(corrupt)?;
+    let format = header.version()?;
     let registry: Registry = serde_json::from_slice(&bytes).map_err(corrupt)?;
+    validate_registry(format, &registry)?;
+    if let Some(locations) = locations
+        && registry
+            .datasets
+            .iter()
+            .any(|e| e.kind == DatasetKind::Persistent && e.reasoning.is_some())
+    {
+        // Borrow the raw JSON values to locate the validated records in the
+        // same immutable file. Nothing from the input buffer escapes this call.
+        #[derive(Deserialize)]
+        struct Spans<'a> {
+            #[serde(borrow)]
+            datasets: Vec<Row<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct Row<'a> {
+            #[serde(borrow)]
+            reasoning: Option<&'a serde_json::value::RawValue>,
+        }
+        let spans: Spans<'_> = serde_json::from_slice(&bytes).map_err(corrupt)?;
+        let file = Arc::new(Mutex::new(file));
+        for (row, span) in registry.datasets.iter().zip(spans.datasets) {
+            if row.kind == DatasetKind::Persistent
+                && let Some(raw) = span.reasoning
+            {
+                let value = raw.get();
+                locations.insert(
+                    row.name.clone(),
+                    RegistryRecord {
+                        file: file.clone(),
+                        offset: (value.as_ptr().addr() - bytes.as_ptr().addr()) as u64,
+                        len: value.len() as u64,
+                    },
+                );
+            }
+        }
+    }
+    Ok(Some(registry))
+}
+#[derive(Deserialize)]
+struct RegistryHeader {
+    format: Option<serde_json::Value>,
+}
+
+impl RegistryHeader {
+    fn version(self) -> Result<u32> {
+        // Older catalog registries omit the version and persistent identities.
+        crate::formats::check_settings(CONFIG_FILE, &serde_json::json!({ "format": self.format }))
+    }
+}
+
+fn validate_registry<R>(format: u32, registry: &Registry<R>) -> Result<()> {
     let mut names = BTreeSet::new();
     for entry in &registry.datasets {
         check_name(&entry.name)?;
@@ -2227,8 +2417,9 @@ fn read_registry_at(dir: &RecoveryDir) -> Result<Option<Registry>> {
             )));
         }
     }
-    Ok(Some(registry))
+    Ok(())
 }
+
 /// Take the catalog lock of a data directory without opening its datasets, for offline
 /// commands on a stopped server. The lock is held until the returned guard is dropped.
 /// A running server holds it, so this fails with [`Error::Locked`] while one runs.
@@ -2481,6 +2672,7 @@ pub(super) fn record_dir_sync(dir: &Path) {
 pub(super) fn take_catalog_dir_syncs() -> Vec<PathBuf> {
     CATALOG_DIR_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
+#[cfg(test)]
 fn write_registry(dir: &Path, reg: &Registry) -> Result<()> {
     write_file_atomic(
         &dir.join(CONFIG_FILE),
@@ -2535,6 +2727,93 @@ mod tests {
         BETWEEN_STATES.set(None);
         assert_eq!(seen.get(), 2);
         assert!(cat.get("a").is_some() && cat.refusal("bad").is_some());
+    }
+
+    #[test]
+    fn refused_deferred_record_stays_on_disk_and_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let warning = "x".repeat(64 << 10);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        for name in ["modern", "legacy"] {
+            let ds = cat.create(name, &Default::default()).unwrap();
+            ds.state()
+                .set_reasoning(Some(crate::reasoning::ReasoningRecord {
+                    warnings: vec![warning.clone()],
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        cat.save().unwrap();
+        drop(cat);
+        let config = dir.path().join(CONFIG_FILE);
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        for row in registry["datasets"].as_array_mut().unwrap() {
+            row["reasoning"]["extension"] = "preserve the original JSON".into();
+        }
+        std::fs::write(&config, serde_json::to_vec(&registry).unwrap()).unwrap();
+        std::fs::remove_file(dir.path().join("databases/legacy/reasoning.json")).unwrap();
+        let (cat, pending) = Catalog::open_deferred(
+            dir.path(),
+            CatalogOptions {
+                memory: MemoryOptions {
+                    pool_bytes: Some(1024),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for name in &pending {
+            assert!(matches!(
+                cat.open_registered(name),
+                Err(Error::BudgetExceeded(_))
+            ));
+        }
+        assert_eq!(cat.closed(), ["legacy", "modern"]);
+        assert_eq!(cat.pool().unwrap().domain_stats().work_reserved, 0);
+        assert!(
+            cat.inner
+                .detached
+                .lock()
+                .values()
+                .all(|entry| matches!(entry.reasoning, DetachedReasoning::Registry(_))),
+            "a refused record is still resident in the detached catalog"
+        );
+        SPAN_DECODE_BYTES.set(0);
+        let unrelated = cat.create("unrelated", &Default::default()).unwrap();
+        let id = unrelated.dataset_id();
+        drop(unrelated);
+        cat.save().unwrap();
+        // Bind a pre-identity row while the other records are refused. Its
+        // replacement must preserve the exact durable payload of each other row.
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        legacy["datasets"][2].as_object_mut().unwrap().remove("id");
+        std::fs::write(&config, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        delete::bind_registry_identity(dir.path(), "unrelated", id).unwrap();
+        let bound: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(bound["datasets"][2]["id"], id.to_string());
+        assert_eq!(
+            &bound["datasets"].as_array().unwrap()[..2],
+            registry["datasets"].as_array().unwrap()
+        );
+        assert!(cat.delete("unrelated").unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        assert_eq!(saved["datasets"], registry["datasets"]);
+        assert_eq!(
+            SPAN_DECODE_BYTES.get(),
+            0,
+            "save decoded refused record bytes"
+        );
+        drop(cat);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        for name in pending {
+            let ds = cat.get(&name).unwrap();
+            assert_eq!(ds.reasoning_record().unwrap().warnings, [warning.as_str()]);
+        }
     }
 
     #[test]

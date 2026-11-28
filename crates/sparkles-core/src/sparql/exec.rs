@@ -125,6 +125,90 @@ pub(super) fn map_batch<T: Send>(
     par: bool,
     f: impl Fn(usize) -> T + Sync + Send,
 ) -> Result<Vec<T>> {
+    map_batch_split(ctx, n, par, f).map(|(out, _)| out)
+}
+
+/// The times of a batch that [`map_batch`] split: its timed sample on the calling thread
+/// and the rest on the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Split {
+    pub(super) sample_rows: usize,
+    pub(super) sample_nanos: u128,
+    pub(super) rest_rows: usize,
+    pub(super) rest_nanos: u128,
+}
+
+/// Classification of a [`Split`] observation against its serial sample projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitOutcome {
+    /// Pool finished clearly faster than the serial projection (`10 * Q <= 9 * P`).
+    ClearWin,
+    /// Pool finished clearly slower than the serial projection (`5 * Q >= 6 * P`).
+    ClearLoss,
+    /// Pool finished within the deadband between 90% and 120% of the serial projection.
+    Inconclusive,
+    /// Zero duration, zero row count, or arithmetic overflow: unusable as policy evidence.
+    Unknown,
+}
+
+impl Split {
+    /// Whether the pool mapped the rest faster than the calling thread would have, at the
+    /// rate of the timed sample (`rest_nanos * sample_rows < sample_nanos * rest_rows`). A
+    /// cheap expression whose evaluation contends across threads, such as STR of IRIs
+    /// interning their strings, can run slower split. Returns `None` for zero or
+    /// overflowing inputs.
+    pub(super) fn valid_paid(&self) -> Option<bool> {
+        if self.sample_rows == 0
+            || self.rest_rows == 0
+            || self.sample_nanos == 0
+            || self.rest_nanos == 0
+        {
+            return None;
+        }
+        let p = self.sample_nanos.checked_mul(self.rest_rows as u128)?;
+        let q = self.rest_nanos.checked_mul(self.sample_rows as u128)?;
+        Some(q < p)
+    }
+
+    /// Classify the split against a 20% clear-loss margin and a 10% clear-win margin,
+    /// treating zero or overflowing inputs as unknown evidence.
+    pub(super) fn classify(&self) -> SplitOutcome {
+        if self.sample_rows == 0
+            || self.rest_rows == 0
+            || self.sample_nanos == 0
+            || self.rest_nanos == 0
+        {
+            return SplitOutcome::Unknown;
+        }
+        let Some(p) = self.sample_nanos.checked_mul(self.rest_rows as u128) else {
+            return SplitOutcome::Unknown;
+        };
+        let Some(q) = self.rest_nanos.checked_mul(self.sample_rows as u128) else {
+            return SplitOutcome::Unknown;
+        };
+        let (Some(q5), Some(p6)) = (q.checked_mul(5), p.checked_mul(6)) else {
+            return SplitOutcome::Unknown;
+        };
+        if q5 >= p6 {
+            return SplitOutcome::ClearLoss;
+        }
+        let (Some(q10), Some(p9)) = (q.checked_mul(10), p.checked_mul(9)) else {
+            return SplitOutcome::Unknown;
+        };
+        if q10 <= p9 {
+            return SplitOutcome::ClearWin;
+        }
+        SplitOutcome::Inconclusive
+    }
+}
+
+/// [`map_batch`], also returning the times of a batch whose rest it mapped on the pool.
+pub(super) fn map_batch_split<T: Send>(
+    ctx: &Ctx,
+    n: usize,
+    par: bool,
+    f: impl Fn(usize) -> T + Sync + Send,
+) -> Result<(Vec<T>, Option<Split>)> {
     let sample = n.min(BATCH_SAMPLE_ROWS);
     let rest = n - sample;
     let mut out = Vec::with_capacity(n);
@@ -134,9 +218,10 @@ pub(super) fn map_batch<T: Send>(
     let may_split = par && batch_may_split(n) && rayon::current_num_threads() > 1;
     let t0 = may_split.then(Instant::now);
     out.extend((0..sample).map(&f));
+    let sampled = t0.map(|t0| t0.elapsed().as_nanos());
     ctx.check()?;
-    if let Some(t0) = t0
-        && t0.elapsed().as_nanos() * rest as u128 >= BATCH_PAR_NANOS * sample as u128
+    if let Some(sample_nanos) = sampled
+        && sample_nanos * rest as u128 >= BATCH_PAR_NANOS * sample as u128
     {
         // Each piece of the rest is its own vector until it is appended to `out`, which
         // already holds room for every row, so the pieces are the memory this adds.
@@ -148,6 +233,7 @@ pub(super) fn map_batch<T: Send>(
                     .saturating_mul(std::mem::size_of::<Result<Vec<T>>>() as u64 + 16),
             );
         if let Ok(_scratch) = ctx.charge(bytes) {
+            let t1 = Instant::now();
             // an indexed collect writes each piece's slot in place
             let pieces: Vec<Result<Vec<T>>> = starts
                 .into_par_iter()
@@ -156,11 +242,18 @@ pub(super) fn map_batch<T: Send>(
                     Ok((start..(start + BATCH_PAR_PIECE).min(n)).map(&f).collect())
                 })
                 .collect();
+            let rest_nanos = t1.elapsed().as_nanos();
             for piece in pieces {
                 out.extend(piece?);
             }
             ctx.check()?;
-            return Ok(out);
+            let split = Split {
+                sample_rows: sample,
+                sample_nanos,
+                rest_rows: rest,
+                rest_nanos,
+            };
+            return Ok((out, Some(split)));
         }
     }
     let mut start = sample;
@@ -171,7 +264,7 @@ pub(super) fn map_batch<T: Send>(
         start = end;
     }
     ctx.check()?;
-    Ok(out)
+    Ok((out, None))
 }
 
 /// [`map_batch`] writing directly into an already-allocated output slice `out` for
@@ -6698,7 +6791,7 @@ fn try_sample_floors(
 
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
-/// each string's floor ([`Ctx::string_floor`]), which the query's floor cache keeps for
+/// each string's floor ([`Ctx::try_string_floor_in`]), which the query's floor cache keeps for
 /// each distinct id across tables and the batches of a cursor (see
 /// [`super::ctx::FloorCache`]), so neither column is decoded. When the floor table's hit
 /// rate stays low, a mask bypasses the table and compares the two vocabulary keys
@@ -6706,8 +6799,9 @@ fn try_sample_floors(
 /// that repeat across later batches re-enable floors. A row with another kind of value is
 /// evaluated as the generic filter would. `None` when the table is small or its first
 /// rows hold other values, so that the generic filter decodes the columns instead. The
-/// floors and direct comparisons decode inside the envelope, and a refused decode fails
-/// the mask with the refusal it recorded.
+/// floors and direct comparisons decode inside the envelope. A refused floor lookup is
+/// optional work, so its row falls back to the direct comparison, and only a refusal of
+/// that comparison's required decoding fails the mask with the refusal it recorded.
 fn string_order_mask(
     ctx: &Ctx,
     t: &Table,
@@ -7087,6 +7181,22 @@ fn string_order_mask(
     Ok(Some(keep))
 }
 
+/// Execution metadata from [`compute_column_controlled`], kept separate from EXPLAIN's
+/// `Report::counted` (which records original input rows and exact distinct inputs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ColumnEval {
+    /// Rows actually evaluated by the expression closure (distinct rows when per-batch
+    /// reuse ran, or the full input length on row fallback).
+    pub(super) evaluated_rows: usize,
+    /// Full column-evaluation elapsed time in nanoseconds, recorded only when the caller
+    /// requested timing for an evaluation of at least [`super::exprcache::MIN_ROWS`] rows.
+    pub(super) elapsed_nanos: Option<u128>,
+    /// Sampled split timing when the row evaluator actually split a batch onto the pool.
+    pub(super) split: Option<Split>,
+    /// Whether the caller permitted parallel execution for this evaluation.
+    pub(super) parallel_allowed: bool,
+}
+
 /// BIND: the value of `e` on every row (unbound on an error), once per distinct input
 /// value when the expression is pure over one variable.
 pub(super) fn compute_column(
@@ -7122,7 +7232,61 @@ pub(super) fn compute_column(
     }
 }
 
-fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+/// [`compute_column`] under a caller-supplied scheduling policy. The same row-evaluation
+/// callback serves both [`super::exprcache::column`]'s per-batch distinct pass and the
+/// ordinary row fallback, reporting actual evaluated-row count, optional full-column
+/// elapsed time and any sampled [`Split`] separately from `report`.
+pub(super) fn compute_column_controlled(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut ExprReport,
+    allow_parallel: impl Fn(usize) -> bool,
+    time_eval: impl Fn(usize) -> bool,
+) -> Result<(Vec<Id>, ColumnEval)> {
+    // A variable copies its column, as in [`compute_column`], and evaluates nothing.
+    if matches!(e, Expr::Var(_)) {
+        return Ok((compute_column(ctx, t, e, report)?, ColumnEval::default()));
+    }
+    if let Some(col) = super::exists::column(ctx, t, e)? {
+        return Ok((col, ColumnEval::default()));
+    }
+    let mut obs = ColumnEval::default();
+    let col = {
+        let mut eval_rows = |rows: &Table| -> Result<Vec<Id>> {
+            let n = rows.len();
+            let par = allow_parallel(n);
+            let t0 = (n >= super::exprcache::MIN_ROWS && time_eval(n)).then(Instant::now);
+            let (values, split) = column_rows_split(ctx, rows, e, par)?;
+            let elapsed_nanos = t0.map(|t0| t0.elapsed().as_nanos());
+            obs = ColumnEval {
+                evaluated_rows: n,
+                elapsed_nanos,
+                split,
+                parallel_allowed: par,
+            };
+            Ok(values)
+        };
+        match super::exprcache::column(ctx, t, e, report, &mut eval_rows)? {
+            Some(ids) => ids,
+            None => eval_rows(t)?,
+        }
+    };
+    Ok((col, obs))
+}
+
+pub(super) fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+    column_rows_split(ctx, t, e, true).map(|(values, _)| values)
+}
+
+/// [`column_rows`], which spreads rows over the pool only when `par` allows it, and also
+/// returns the times of a batch of at most [`PAR_THRESHOLD`] rows that it split.
+pub(super) fn column_rows_split(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    par: bool,
+) -> Result<(Vec<Id>, Option<Split>)> {
     let nested = super::exists::nested(ctx, t, &[e])?;
     let exists = nested.as_ref().map(|n| &n.answers);
     let dec = decode_for(ctx, t, &[e])?;
@@ -7141,10 +7305,129 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
         Ok(v) => v.into_id(ctx),
         Err(_) => Id::UNDEF,
     };
+    let par = par && e.parallel();
     if t.len() <= PAR_THRESHOLD {
-        return map_batch(ctx, t.len(), batch_may_split(t.len()) && e.parallel(), f);
+        return map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f);
     }
-    map_rows(ctx, t.len(), e.parallel(), f)
+    Ok((map_rows(ctx, t.len(), par, f)?, None))
+}
+
+/// The result of [`column_rows_split_optional`].
+pub(super) enum OptionalColumn {
+    /// Every row was evaluated without a refusal of memory.
+    Complete(Vec<Id>, Option<Split>),
+    /// A refusal of memory met at least one row. Each row that finished without a
+    /// refusal holds its value, which is final and whose terms are interned. Each refused
+    /// row, and each row that a refusal on another row skipped, holds the caller's
+    /// `unevaluated` marker.
+    Refused(Vec<Id>),
+}
+
+/// [`column_rows_split`] for the misses of an optional cache, such as cursor BIND reuse.
+/// Each row runs as [`Ctx::optional_eval`], so a refusal of memory that the evaluation
+/// meets, whether it interns the result or a term on the way to it, grows a decode
+/// envelope or a regular expression cache, is not recorded as the query's memory
+/// failure. After the refusal the row's expression takes no arm that the ordinary
+/// evaluation would skip, and its value is not interned. The rows that start after a
+/// refusal are not evaluated, and [`OptionalColumn::Refused`] marks them and the refused
+/// rows with `unevaluated`, which must be an id that no term carries. The rows that
+/// finished keep their values, so the caller releases its optional state and evaluates
+/// only the marked rows the ordinary way (see [`with_row_eval`]), without repeating the
+/// work of the finished rows. An unfinished row that interned an intermediate term after
+/// an earlier transient allocation before refusing can still repeat that transient
+/// allocation on retry beside the retained intermediate term (roadmap item 1322). On one worker the finished rows are the rows before the
+/// refused one. On several, they are the rows that finished while the refusal stopped
+/// the others. The caller checks the context before it uses the values, since a
+/// cancellation or a latched failure leaves `UNDEF` in rows that look finished.
+/// Expressions that an optional cache admits are pure, so none has an EXISTS that hands
+/// work to the pool, and they construct no geometry, whose charge would outlast a
+/// refused row.
+pub(super) fn column_rows_split_optional(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    par: bool,
+    unevaluated: Id,
+) -> Result<OptionalColumn> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    debug_assert!(nested.is_none(), "an optional cache admits no EXISTS");
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let dec = decode_for(ctx, t, &[e])?;
+    let map = t.var_map(ctx.nvars());
+    let refused = std::sync::atomic::AtomicBool::new(false);
+    let f = |i: usize| {
+        if refused.load(AtomicOrdering::Relaxed) {
+            return unevaluated;
+        }
+        let (id, refusal) = ctx.optional_eval(|| {
+            match eval(
+                e,
+                &Row {
+                    table: t,
+                    i,
+                    map: &map,
+                    dec: Decoded::cols(&dec),
+                    exists,
+                },
+                ctx,
+            ) {
+                // A refused row's value is discarded, so it is not interned.
+                Ok(_) if ctx.has_memory_failure() => Id::UNDEF,
+                Ok(v) => v.into_id(ctx),
+                Err(_) => Id::UNDEF,
+            }
+        });
+        if refusal {
+            refused.store(true, AtomicOrdering::Relaxed);
+            return unevaluated;
+        }
+        id
+    };
+    let par = par && e.parallel();
+    let (values, split) = if t.len() <= PAR_THRESHOLD {
+        map_batch_split(ctx, t.len(), batch_may_split(t.len()) && par, f)?
+    } else {
+        (map_rows(ctx, t.len(), par, f)?, None)
+    };
+    Ok(if refused.into_inner() {
+        OptionalColumn::Refused(values)
+    } else {
+        OptionalColumn::Complete(values, split)
+    })
+}
+
+/// Call `body` with the ordinary evaluation of one row of `t` at a time, on this
+/// thread, for the rows of an optional cache that a refusal left unevaluated (see
+/// [`column_rows_split_optional`]). Each row is evaluated and interned as
+/// [`column_rows_split`] evaluates it, so a refusal of memory fails the query as it
+/// would without the cache. The rows read their terms as they need them, with no
+/// decoded columns of the whole table, whose charge would stand beside the evaluation
+/// of a few remaining keys where the evaluation without the cache decodes only the
+/// distinct ones. `body` polls cancellation and the deadline itself.
+pub(super) fn with_row_eval<R>(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    body: impl FnOnce(&dyn Fn(usize) -> Id) -> Result<R>,
+) -> Result<R> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
+    let map = t.var_map(ctx.nvars());
+    let f = |i: usize| match eval(
+        e,
+        &Row {
+            table: t,
+            i,
+            map: &map,
+            dec: None,
+            exists,
+        },
+        ctx,
+    ) {
+        Ok(v) => v.into_id(ctx),
+        Err(_) => Id::UNDEF,
+    };
+    body(&f)
 }
 
 #[cfg(test)]
@@ -17750,6 +18033,488 @@ mod string_order_tests {
             assert!(ctx.check().is_ok());
         });
     }
+
+    /// The `k`th of the mixed strings, distinct for every `k`. They hold ASCII, two-,
+    /// three- and four-byte UTF-8, a combining mark and long keys that share a long
+    /// prefix, so their code point order crosses every byte length.
+    fn mixed_string(k: usize) -> String {
+        match k % 6 {
+            0 => format!("k{k:05}"),
+            1 => format!("é{k}"),
+            2 => format!("日本{k}"),
+            3 => format!("\u{1F600}{k}"),
+            4 => format!("e\u{301}{k}"),
+            _ if k % 60 == 5 => format!("L{}{k}", "x".repeat(5000)),
+            _ => format!("L{}{k}", "x".repeat(600 + k % 13)),
+        }
+    }
+
+    /// A store of mixed strings and other terms in one vocabulary codec.
+    struct MixedCorpus {
+        store: Store,
+        /// Strings that the rows of rarely repeating pairs use at most once.
+        general: Vec<Id>,
+        /// A string and one of its proper extensions, beginning with the empty string.
+        prefix_pairs: Vec<(Id, Id)>,
+        /// Language-tagged, directional, typed, numeric and IRI terms.
+        others: Vec<Id>,
+        /// Pairs of language-tagged literals with one tag and pairs of integers, which the
+        /// generic comparison orders, with their order.
+        comparable: Vec<([Id; 2], Ordering)>,
+        /// The lexical form of every stored simple literal, by its id.
+        text: std::collections::HashMap<u64, String>,
+    }
+
+    fn mixed_corpus(codec: crate::builder::VocabCodec) -> MixedCorpus {
+        use crate::builder::BuildOptions;
+        use oxrdf::{BaseDirection, Literal, NamedNode, Term};
+        use std::fmt::Write;
+        const GENERAL: usize = 8000;
+        const PREFIXES: usize = 256;
+        let general: Vec<String> = (0..GENERAL).map(mixed_string).collect();
+        let prefix_pairs: Vec<(String, String)> = (0..PREFIXES)
+            .map(|j| {
+                let base = if j == 0 {
+                    String::new()
+                } else {
+                    format!("q{j}")
+                };
+                let ext = match j % 3 {
+                    0 => format!("{base}a"),
+                    1 => format!("{base}é"),
+                    _ => format!("{base}\u{1F600}"),
+                };
+                (base, ext)
+            })
+            .collect();
+        let others: Vec<Term> = vec![
+            Literal::new_language_tagged_literal("k00001", "en")
+                .unwrap()
+                .into(),
+            Literal::new_language_tagged_literal("é1", "en-us")
+                .unwrap()
+                .into(),
+            Literal::new_directional_language_tagged_literal("q1", "ar", BaseDirection::Rtl)
+                .unwrap()
+                .into(),
+            Literal::new_typed_literal("k00002", NamedNode::new("urn:dt").unwrap()).into(),
+            Literal::new_typed_literal("5", oxrdf::vocab::xsd::INTEGER).into(),
+            NamedNode::new("urn:iri").unwrap().into(),
+        ];
+        let en = |s: &str| -> Term {
+            Literal::new_language_tagged_literal(s, "en")
+                .unwrap()
+                .into()
+        };
+        let int =
+            |s: &str| -> Term { Literal::new_typed_literal(s, oxrdf::vocab::xsd::INTEGER).into() };
+        let comparable: Vec<(Term, Term, Ordering)> = vec![
+            (en("k00001"), en("k00009"), Ordering::Less),
+            (en("k00009"), en("k00001"), Ordering::Greater),
+            (en("k00009"), en("k00009"), Ordering::Equal),
+            (int("5"), int("10"), Ordering::Less),
+            (int("10"), int("5"), Ordering::Greater),
+            (int("10"), int("10"), Ordering::Equal),
+        ];
+        let simple = |s: &str| -> Term { Literal::new_simple_literal(s).into() };
+        let strings: Vec<Term> = general
+            .iter()
+            .chain(prefix_pairs.iter().flat_map(|(a, b)| [a, b]))
+            .map(|s| simple(s))
+            .collect();
+        let mut nt = String::new();
+        let comparable_terms = comparable.iter().flat_map(|(a, b, _)| [a, b]);
+        for (i, term) in strings
+            .iter()
+            .chain(&others)
+            .chain(comparable_terms)
+            .enumerate()
+        {
+            writeln!(nt, "<urn:s:{i}> <urn:p> {term} .").unwrap();
+        }
+        let store = Store::in_memory(StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(codec),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.generation.vocab_codec(), codec);
+        let mut text = std::collections::HashMap::new();
+        let mut id_of = |s: &str| {
+            let id = snap.lookup_term(&simple(s)).unwrap();
+            assert_eq!(id.tag(), Tag::Vocab, "{s:?}");
+            text.insert(id.0, s.to_string());
+            id
+        };
+        let general: Vec<Id> = general.iter().map(|s| id_of(s)).collect();
+        let prefix_pairs: Vec<(Id, Id)> = prefix_pairs
+            .iter()
+            .map(|(a, b)| (id_of(a), id_of(b)))
+            .collect();
+        let others = others
+            .iter()
+            .map(|term| snap.lookup_term(term).unwrap())
+            .collect();
+        let comparable = comparable
+            .iter()
+            .map(|(a, b, ord)| {
+                let pair = [snap.lookup_term(a).unwrap(), snap.lookup_term(b).unwrap()];
+                assert!(pair.iter().all(|id| !text.contains_key(&id.0)), "{a} {b}");
+                (pair, *ord)
+            })
+            .collect();
+        drop(snap);
+        MixedCorpus {
+            store,
+            general,
+            prefix_pairs,
+            others,
+            comparable,
+            text,
+        }
+    }
+
+    /// `STRING_ORDER_ROWS` rows of string pairs. Rarely repeating rows pair a string with
+    /// its proper extension in every 16th row and otherwise use every general string at
+    /// most once, except that the empty string and one long key also fill the first two
+    /// rows of equal strings. Repeating rows draw both sides from 80 strings. In both
+    /// layouts every 64th row compares a string with itself. After the sample, every 61st
+    /// row holds another kind of term on one side, and every 61st row at another offset
+    /// holds a pair that the generic comparison orders.
+    fn mixed_rows(c: &MixedCorpus, repeat: bool) -> Vec<[Id; 2]> {
+        let g = &c.general;
+        let pick = |k: usize| g[k * 7919 % g.len()];
+        let hot: Vec<Id> = (0..48)
+            .map(|k| g[k * 167 % g.len()])
+            .chain(c.prefix_pairs.iter().take(16).flat_map(|&(a, b)| [a, b]))
+            .collect();
+        let mut next = 0;
+        let mut equal = 0;
+        (0..STRING_ORDER_ROWS)
+            .map(|i| {
+                let mut row = if repeat {
+                    let a = hot[i * 7 % hot.len()];
+                    if i % 64 == 33 {
+                        [a, a]
+                    } else {
+                        [a, hot[(i * 13 + 5) % hot.len()]]
+                    }
+                } else if i % 64 == 33 {
+                    // the empty string, a key of 5,000 bytes, then unused general strings
+                    let a = match equal {
+                        0 => c.prefix_pairs[0].0,
+                        1 => g[5],
+                        _ => {
+                            next += 1;
+                            pick(next - 1)
+                        }
+                    };
+                    equal += 1;
+                    [a, a]
+                } else if i % 16 == 7 {
+                    let (a, b) = c.prefix_pairs[i / 16];
+                    if (i / 16).is_multiple_of(2) {
+                        [a, b]
+                    } else {
+                        [b, a]
+                    }
+                } else {
+                    next += 2;
+                    [pick(next - 2), pick(next - 1)]
+                };
+                if i >= STRING_ORDER_SAMPLE && i % 61 == 3 {
+                    row[(i / 61) % 2] = c.others[(i / 61) % c.others.len()];
+                } else if i >= STRING_ORDER_SAMPLE && i % 61 == 31 {
+                    row = c.comparable[(i / 61) % c.comparable.len()].0;
+                }
+                row
+            })
+            .collect()
+    }
+
+    /// Bypassed direct comparisons and floors keep the rows that the generic filter and
+    /// code point order keep, over ASCII, multi-byte UTF-8, combining marks, proper
+    /// prefixes, equal strings, long keys and interleaved language-tagged, directional,
+    /// typed and IRI terms, in both vocabulary codecs, for all four operators and in both
+    /// modes. Rows of language-tagged literals with one tag and rows of integers keep the
+    /// rows that their known order keeps, so the generic fallback keeps some of them.
+    /// Pairs that rarely repeat bypass the floor table without allocating it, and pairs
+    /// that repeat keep their floors in it.
+    #[test]
+    fn mixed_strings_compare_exactly_whether_floors_are_bypassed_or_kept() {
+        use super::super::expr::CmpOp;
+        use crate::builder::VocabCodec;
+        for codec in [VocabCodec::Front, VocabCodec::Fsst] {
+            let c = mixed_corpus(codec);
+            for repeat in [false, true] {
+                let rows = mixed_rows(&c, repeat);
+                for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                    for cursor in [false, true] {
+                        let label = format!("{codec:?} repeat {repeat} {op:?} cursor {cursor}");
+                        let mut ctx = Ctx::new(c.store.snapshot());
+                        ctx.mem_limit = 64 << 20;
+                        if cursor {
+                            ctx.enable_cursor_accounting().unwrap();
+                        }
+                        let (x, y) = (ctx.var("x"), ctx.var("y"));
+                        let mut t = Table::new(vec![x, y]);
+                        for row in &rows {
+                            t.push_row(row);
+                        }
+                        let e = cmp(x, y, op);
+                        let mask = string_order_mask(&ctx, &t, (x, y), op, &e)
+                            .unwrap()
+                            .unwrap_or_else(|| panic!("{label}: the mask applies"));
+                        let generic =
+                            evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                        assert_eq!(mask, generic, "{label}");
+                        let keep = |ord: Ordering| match op {
+                            CmpOp::Lt => ord.is_lt(),
+                            CmpOp::Le => ord.is_le(),
+                            CmpOp::Gt => ord.is_gt(),
+                            CmpOp::Ge => ord.is_ge(),
+                        };
+                        let (mut strings, mut equal) = (0, 0);
+                        let (mut ordered, mut ordered_kept) = (0, 0);
+                        for (i, row) in rows.iter().enumerate() {
+                            let [a, b] = row;
+                            if let Some((_, ord)) = c.comparable.iter().find(|(p, _)| p == row) {
+                                assert_eq!(mask[i], keep(*ord), "{label} row {i}: {ord:?}");
+                                ordered += 1;
+                                ordered_kept += usize::from(mask[i]);
+                                continue;
+                            }
+                            let (Some(sa), Some(sb)) = (c.text.get(&a.0), c.text.get(&b.0)) else {
+                                continue;
+                            };
+                            let ord = sa.as_str().cmp(sb.as_str());
+                            assert_eq!(mask[i], keep(ord), "{label} row {i}: {sa:?} {op:?} {sb:?}");
+                            strings += 1;
+                            equal += usize::from(ord.is_eq());
+                        }
+                        assert!(strings > rows.len() * 9 / 10, "{label}: {strings}");
+                        // every 64th row, less the few that rows of other terms replace
+                        assert!(equal > rows.len() / 128, "{label}: {equal} equal rows");
+                        assert!(
+                            0 < ordered_kept && ordered_kept < ordered,
+                            "{label}: {ordered_kept} of {ordered} ordered other rows kept"
+                        );
+                        let cache = ctx.floor_cache();
+                        if repeat {
+                            assert_eq!(cache.bypassed(), 0, "{label}");
+                            assert!(cache.entries() > 0, "{label}");
+                        } else {
+                            assert_eq!(cache.bypassed(), 1, "{label}");
+                            assert_eq!(cache.slots(), 0, "{label}: the table stays deferred");
+                            assert_eq!(cache.used(), 0, "{label}");
+                        }
+                        assert!(ctx.check().is_ok(), "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One thread and four give the same masks and leave the floor cache with the same
+    /// bypass count, slots, entries, table bytes and reservation and the query with the
+    /// same retained charge after every mask, for a stream of pairs that rarely repeat
+    /// and for a stream of pairs that repeat. Each mask has one row more than
+    /// `PAR_THRESHOLD`, so the four-thread arm always splits the rows after the sample
+    /// over the pool in one part, whether it compares them directly or through floors,
+    /// and never leaves the choice to a timed sample.
+    #[test]
+    fn floor_bypass_and_floors_are_deterministic_across_thread_counts() {
+        use super::super::expr::CmpOp;
+        let rows = PAR_THRESHOLD + 1;
+        assert!(
+            rows <= STRING_ORDER_SAMPLE + PAR_THRESHOLD,
+            "one part after the sample"
+        );
+        let masks = 6;
+        let (s, ids) = word_store(masks * 2 * rows);
+        // Strings adjacent in the vocabulary share no slot of a table, so no floor evicts
+        // another in an order that depends on the threads.
+        let mut hot = ids.clone();
+        hot.sort_by_key(|id| id.payload());
+        let hot = hot[1000..1048].to_vec();
+        let run = |threads: usize, repeat: bool| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut ctx = Ctx::new(s.snapshot());
+                ctx.mem_limit = 256 << 20;
+                ctx.enable_cursor_accounting().unwrap();
+                let (x, y) = (ctx.var("x"), ctx.var("y"));
+                let e = cmp(x, y, CmpOp::Lt);
+                let mut states = Vec::new();
+                for m in 0..masks {
+                    let mut t = Table::new(vec![x, y]);
+                    for i in 0..rows {
+                        let row = if repeat {
+                            [hot[(i * 7 + m) % hot.len()], hot[(i * 11 + 3) % hot.len()]]
+                        } else {
+                            let k = 2 * (m * rows + i);
+                            [ids[k], ids[k + 1]]
+                        };
+                        t.push_row(&row);
+                    }
+                    let mask = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e)
+                        .unwrap()
+                        .expect("the mask applies");
+                    let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+                    assert_eq!(mask, generic, "threads {threads} repeat {repeat} mask {m}");
+                    // The decode envelope reserves a key for every decode worker until
+                    // the work ends, so compare what the query keeps after it ends.
+                    ctx.release_work();
+                    let cache = ctx.floor_cache();
+                    states.push((
+                        mask,
+                        cache.bypassed(),
+                        cache.slots(),
+                        cache.entries(),
+                        cache.used(),
+                        cache.reserved(),
+                        ctx.live_bytes(),
+                    ));
+                }
+                assert!(ctx.check().is_ok(), "threads {threads} repeat {repeat}");
+                states
+            })
+        };
+        for repeat in [false, true] {
+            let one = run(1, repeat);
+            let four = run(4, repeat);
+            for (m, (a, b)) in one.iter().zip(&four).enumerate() {
+                assert_eq!(a.0, b.0, "repeat {repeat} mask {m}: masks");
+                assert_eq!(
+                    (a.1, a.2, a.3, a.4, a.5, a.6),
+                    (b.1, b.2, b.3, b.4, b.5, b.6),
+                    "repeat {repeat} mask {m}: state"
+                );
+            }
+            let last = one.last().unwrap();
+            if repeat {
+                assert!(one.iter().all(|state| state.1 == 0), "repeat: no bypass");
+                assert_eq!(last.3, hot.len(), "repeat: every floor is kept");
+            } else {
+                // every mask but the probe on the fourth bypasses the table
+                assert_eq!(last.1, masks - 1, "low repeat");
+                assert!(last.2 > 0, "low repeat: the probe installs the table");
+            }
+        }
+    }
+
+    /// Colleague-shaped pairs of names that never repeat and names-shaped pairs of a few
+    /// repeated names stream through string order masks and keep the rows that the
+    /// decoded comparison keeps, on one thread and on four. Each person's colleague has
+    /// a name of its own, so the two columns of the colleague shape share no string in
+    /// any join order and its mask bypasses the floor table, while the names shape keeps
+    /// its floors. The cursor's own floor cache shows which path each query took.
+    #[test]
+    fn streamed_name_pairs_match_the_decoded_comparison_on_any_thread_count() {
+        use crate::sparql::{CursorOptions, QueryOptions, query, select_cursor};
+        use std::fmt::Write;
+        let people = 6000;
+        let name = |i: usize| oxrdf::Literal::new_simple_literal(mixed_string(i));
+        let mut nt = String::new();
+        for i in 0..people {
+            let colleague = (i * 7919 + 1) % people;
+            let known = (i * 13 + 5) % people;
+            writeln!(nt, "<urn:p:{i}> <urn:name> {} .", name(i)).unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:nick> {} .", name(i % 40 * 150)).unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:colleague> <urn:c:{i}> .").unwrap();
+            writeln!(nt, "<urn:c:{i}> <urn:name> {} .", name(people + colleague)).unwrap();
+            writeln!(nt, "<urn:p:{i}> <urn:knows> <urn:p:{known}> .").unwrap();
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let options = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let text = |t: &Option<oxrdf::Term>| t.as_ref().map(|t| t.to_string());
+        let shapes = [("urn:name", "urn:colleague"), ("urn:nick", "urn:knows")];
+        for (label, link) in shapes {
+            for op in ["<", ">="] {
+                let q = |filter: &str| {
+                    format!(
+                        "SELECT ?p ?q WHERE {{ ?p <{label}> ?n ; <{link}> ?q . \
+                         ?q <{label}> ?m FILTER({filter}) }}"
+                    )
+                };
+                let mut decoded: Vec<_> = query(
+                    s.snapshot(),
+                    &q(&format!("CONCAT(?n, \"\") {op} CONCAT(?m, \"\")")),
+                    &options,
+                )
+                .unwrap()
+                .rows()
+                .unwrap()
+                .iter()
+                .map(|r| r.values().iter().map(text).collect::<Vec<_>>())
+                .collect();
+                decoded.sort();
+                assert!(!decoded.is_empty(), "{label} {op}");
+                assert!(decoded.len() < people, "{label} {op}");
+                for threads in [1, 4] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let (mut streamed, cache) = pool.install(|| {
+                        let cursor_options = CursorOptions {
+                            batch_rows: 1 << 16,
+                            ..Default::default()
+                        };
+                        let q = q(&format!("?n {op} ?m"));
+                        let mut cursor =
+                            select_cursor(s.snapshot(), &q, &options, &cursor_options).unwrap();
+                        let mut streamed = Vec::new();
+                        while let Some(batch) = cursor.next_batch().unwrap() {
+                            for row in 0..batch.len() {
+                                let row = batch.row(row).unwrap();
+                                streamed.push(row.values().iter().map(text).collect::<Vec<_>>());
+                            }
+                        }
+                        let ctx = cursor.output_ctx();
+                        let cache = ctx.floor_cache();
+                        let state = (cache.bypassed(), cache.slots(), cache.entries());
+                        (streamed, state)
+                    });
+                    let (bypassed, slots, entries) = cache;
+                    let path = format!(
+                        "{label} {op} threads {threads}: bypassed {bypassed}, slots {slots}, \
+                         entries {entries}"
+                    );
+                    if label == "urn:name" {
+                        assert!(bypassed > 0, "{path}: the colleague shape bypasses floors");
+                        assert_eq!(slots, 0, "{path}: the floor table stays deferred");
+                    } else {
+                        assert_eq!(bypassed, 0, "{path}: the names shape keeps its floors");
+                        assert!(entries > 0, "{path}: the names shape keeps its floors");
+                    }
+                    streamed.sort();
+                    assert_eq!(streamed, decoded, "{label} {op} threads {threads}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -18332,4 +19097,47 @@ fn assert_parallel_full_sort_at_budget(
         .unwrap();
     assert!(sorted.cols[0].iter().map(|id| id.as_i64()).eq(expected));
     assert_eq!(ctx.live_bytes(), 0);
+}
+
+#[cfg(test)]
+mod map_batch_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn map_batch_without_parallel_permission_runs_every_row_on_its_caller() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let caller = std::thread::current().id();
+            let (out, split) = map_batch_split(&ctx, 4096, false, |i| {
+                assert_eq!(std::thread::current().id(), caller);
+                i * 3 + 1
+            })
+            .unwrap();
+            assert!(split.is_none());
+            assert_eq!(out, (0..4096).map(|i| i * 3 + 1).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn map_batch_serial_cancellation_stops_at_next_chunk_check() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let visited = AtomicUsize::new(0);
+        let result = map_batch_split(&ctx, 4096, false, |i| {
+            visited.fetch_add(1, Ordering::Relaxed);
+            if i == 300 {
+                ctx.cancel.store(true, Ordering::Relaxed);
+            }
+            i
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(visited.load(Ordering::Relaxed), BATCH_SAMPLE_ROWS + 1024);
+    }
 }

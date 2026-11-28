@@ -484,14 +484,13 @@ assigns the transaction's frame the next control sequence number under the lock,
 sequence numbers order every frame the store ever wrote, and it writes the frame in one
 of two places.
 
-A transaction with a net change to the quads is an ordinary commit. Its control records
-go into the same write-ahead log record as its quads, before its commit record, and the
-commit's checksum covers them. A transaction with a control record never joins a group
-commit and never takes the bulk rebuild path. It drains the group and commits through the
-serial path, which writes the record, synchronizes the log and only then publishes the
-snapshot and then the control state. A ledger record of a publication is therefore
-durable exactly when its commit is durable, and a reader sees it only after that commit
-is published.
+A transaction with a control frame and a net change to the quads always commits
+through the WAL. The frame and quads go into the same WAL transaction before the
+commit record, and the commit's checksum covers both. The writer drains earlier commits, then seals and
+leads a fence for that commit alone while holding the writer lock. The fence makes the
+commit durable, then publishes the snapshot and then the control state. A ledger record
+of a publication is durable with its commit and becomes visible after the snapshot is
+published.
 
 A transaction with no net change to the quads is a control-only batch. It drains the
 group, so every commit up to the head is durable, then appends its frame to `control.log`
@@ -501,12 +500,12 @@ run or preview that stages a control record is refused, since neither may write.
 
 The following properties hold, and the recovery of §7.2 relies on them.
 
-1. A frame is durable before the writer lock is released after it. The serial commit path
-   and the control log both synchronize before the lock is released. In a store whose
-   keyspace is enabled, a guard is armed before the first byte of any serial transaction
-   reaches either log, whether or not it carries a frame, and disarmed only after the
-   head and the log's length are recorded and the snapshot and the control state are
-   published. The same guard covers a bulk commit and a compaction from the moment
+1. The writer holds the lock until the fence or the control log has made the frame
+   durable. In a store with the control keyspace enabled, the writer arms a guard before
+   writing to the control log or starting a one-commit fence under the lock. The guard
+   also covers these WAL commits when they carry no control frame. The writer disarms
+   it after recording the head and log length and publishing any new snapshot and
+   control state. The same guard covers a bulk commit and a compaction from the moment
    `CURRENT` may switch until the writer has adopted the new log and the snapshot of the
    new generation is published. The group commit keeps the fence it already has for an
    unwind of its coordinator. A failed write or synchronization, any other error in

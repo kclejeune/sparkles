@@ -86,7 +86,7 @@ struct Upstream {
     held: Mutex<MemoryLease>,
     /// Consumer wait credit forwarded by a streaming view rebuild once synchronous mask
     /// preparation has finished. Zero during mask preparation so the deadline stays fixed.
-    pause: Arc<AtomicU64>,
+    pause: Option<Arc<AtomicU64>>,
 }
 
 impl Drop for Inner {
@@ -338,10 +338,22 @@ impl Preparation {
         parent: ParentHandle,
         inherited: Option<&Self>,
     ) -> Result<Self> {
+        Self::with_upstream(opts, parent, inherited, true)
+    }
+
+    pub(crate) fn with_upstream(
+        opts: &crate::sparql::QueryOptions,
+        parent: ParentHandle,
+        inherited: Option<&Self>,
+        pause_deadline: bool,
+    ) -> Result<Self> {
         if let Some(inherited) = inherited {
             inherited.check()?;
         }
-        let mut control = Control::with_cancel(opts.cancel.clone().expect("rebuild cancellation"));
+        let mut control = opts
+            .cancel
+            .clone()
+            .map_or_else(Control::none, Control::with_cancel);
         control.deadline = opts.deadline;
         if let Some(inherited) = inherited {
             control.progress = inherited.inner.control.progress.clone();
@@ -359,7 +371,7 @@ impl Preparation {
             } else {
                 0
             }) as u64;
-        let limit = opts.max_memory_bytes.expect("rebuild memory limit");
+        let limit = opts.max_memory_bytes.unwrap_or(u64::MAX);
         if bytes > limit {
             return Err(memory(limit));
         }
@@ -379,7 +391,7 @@ impl Preparation {
                 upstream: Some(Box::new(Upstream {
                     parent,
                     held: Mutex::new(held),
-                    pause: Arc::new(AtomicU64::new(0)),
+                    pause: pause_deadline.then(|| Arc::new(AtomicU64::new(0))),
                 })),
             }),
             no_wait: inherited.is_some_and(|original| original.no_wait),
@@ -420,7 +432,7 @@ impl Preparation {
                 upstream: Some(Box::new(Upstream {
                     parent,
                     held: Mutex::new(held),
-                    pause: Arc::new(AtomicU64::new(0)),
+                    pause: None,
                 })),
             }),
             no_wait: false,
@@ -437,7 +449,7 @@ impl Preparation {
         self.inner
             .upstream
             .as_ref()
-            .map(|upstream| upstream.pause.clone())
+            .and_then(|upstream| upstream.pause.clone())
     }
 
     pub(crate) fn with_query_controls(
@@ -659,7 +671,7 @@ impl Preparation {
                 upstream: Some(Box::new(Upstream {
                     parent,
                     held: Mutex::new(held),
-                    pause: Arc::new(AtomicU64::new(0)),
+                    pause: Some(Arc::new(AtomicU64::new(0))),
                 })),
             }),
             no_wait: false,
@@ -861,9 +873,9 @@ impl Preparation {
         if let Some(deadline) = self.inner.control.deadline {
             let now = std::time::Instant::now();
             if now >= deadline {
-                let expired = match &self.inner.upstream {
-                    Some(upstream) => {
-                        let paused = Duration::from_nanos(upstream.pause.load(Ordering::Relaxed));
+                let expired = match self.inner.upstream.as_ref().and_then(|u| u.pause.as_ref()) {
+                    Some(pause) => {
+                        let paused = Duration::from_nanos(pause.load(Ordering::Relaxed));
                         deadline.checked_add(paused).is_some_and(|end| now >= end)
                     }
                     None => true,
@@ -1748,7 +1760,7 @@ fn lossy(mut bytes: &[u8], preparation: &Preparation) -> Result<String> {
     Ok(out)
 }
 
-fn parent_error(error: sparkles_budget::ParentRefused) -> Error {
+pub(crate) fn parent_error(error: sparkles_budget::ParentRefused) -> Error {
     match error {
         sparkles_budget::ParentRefused::Limit {
             limit,

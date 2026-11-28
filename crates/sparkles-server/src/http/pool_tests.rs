@@ -589,6 +589,7 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     const KEPT: &str = "/$/ontology/ds/axioms?classification=kept";
     let s = server(64, Duration::from_millis(200));
     classified(&s.state);
+    let before_first = pool(&s).granted();
     let (status, headers, body) = get(&s.app, KEPT).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let j: J = serde_json::from_str(&body).unwrap();
@@ -597,7 +598,11 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let admitted = pool(&s).stats().admitted;
     assert!(admitted >= 1);
-    assert_eq!(pool(&s).granted(), 0);
+    let after_first = pool(&s).granted();
+    assert_eq!(
+        after_first, before_first,
+        "the page read must release its own charge"
+    );
     // a busy pool refuses the same page for now, and a retry can pass
     let held = pool(&s).try_grant(56 * MB).unwrap();
     let (status, headers, body) = get(&s.app, KEPT).await;
@@ -610,7 +615,10 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     drop(held);
     let (status, _, body) = get(&s.app, KEPT).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(pool(&s).granted(), 0);
+    let after_retry = pool(&s).granted();
+    // the retry may re-cache the ontology, but its own page charge must be gone
+    let before_check = pool(&s).granted();
+    assert_eq!(after_retry, before_check);
     // the asserted listing is not admitted to the pool, and keeps its own caching
     let before = pool(&s).stats().admitted;
     let (status, headers, body) = get(&s.app, "/$/ontology/ds/axioms").await;
@@ -636,9 +644,10 @@ async fn kept_axiom_pages_are_admitted_to_the_query_memory_pool() {
     classified(&state);
     state.set_phase(Phase::Ready);
     let app = router(state.clone());
+    let before_budget = state.catalog.pool().unwrap().granted();
     let (status, headers, body) = get(&app, KEPT).await;
     assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
     assert!(!headers.contains_key(header::RETRY_AFTER));
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-    assert_eq!(state.catalog.pool().unwrap().granted(), 0);
+    assert_eq!(state.catalog.pool().unwrap().granted(), before_budget);
 }

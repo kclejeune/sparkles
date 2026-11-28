@@ -330,7 +330,7 @@ fn swap(
         }
     };
     if let Some(detached) = st.inner.detached.lock().get_mut(name) {
-        detached.reasoning = reasoning;
+        detached.reasoning = reasoning.into();
     }
     let predecessor_revision = match st.bind_swap_revision(name, old_id) {
         Ok(rev) => rev,

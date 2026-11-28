@@ -2613,6 +2613,22 @@ mod classification {
         assert_eq!(j["complete"], json!(part.complete()));
         assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
         let consistency = j["consistency"].as_str().unwrap();
+        // A deadline that stops the modules' pass after the saturation answers in full
+        // for the axioms it took, with every class open and the consistency unknown. It
+        // is answered but not partial.
+        if cl.complete_for_taken && cl.stats.coverage_stopped {
+            assert!(!part.complete());
+            assert_eq!(consistency, "unknown");
+            for x in full.classification.taxonomy.classes() {
+                if *x != Class::thing() && *x != Class::nothing() {
+                    assert!(
+                        cl.incomplete.binary_search(x).is_ok(),
+                        "{x:?} is complete after a stopped modules' pass"
+                    );
+                }
+            }
+            return (false, "unknown");
+        }
         if cl.complete_for_taken {
             assert!(everything || got == want);
             assert!(part.complete());
@@ -2785,11 +2801,14 @@ mod classification {
         let mut partial = Vec::new();
         for k in 1..20 {
             let ds = dataset(&body);
+            // These ceilings come from the classifier peak. Prepare the
+            // input before exercising a stop during saturation.
+            ds.ontology().open(&req, &opts()).unwrap();
             let o = QueryOptions {
                 max_memory_bytes: Some(peak * k / 20),
                 ..opts()
             };
-            // a budget under the size of the ontology and its index refuses the run
+            // A budget under the size of the classifier's index refuses the run.
             let Ok(part) = ds.ontology().classify(&req, &partial_request(), &o) else {
                 continue;
             };
@@ -2914,6 +2933,7 @@ mod classification {
         let (ds, part) = (1..20)
             .find_map(|k| {
                 let ds = dataset(&body);
+                ds.ontology().open(&req, &opts()).unwrap();
                 let o = QueryOptions {
                     max_memory_bytes: Some(peak * k / 20),
                     ..opts()
@@ -2971,6 +2991,28 @@ mod classification {
         }
 
         let req = OntologyRequest::default();
+        // Warm terminology only. The sweep sets the budget for a fresh classifier
+        // and its staged axiom references. Cold decode has its own refusal test.
+        let staging_bytes = |ds: &Dataset, assertions: bool| {
+            let h = ds.ontology();
+            let options = opts();
+            let opened = h.open(&req, &options).unwrap();
+            let work = super::classify::working(&options, &opened);
+            let mut count = opened.ontology.axioms.len();
+            if assertions {
+                opened
+                    .assertions(&options, |ax, _, _| {
+                        if let Some(ax) = ax {
+                            super::classify::stage_assertion(&work, &ax)?;
+                            count += 1;
+                        }
+                        Ok(true)
+                    })
+                    .unwrap();
+            }
+            super::classify::stage_axioms(&work, count).unwrap();
+            work.lock().bytes()
+        };
         for (tier, body) in [("el", el_body), ("horn", horn_body)] {
             let full = dataset(&body)
                 .ontology()
@@ -2982,8 +3024,9 @@ mod classification {
             let (ds, part) = (1..20)
                 .find_map(|k| {
                     let ds = dataset(&body);
+                    let staged = staging_bytes(&ds, false);
                     let o = QueryOptions {
-                        max_memory_bytes: Some(peak * k / 20),
+                        max_memory_bytes: Some(staged + peak * k / 20),
                         ..opts()
                     };
                     match ds.ontology().classify(&req, &partial_request(), &o) {
@@ -3046,8 +3089,9 @@ mod classification {
             let (assert_ds, part_assert) = (1..20)
                 .find_map(|k| {
                     let ds = dataset(&assert_body);
+                    let staged = staging_bytes(&ds, true);
                     let o = QueryOptions {
-                        max_memory_bytes: Some(assert_peak * k / 20),
+                        max_memory_bytes: Some(staged + assert_peak * k / 20),
                         ..opts()
                     };
                     match ds.ontology().classify(&req, &assert_req, &o) {
@@ -3143,6 +3187,9 @@ mod classification {
         let (ds, part) = (1..20)
             .find_map(|k| {
                 let ds = dataset(&body);
+                // These ceilings come from the classifier peak. Prepare the
+                // input before exercising a stop during saturation.
+                ds.ontology().open(&req, &opts()).unwrap();
                 let o = QueryOptions {
                     max_memory_bytes: Some(peak * k / 20),
                     ..opts()

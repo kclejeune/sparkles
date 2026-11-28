@@ -1683,6 +1683,7 @@ pub(crate) const STORE_TEMP_FILES: &[&str] = &[
     "dataset.tmp",
     "commits.tmp",
     "annotations.tmp",
+    crate::store::INDEX_SETTINGS_TEMP_FILE,
 ];
 
 /// Remove the [`STORE_TEMP_FILES`] of the dataset root that are regular files, and return

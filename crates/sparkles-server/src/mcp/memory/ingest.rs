@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sparkles::commit::CommitKind;
 use sparkles::error::Error;
+use sparkles::guard::Precondition;
+use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -958,7 +960,7 @@ fn bookkeeping(iri: &str) -> bool {
 
 impl Tools<'_> {
     pub(crate) fn register_source(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        self.register_source_with(args, &RenditionExtras::default(), false)
+        self.register_source_with(args, None, false, None)
     }
 
     /// `register_source` for a converted document (`POST /$/ingest`): its arguments with
@@ -980,14 +982,22 @@ impl Tools<'_> {
             Some(Value::Bool(b)) => b,
             Some(_) => return Err(ToolError::bad_argument("plan is true or false")),
         };
-        self.register_source_with(args, &extras, plan)
+        let if_head = match args.remove("ifHead") {
+            None => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| ToolError::bad_argument("ifHead is a commit number"))?,
+            ),
+        };
+        self.register_source_with(args, Some(&extras), plan, if_head)
     }
 
     fn register_source_with(
         &self,
         args: Map<String, Value>,
-        extras: &RenditionExtras,
+        converted: Option<&RenditionExtras>,
         plan: bool,
+        if_head: Option<u64>,
     ) -> Result<Outcome, ToolError> {
         let t0 = Instant::now();
         let a: RegisterArgs = parse(args)?;
@@ -1118,26 +1128,44 @@ impl Tools<'_> {
             "urn:uuid:{}",
             uuid_v5(&dataset_id, &format!("rendition\0{dig}")).hyphenated()
         ));
-        // §8.10.7: no text the server recognizes as a secret enters an import graph
-        let main_ds = ds.main();
-        let main_ds: &Dataset = main_ds.as_deref().unwrap_or(&ds);
-        let memory = crate::assist::memory_settings(&self.server.state, main_ds);
-        if let Some(im) = memory.imports.as_ref()
-            && graph.as_str().starts_with(&im.base)
-        {
-            let mut texts: Vec<&str> = vec![&text];
-            if let Some(s) = original
-                .as_deref()
-                .and_then(|b| std::str::from_utf8(b).ok())
-            {
-                texts.push(s);
-            }
-            secret_check(im, &texts)?;
-        }
         let transcript =
             format.starts_with("text/markdown") && format.contains("profile=transcript");
         let bounds = chunk_bounds(&text, transcript);
         let length = text.chars().count();
+        let main_ds = ds.main();
+        let main_ds = main_ds.as_deref().unwrap_or(&ds);
+        let check = || {
+            if self.call.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ToolError::new(
+                    "cancelled",
+                    499,
+                    "registration was cancelled",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(ToolError::new(
+                    "timeout",
+                    504,
+                    "the registration deadline passed",
+                ));
+            }
+            Ok(())
+        };
+        if converted.is_some() && (a.iri.is_some() || a.graph.is_some()) {
+            // Conversion checked the request spelling. Check explicit locators again
+            // once the writer has expanded them using its actual prefix map.
+            let redaction =
+                crate::ingest::pipeline::Redaction::for_dataset(&self.server.state, main_ds, p);
+            for (explicit, resolved) in [(a.iri.is_some(), &source), (a.graph.is_some(), &graph)] {
+                if explicit && redaction.matches_locator_checked(resolved.as_str(), check)? {
+                    return Err(ToolError::new(
+                        "sensitive-locator",
+                        422,
+                        "a source or graph IRI matches the redaction policy: use a different IRI",
+                    ));
+                }
+            }
+        }
         // the caller's write view
         let mut opts = self
             .query_options(&ds.name, Endpoint::Update, false, deadline, &prefix_map)
@@ -1160,10 +1188,57 @@ impl Tools<'_> {
                 ),
             ));
         }
+        if converted.is_none() {
+            // Direct registration applies the import graph policy.
+            let memory = crate::assist::memory_settings(&self.server.state, main_ds);
+            let check_secrets = memory.redaction_everywhere()
+                || memory
+                    .imports
+                    .as_ref()
+                    .is_some_and(|im| graph.as_str().starts_with(&im.base));
+            if check_secrets {
+                let source_iri =
+                    percent_encoding::percent_decode_str(source.as_str()).decode_utf8_lossy();
+                let graph_iri =
+                    percent_encoding::percent_decode_str(graph.as_str()).decode_utf8_lossy();
+                let mut texts = vec![text.as_str(), source.as_str(), graph.as_str()];
+                if source_iri != source.as_str() {
+                    texts.push(&source_iri);
+                }
+                if graph_iri != graph.as_str() {
+                    texts.push(&graph_iri);
+                }
+                texts.extend(a.title.as_deref());
+                texts.extend(
+                    original
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok()),
+                );
+                secret_check(&self.server.state, p, &memory, &texts, check)?;
+            }
+        }
         let mut ropts = opts.clone();
         ropts.union_default_graph = Some(false);
         ropts.default_graph_extra.clear();
-        let r = Reader::from_snapshot(ds.store.snapshot(), ropts, deadline, false);
+        let precondition = if_head.map(|expected| {
+            Precondition::new(move |head: &Snapshot| {
+                if head.commit != expected {
+                    return Err(Error::PreconditionFailed(format!(
+                        "the dataset changed since the preview (head {expected} then, {} now): ingest the document again",
+                        head.commit
+                    )));
+                }
+                Ok(())
+            })
+        });
+        let head = ds.store.snapshot();
+        let conflict = |m| ToolError::new("conflict", 409, m);
+        if let Some(p) = &precondition
+            && let Err(Error::PreconditionFailed(m)) = p.check(&head)
+        {
+            return Err(conflict(m));
+        }
+        let r = Reader::from_snapshot(head, ropts, deadline, false);
         let eng = |e: Error| ctx.engine(e);
         let g1 = std::slice::from_ref(&graph);
         // what the graph already says of the source
@@ -1231,6 +1306,15 @@ impl Tools<'_> {
             "textKept": settings.keep_text,
             "originalKept": original_term.is_some(),
         });
+        if converted.is_some() {
+            // Ingestion reuses these terms for proposals and preview approval. Display
+            // terms can be shortened or depend on the current prefix configuration.
+            out["resolved"] = json!({
+                "source": source.to_string(),
+                "graph": graph.to_string(),
+                "rendition": rendition.to_string(),
+            });
+        }
         // the same text: nothing to write unless the bytes behind it changed
         let same = current.contains(&rendition);
         let same_bytes = old_digests.len() == 1
@@ -1313,7 +1397,9 @@ impl Tools<'_> {
                 let _ = write!(ins, " ; <{PROV}wasRevisionOf> {old}");
             }
             ins.push_str(" .\n");
-            extras.write(&mut ins, &rendition);
+            if let Some(extras) = converted {
+                extras.write(&mut ins, &rendition);
+            }
             if settings.keep_text {
                 let slices = chunk_slices(&text, &bounds);
                 for (i, (s, e)) in bounds.iter().enumerate() {
@@ -1412,7 +1498,7 @@ impl Tools<'_> {
             report_limit: None,
             message,
             author: crate::http::author(p),
-            precondition: None,
+            precondition,
             no_wait: false,
             preview_as_new_branch: false,
             before_publish: None,
@@ -1450,6 +1536,7 @@ impl Tools<'_> {
                     "the source does not conform to the dataset's validation guard; nothing was written",
                 ));
             }
+            Err(Error::PreconditionFailed(m)) if if_head.is_some() => return Err(conflict(m)),
             Err(e) => return Err(ctx.engine(e)),
             Ok(stats) => {
                 let Some(receipt) = stats.commit else {
@@ -1762,20 +1849,25 @@ impl Tools<'_> {
     }
 }
 
-/// The `secret-detected` check of §8.10.7: the built-in patterns and the dataset's own
-/// over each text. The error names the pattern and the offset in characters, never the
-/// value.
-fn secret_check(im: &crate::assist::Imports, texts: &[&str]) -> Result<(), ToolError> {
-    use sparkles_memory_import::redact;
-    let mut patterns = redact::builtin();
-    for p in &im.secret_patterns {
-        // the settings route validates them; one that no longer compiles is skipped
-        if let Ok(x) = redact::Pattern::new(&p.name, &p.regex) {
-            patterns.push(x);
-        }
-    }
+/// The `secret-detected` check of §8.10.7 and item 77: the dataset's full redaction
+/// policy (built-in and configured patterns, entropy, personal detectors, server secrets
+/// and allow-list) over each text. The error names the detector and the offset in
+/// characters, never the value.
+fn secret_check(
+    st: &crate::state::AppState,
+    principal: &crate::auth::Principal,
+    memory: &crate::assist::MemorySettings,
+    texts: &[&str],
+    mut check: impl FnMut() -> Result<(), ToolError>,
+) -> Result<(), ToolError> {
+    let known = if memory.redaction_known_values() {
+        crate::settings::secrets::known_values(st, principal)
+    } else {
+        Vec::new()
+    };
+    let policy = memory.redaction_policy(known, "server-secret");
     for t in texts {
-        if let Some((name, at)) = redact::first_match(t, &patterns) {
+        if let Some((name, at)) = policy.first_match_checked(t, &mut check)? {
             let offset = t[..at].chars().count();
             return Err(ToolError::new(
                 "secret-detected",
@@ -1785,7 +1877,7 @@ fn secret_check(im: &crate::assist::Imports, texts: &[&str]) -> Result<(), ToolE
                 ),
             )
             .hint("redact the text before registering it (sparkles memory import does), or remove the secret from the file")
-            .data(json!({"pattern": name, "offset": offset})));
+            .data(json!({"pattern": name, "detector": name, "offset": offset})));
         }
     }
     Ok(())

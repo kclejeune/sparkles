@@ -46,6 +46,7 @@ const CHUNK: usize = 8 << 20;
 
 /// How one file is stored.
 struct FilePlan {
+    chunker: Option<crate::chunking::Chunker>,
     /// the parent's segments this file starts with
     reused: Vec<BlobRef>,
     /// the whole-file hash when it was computed while checking the parent's segments
@@ -250,7 +251,7 @@ impl Repository {
         let started = Instant::now();
         let created = crate::now_rfc3339();
         let guard = lock::acquire(self, LockKind::Shared, LockOperation::Create, &o.ctl).await?;
-        let r = self.create_locked(src, o, started, created).await;
+        let r = self.create_locked(src, o, started, created, &guard).await;
         if let Err(e) = guard.release().await {
             tracing::warn!(target: "sparkles::backup", "releasing a lock: {e}");
         }
@@ -263,8 +264,10 @@ impl Repository {
         o: &CreateOptions,
         started: Instant,
         created: String,
+        guard: &lock::LockGuard,
     ) -> Result<BackupSummary> {
         let ctl = &o.ctl;
+        let until = self.retention_deadline(guard)?;
         let security = self.security().await?;
         let key = layout::manifest_key(&o.name);
         match self.store.head(&key).await {
@@ -356,6 +359,12 @@ impl Repository {
         }
         let files = Arc::new(files);
         let piece = self.marker.piece_bytes;
+        let gear = self
+            .marker
+            .chunking
+            .as_ref()
+            .map(|_| crate::chunking::gear(self.id(), &security).map(Arc::new))
+            .transpose()?;
 
         // plan
         let span = tracing::info_span!("backup.plan", sparkles.repository = %self.config.name,
@@ -372,7 +381,12 @@ impl Repository {
             });
             crate::repo::sort_newest_first(&mut ms);
             let parent = ms.into_iter().find(|m| {
-                crate::manifest::validate(m, piece, std::slice::from_ref(&index_format)).is_ok()
+                crate::manifest::validate_for_repo(
+                    m,
+                    &self.marker,
+                    std::slice::from_ref(&index_format),
+                )
+                .is_ok()
             });
             let mut plans = Vec::with_capacity(files.len());
             for (i, f) in files.iter().enumerate() {
@@ -389,7 +403,22 @@ impl Repository {
                         self.plan_append(&files, i, prior, piece, ctl, &security)
                             .await?
                     }
+                    _ if gear.is_some() && crate::chunking::eligible(&f.path, f.kind) => {
+                        let files = files.clone();
+                        let gear = gear.as_ref().expect("chunking is configured").clone();
+                        let cancel = ctl.cancel.clone();
+                        FilePlan {
+                            chunker: Some(crate::chunking::Chunker::FastCdc2016),
+                            reused: Vec::new(),
+                            sha256: None,
+                            pieces: blocking(move || {
+                                crate::chunking::pieces(&files[i], &gear, &cancel)
+                            })
+                            .await?,
+                        }
+                    }
                     _ => FilePlan {
+                        chunker: None,
                         reused: Vec::new(),
                         sha256: None,
                         pieces: blob::pieces(f.len, piece).collect(),
@@ -450,14 +479,7 @@ impl Repository {
             let mut results = futures::stream::iter(units)
                 .map(|u| {
                     let known = (parent_ids.clone(), seen.clone());
-                    self.upload_unit(
-                        files.clone(),
-                        u,
-                        known,
-                        o.min_free_disk_bytes,
-                        ctl,
-                        security.clone(),
-                    )
+                    self.upload_unit(files.clone(), u, known, o, until, security.clone())
                 })
                 .buffered(self.config.concurrency());
             while let Some(up) = results.try_next().await? {
@@ -502,11 +524,15 @@ impl Repository {
                     .or_else(|| hasher.map(Hasher::finish))
                     .unwrap_or_default(),
                 blobs,
+                chunker: plan.chunker,
                 definition: defined.get(&f.path).cloned(),
             })
             .collect();
         let has_text = entries.iter().any(|e| e.path == "text.json");
         let mut requires = Vec::new();
+        if entries.iter().any(|entry| entry.chunker.is_some()) {
+            requires.push(crate::chunking::FEATURE.to_string());
+        }
         if !defined.is_empty() {
             requires.push("definitions".to_string());
         }
@@ -530,7 +556,7 @@ impl Repository {
             requires.push("control/1".to_string());
         }
         let manifest = Manifest {
-            format: layout::FORMAT,
+            format: sparkles_core::formats::BACKUP_MANIFEST.writes,
             kind: layout::MANIFEST_KIND.to_string(),
             name: o.name.clone(),
             id: uuid::Uuid::new_v4(),
@@ -570,9 +596,7 @@ impl Repository {
                     rebuild_on_restore: true,
                 }),
             },
-            encryption: security
-                .epoch()
-                .map(|epoch| serde_json::json!({"scheme":"sparkles-repo-v1","epoch":epoch})),
+            encryption: security.manifest_encryption(),
             branches_omitted,
             requires,
         };
@@ -603,7 +627,7 @@ impl Repository {
             sparkles.backup.name = %o.name);
         let e_tag = async {
             match self
-                .create_object(&key, PutPayload::from(body.clone()))
+                .publish_manifest(&manifest, PutPayload::from(body.clone()), ctl, guard)
                 .await?
             {
                 Some(put) => Ok(put.e_tag),
@@ -656,6 +680,7 @@ impl Repository {
     ) -> Result<FilePlan> {
         let f = &files[i];
         let scratch = || FilePlan {
+            chunker: None,
             reused: Vec::new(),
             sha256: None,
             pieces: blob::pieces(f.len, piece).collect(),
@@ -683,6 +708,16 @@ impl Repository {
             // a parent entry whose blobs do not add up: do not trust it
             return Ok(scratch());
         }
+        if self.has_object_lock() {
+            for blob in &prior.blobs {
+                ctl.check()?;
+                match self.store.head(&layout::blob_key(&blob.id)).await {
+                    Ok(_) => {}
+                    Err(error) if is_not_found(&error) => return Ok(scratch()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         let (files2, cancel) = (files.clone(), ctl.cancel.clone());
         let security = security.clone();
         let (ids, whole) =
@@ -695,12 +730,14 @@ impl Repository {
                 "the file differs from the parent backup's copy: stored from scratch"
             );
             return Ok(FilePlan {
+                chunker: None,
                 reused: Vec::new(),
                 sha256: Some(whole),
                 pieces: blob::pieces(f.len, piece).collect(),
             });
         }
         Ok(FilePlan {
+            chunker: None,
             reused: prior.blobs.clone(),
             sha256: Some(whole),
             pieces: new,
@@ -741,11 +778,12 @@ impl Repository {
         files: Arc<Vec<CapturedFile>>,
         unit: Unit,
         known: (Arc<HashSet<String>>, Arc<Mutex<HashSet<String>>>),
-        reserve: Option<u64>,
-        ctl: &Ctl,
+        options: &CreateOptions,
+        until: Option<chrono::DateTime<chrono::Utc>>,
         security: crate::security::Security,
     ) -> Result<Uploaded> {
         let (parent_ids, seen) = known;
+        let ctl = &options.ctl;
         ctl.check()?;
         let cancel = ctl.cancel.clone();
         let hasher = security.clone();
@@ -766,12 +804,13 @@ impl Repository {
             plain: unit.feed.then_some(plain),
         };
         // known: referenced by the parent, or already handled by this backup
-        if parent_ids.contains(&id) || !seen.lock().unwrap().insert(id.clone()) {
+        if (until.is_none() && parent_ids.contains(&id)) || !seen.lock().unwrap().insert(id.clone())
+        {
             return Ok(done(None, plain));
         }
         let key = layout::blob_key(&id);
         let single = self.single_writer();
-        if unit.len > HEAD_ABOVE || single {
+        if unit.len > HEAD_ABOVE || single || until.is_some() {
             ctl.check()?;
             match self.store.head(&key).await {
                 Ok(_) => return Ok(done(None, plain)),
@@ -782,9 +821,17 @@ impl Repository {
         let p2 = plain.clone();
         let payload = blocking(move || security.encode(p2)).await?;
         let stored = payload.content_length() as u64;
-        self.check_space(stored, reserve, true)?;
+        self.check_space(stored, options.min_free_disk_bytes, true)?;
         self.upload.take(stored, ctl).await?;
         ctl.check()?;
+        if self.marker.s3_policy.is_some() {
+            return Ok(done(
+                self.create_object_until(&key, payload, until)
+                    .await?
+                    .map(|_| stored),
+                plain,
+            ));
+        }
         if single {
             self.store.put(&key, payload).await?;
             return Ok(done(Some(stored), plain));

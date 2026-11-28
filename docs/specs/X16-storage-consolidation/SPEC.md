@@ -1,8 +1,11 @@
 # X16: Storage consolidation
 
-> **Status:** implemented in part (Phases 1, 2, 3, 4, 5 apart from `imbl`, and items 846 and 1062). The plan below is ordered and audited against the code.
+> Phases 1 through 5, the unified WAL commit path of Phase 6, and items 846, 1062 and
+> 1152 have shipped.
 >
-> **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Item 833 holds the remaining ready phase, item 1152 takes the last `imbl` maps of Phase 5, and items 479, 484, 830, 831, 832, 846 and 1062 are complete. The later candidate phases get their numbers when their prerequisites land.
+> [Roadmap item 455](../../ROADMAP.md) tracks the remaining work. Item 833 tracks Phase 6's
+> Intel writes benchmark.
+> The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -360,11 +363,10 @@ item 448 measured at about 1,000 user instructions goes and the leader keeps
 `commit_direct`. It is a hypothesis until the writes benchmark measures it, and a
 measured slowdown that the screen accepts gets a follow-up item in the same change.
 
-The gates are those of Phase 2 with the writes benchmark of
-[docs/benchmarks/writes](../../benchmarks/writes/README.md) on a benchmark worker before
-the phase reports, since its goal is a single path at no cost in serial latency. Items
-446, 447, 448 and Phase 2 land first. This is concurrency and WAL-ordering work, and its
-planner implements it.
+The gates are those of Phase 2 plus the
+[writes benchmark](../../benchmarks/writes/README.md) on an Intel benchmark worker to
+verify serial latency. The implementation builds on items 446 and 447, the idle-writer
+optimization from item 448 and the shared publish tail from Phase 2.
 
 ### Phase 7. Partitioned vocabulary and per-range generations
 
@@ -418,8 +420,8 @@ the loader entry points of `store.rs`, and Phase 5 touches `index.rs`, `builder/
 and `io.rs`. Phases 1 and 2 both edit `store.rs` and `compaction.rs`, so the first to
 land merges forward and the second rebases its tests. Phase 3 follows Phase 1, since the
 cutoff removes the legacy branches that its readers would otherwise carry. Phase 6
-follows Phase 2 and item 448. Phase 7 follows item 14 and Phase 1. Phase 8 follows item
-40 and nothing in this spec.
+builds on Phase 2 and the idle-writer optimization from item 448. Phase 7 follows item
+14 and Phase 1. Phase 8 follows item 40 and nothing in this spec.
 
 ### Routine and judgment
 
@@ -502,9 +504,10 @@ written under the writer before a compaction or a bulk commit switches `CURRENT`
 generation switch never discards a control frame that no other file holds, and a switch
 installs a new log only at the version the store writes at that moment.
 
-A transaction that carries a control record drains the group and commits through the
-serial path. The group-of-one commit of item 833 must keep that rule, or carry control
-frames through the group's fence with the same durability order, which C26 §7.1 states.
+The writer drains earlier commits and encodes the control frame in the same WAL
+transaction as the quads. It seals and leads a fence for that commit alone while
+holding the writer lock. The fence makes the commit durable, then publishes the snapshot
+and then the control state. This order follows [C26 §7.1](../C26-durable-jobs-and-delivery.md#71-ordering-against-the-write-ahead-log-and-the-commit-tail).
 
 ## Decisions
 
@@ -546,8 +549,8 @@ follows them.
 
 ## Dependencies
 
-* Items 446 and 447 have landed. Item 448 and Phase 2 land before the group-of-one
-  commit of item 833.
+* The unified WAL commit path built on items 446 and 447, the idle-writer optimization
+  from item 448 and the shared publish tail from Phase 2.
 * Items 4 and 14 settle cold reads and per-block deltas before the layout changes of
   Phase 7.
 * Item 409 settles the cost of controlled preparation before the vocabulary scanners move
@@ -907,13 +910,8 @@ functions outside tests in place of their `cfg` blocks. `parse_source` and
 `parse_source_into` choose their first rung, Jena's syntaxes, the functional-style syntax
 or a buffered document, through one `Rung`, and a buffered document of either is parsed by
 one whole-slice parser, with a test that both entry points agree for every parse mode,
-codec and kind of data. The `imbl` maps stay. A `BTreeMap` behind an `Arc` would copy the
-whole map at the first change after a snapshot, which measured 38 µs a commit at 10,000
-predicates and 8.4 ms at a million, against about a microsecond for `imbl`, and 30 ms a
-frame for a control state of a million entries, as
-[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1152
-takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
-dependency can leave. No on-disk format changed.
+codec and kind of data. Item 1152 replaced the `imbl` maps and vectors that Phase 5 left,
+as the [outcome of item 1152](#item-1152-outcome) describes. No on-disk format changed.
 
 The query matrix on `atlas` compared Phase 5, d05e6b9d, with its base, 5f3f69c2, at 1.05M and
 10.5M triples with one and twelve Rayon threads, in eager and streamed execution. No query of 0.3 ms or
@@ -939,6 +937,127 @@ addition for overflow. Unit tests cover every overflowing tenth byte from `0x02`
 `0x7f`, non-terminating tenth bytes, padded tenth-byte zero encodings and round-trips of the
 largest valid 64-bit varint across index column frames, bounded reads, builder run blocks and
 temporary pattern runs.
+
+### Item 1152 outcome
+
+The `imbl` crate has left the workspace, the three binding workspaces and every workspace
+lockfile.
+A `BTreeMap` behind an `Arc` would copy the whole map at the first change after a snapshot,
+which measured 38 µs a commit at 10,000 predicates, 8.4 ms at a million and 30 ms a frame
+for a control state of a million entries, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. The predicate
+statistics of `Delta` and the entries of `ControlState` are therefore a `store::pmap::PMap`,
+the persistent B+ tree of `KeySet` with a value beside each key and without the range
+counts. It shares the node-copy helpers of `KeySet`, whose own code did not change. A clone
+shares every node, and a write of one entry copies the nodes on its path from the root to a
+leaf, so a commit or a control frame that changes several entries copies a path for each.
+A removal also copies the neighbouring child at each level where the child on its path holds
+the fewest entries a node may hold, since it prepares that neighbour for a merge before the
+leaf changes. That copy happens even when the child keeps enough entries and no merge
+follows.
+
+Maps whose keys or values own heap memory, such as the byte strings of the control keyspace,
+use nodes of 16 entries in place of 32, so a path copy clones fewer keys. Their binary
+searches stop at an equal key, because the branchless search of the standard library made
+each step wait for the previous comparison through a key's pointer. With that search and
+32-entry nodes, control lookups measured 1.3 to 2.7 times as slow as `imbl` and writes up to
+1.7 times as slow. `get_mut`, `remove` and an update through `get_or_insert_with` find an
+entry's path in one descent that compares keys, and copy that path in a second descent that
+compares none, so a missing key copies no node. A const assertion checks that a node of the
+predicate statistics stays within the 8 KiB that `Delta::predicate_bytes_bound` charges for
+each node.
+
+The rows that commits add to the spatial index after its overlay was built are kept in a
+`store::append_vec::AppendVec`. It is a radix tree of full 32-row chunks with the last,
+partly filled chunk beside it, so an append to a clone copies at most that last chunk and the
+branches above a new chunk. Iteration walks the chunks in order. A shared tail is copied
+into a buffer with room for a chunk, and a tail that fills moves into the tree and leaves no
+buffer behind, so a view whose rows end at a full chunk allocates its next buffer at its
+next append.
+
+The memory charges keep their logical definitions. `maxControlBytes` counts each control
+key and value once, and the spatial `overlay_bytes` counts each tail row once, as before.
+Neither counts the structure around those entries. Each branch of a `PMap` keeps a copy of
+the largest key under each child to route a descent, so a control map of byte-string keys
+holds one more copy of a key for each node below its root, and a write that copies a branch
+allocates new copies of its keys. A spatial tail that holds a row reserves room for 32,
+which is 1,280 bytes for 40-byte `TailRow` values on a 64-bit build against the 40 bytes the
+view charges for one row, and full chunks add their branches and allocation headers. The
+spatial formula left out the tree around the tail with `imbl` as well.
+
+A write copies every shared node it changes before it changes any, so a key or value whose
+`Clone` panics during those copies leaves a `PMap` as it was, which a unit test checks at
+every value clone of a set of writes to a shared tree. The bounds that branches keep are cloned
+after a leaf changes, so a panicking key clone there can leave the writer's map
+inconsistent. The maps of the store hold integer and byte-string keys, whose clones fail
+only when an allocation fails, and that aborts the process. Unit tests compare `PMap` with `BTreeMap` under random
+inserts, removals, updates and ranges with integer and heap keys, and check after each phase
+that every snapshot kept its entries, that a write to a clone of a million entries leaves
+at most one path with a split or a neighbour at each level unshared, and that a missing
+key copies nothing. The tests of `AppendVec` cover sizes past three levels of branches and two clones of one version that
+append different rows.
+
+A [collection harness](../../benchmarks/writes/RESULTS.md#persistent-collections-of-the-commit-path)
+timed both crates in one process on one pinned core of the Boat worker
+`bx_4xarzecx`, an AMD Ryzen 9 9950X, against `imbl` 7.0.2, in eight rounds that alternate
+the order of the two. Each commit case clones a map and changes one entry, as a single-quad
+commit and a control frame do. The table gives the ratio of the medians, `PMap` or
+`AppendVec` over `imbl`, at 100, 10,000 and 1,000,000 entries, and at 4,096, 100,000 and
+1,000,000 rows for the tails. Boat timings are approximate. The table is the run of an
+unhashed working tree of the change before its formatting, which the
+[run record](../../benchmarks/writes/runs/2026-11-27-persistent-collections-boat/README.md)
+identifies with the others. Two later runs of the sources of d2c524f6, which predate the
+repair of removal and tail appends in 6e6405bf, read the random inserts into one map of a
+million predicates at 1.89 and 1.98 and the control removal at a million entries at 1.17 and
+1.44, after a long test run on the worker. A run of the repaired code of 6e6405bf read the
+commits at 10,000 predicates at 1.09 and 1.18, the inserts into one map of 10,000 and of a
+million predicates at 1.12 and 1.24, the control removal at a million entries at 1.09 and the
+control lookup at 10,000 entries at 1.04, with the spatial tails again at about half of
+`imbl`'s time. Item 1246 holds the cases that ran slower, the commits at 10,000 predicates,
+the inserts into one map of 10,000 and of a million predicates, the control removal at a
+million entries and the control lookup at 10,000 entries, for an Intel host to confirm. The harness times collection operations alone and no
+whole-store commit or spatial query.
+
+| Case | Small | Medium | Large |
+|---|---|---|---|
+| Predicate commit, existing predicate | 0.77 | 1.14 | 1.08 |
+| Predicate commit, new predicate | 0.90 | 1.16 | 1.02 |
+| Predicate lookup | 0.46 | 0.53 | 0.82 |
+| Predicate iteration | 0.62 | 0.47 | 0.56 |
+| Predicate inserts into one unshared map | 1.02 | 1.13 | 1.60 |
+| Control frame, existing key | 0.93 | 0.95 | 0.96 |
+| Control frame, new key | 0.98 | 0.95 | 0.95 |
+| Control frame, removal | 1.00 | 1.03 | 1.24 |
+| Control lookup | 0.84 | 1.02 | 1.12 |
+| Control prefix of 16 entries | 0.79 | 0.85 | 1.14 |
+| Spatial tail commit of one row | 0.53 | 0.52 | 0.53 |
+| Spatial tail commit of 16 rows | 0.47 | 0.47 | 0.47 |
+| Spatial tail iteration | 0.47 | 0.48 | 0.44 |
+| Spatial tail lookup by position | 0.50 | 0.52 | 0.49 |
+
+A commit that changes one predicate of a million took 1.44 µs against 1.34 µs, and a control
+frame that sets one of a million keys 2.41 µs against 2.51 µs. A commit that appends one row
+to a spatial tail took 0.19 to 0.21 µs against 0.37 to 0.39 µs. Building a map of a million
+predicates by random inserts took 322 ns an insert against 202 ns. Integer maps with 16-entry
+nodes were measured as well and were not kept, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records.
+
+### Phase 6 outcome
+
+Persistent WAL transactions use one commit path. Each transaction enqueues its WAL
+records, vocabulary changes and optional annotation. A fence leader makes the batch
+durable and publishes its commits in order. Disabling batching or falling back from it
+seals a fence of one under the writer lock. A writer that finds a healthy idle
+coordinator skips speculative admission and predecessor checks under that lock.
+
+The fence uses write-through I/O for the writes that qualify and buffered writes with
+`fdatasync` otherwise. A WAL commit with an annotation carries `WAL_FLAG_ANNOTATED`.
+Recovery drops a torn tail whose required annotation is missing and retains all earlier
+acknowledged commits and their annotations. The crash-image suite exercises this case
+with a single writer on both the buffered and direct I/O paths. The WAL and annotation
+formats are unchanged.
+
+The writes benchmark still needs to verify serial latency on an Intel benchmark worker.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the

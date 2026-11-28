@@ -913,11 +913,17 @@ fn shapes_can_come_from_their_own_graph() {
 
 #[test]
 fn an_incremental_run_materializes_in_full_and_says_why() {
-    let s = store_of(
-        "ex:S a sh:NodeShape ; sh:targetClass ex:A ;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    let shapes = "ex:S a sh:NodeShape ; sh:targetClass ex:A ;
            sh:rule [ a sh:TripleRule ; sh:subject sh:this ; sh:predicate ex:p ; sh:object 1 ] .
-         ex:x a ex:A .",
-    );
+         ex:x a ex:A .";
+    s.load(&[Source::from_bytes(
+        format!("{PREFIXES}{shapes}").into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
     let profile = Profile::ShaclAf(ShaclAf::default());
     let cache = Cache::default();
     let opts = ReasonOptions::default();
@@ -932,12 +938,26 @@ fn an_incremental_run_materializes_in_full_and_says_why() {
         &opts,
     )
     .unwrap();
-    s.load(&[Source::from_bytes(
-        format!("{PREFIXES}ex:y a ex:A .").into_bytes(),
-        RdfFormat::Turtle,
-        None,
-    )])
+    sparkles_core::sparql::update::update(
+        &s,
+        "INSERT DATA { <http://example.org/y> a <http://example.org/A> }",
+        &Default::default(),
+    )
     .unwrap();
+    let pool = sparkles_core::sparql::pool::QueryPool::new(8 << 20);
+    let inspect_pool = pool.clone();
+    let opts = ReasonOptions {
+        memory_parent: Some(pool.work_parent()),
+        inspect: Some(std::sync::Arc::new(move |_| {
+            assert_eq!(
+                inspect_pool.granted(),
+                0,
+                "full SHACL-AF must skip incremental staging"
+            );
+            Ok(Vec::new())
+        })),
+        ..Default::default()
+    };
     let since = first.receipt.as_ref().map(|r| r.commit.seq);
     let second = materialize_incremental(
         &s,
@@ -950,6 +970,7 @@ fn an_incremental_run_materializes_in_full_and_says_why() {
         &opts,
     )
     .unwrap();
+    assert_eq!(pool.granted(), 0);
     assert_eq!(second.method, Method::Full);
     assert!(
         second

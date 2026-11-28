@@ -101,8 +101,7 @@ used in part. General composition through the top object property, canonical XML
 ill-typed literal semantics and datatypes outside the supported map remain in item 663.
 Item 692 runs the Horn
 rules on ontologies with individuals, functional data properties and top properties, as
-[The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
-shared hierarchical budget remains in item 675.
+[The Horn rules with individuals](#the-horn-rules-with-individuals) describes.
 
 Item 694 exposes EL-only (ELK) classification across the Rust API, HTTP routes, CLI and
 Python, Node.js and JVM bindings and keys the dataset's kept classification cache by
@@ -190,6 +189,41 @@ from 146.6 to 138.6 ms. Item 590 still waits for item 1254, since on `ore_ont_13
 the index build and the checks before it are 0.47 of a run
 that starts again, while item 664 shipped ahead of item 1254 over the index-comparison path.
 
+Item 1277 charges the modules' pass of [completeness for the whole
+ontology](#completeness-for-the-whole-ontology) to the classifier's memory budget and the
+pool's grant, as the saturation is charged. The pass held its index, its extractions and
+its lists outside both, about 107 MiB on ChEBI lite with the EL-only rules. It now admits
+each growth of that state through the run that classified, before it allocates, and a
+vector that moves to a larger buffer counts both buffers while it moves. The state raises
+the run's admitted peak, `Stats::peak_memory`, by the pass's own peak, which
+`Stats::coverage_memory` reports, and leaves the held estimate as it was. The pool is
+therefore charged the peak, and the answer keeps only its list of incomplete classes. A
+refusal fails a run with `Error::Memory`. A partial run answers as a pass that its
+deadline stopped would, once the state is freed, and it does so too when the pass fits
+but its list cannot be merged beside the full list of classes. A growth of that list
+also counts the list's old buffer while a reserve moves it. The index now polls the
+deadline and the cancellation every 4,096 axioms while it counts the axioms and while it
+indexes them, and the marking of the left-out axioms and the terminology's gates poll at
+the same rate, as the extractions do. The pass also polls once when it starts, so an
+armed stop ends it before it admits any scratch, whatever the size of the input. The lists of each entity's axioms and the classes by depth are
+ordered with unstable sorts on keys that tie nowhere, which give the order the stable
+sorts gave without their buffers.
+
+The walk of one axiom, which collects its signature, its needed sets and its triggers and
+checks its literals, is admitted before it allocates. Its bound comes from the axiom's
+heap and its count of entity references, found without allocating, and covers the scratch
+of the base64 and XML literal checks. The XML bound charges each `<` and each `=` of the
+literal for the most that an element or an attribute can hold, so a literal dense in
+attributes is admitted at several times what its check holds, and a tight budget can
+refuse a pass over such literals that it admitted before the item. The index checks each axiom's literals once and
+keeps the verdict, so the locality rules of the extractions allocate nothing for them.
+When the pass returns, the meter counts the list it answers and nothing else. On the
+400-class test ontology the pass held 392 KB at its peak, against 435 KB before the item,
+and the estimate was within 1.5 KB of the counting allocator's peak on four test
+ontologies of 50 to 20,000 classes, exact on two of them. The estimate covers the
+allocator's peak on all 640 cases of item 603 with the first or the last logical axiom
+left out, by at most about 11 KB. The figures on ChEBI and GO are not measured again.
+
 Item 664 extends incremental OWL 2 EL classification to edits involving individuals,
 nominals, assertions, keys, context merges, universal roles and conditional worlds. Plain
 EL terminologies without individuals continue to take the bitset invalidation path of
@@ -237,7 +271,8 @@ pass the bound and give their default answer, and 9 take the default paths. ore_
 run is rooted now. It passes the bound and gives the default answer, which is HermiT's,
 in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803 does the
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
-Item 1061 follows that cost.
+Item 1061 follows that cost, and [its section](#item-1061-shared-ground-reasoning-across-contexts)
+records what the contexts now share.
 
 Item 1265 closes a crash of the keys that the rewriting declines. When an ontology's only
 individuals were in axioms outside OWL 2 EL, the disjunctive rules took the run, the
@@ -391,18 +426,69 @@ bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlie
 which a rooted run classifies again without counting or without the rooted rules when such
 a restriction or edge arrives, and `=0` turns both off, for measurement.
 
-Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
+A closure check now tests the replay's lemma, that after a saturation that finished, Pred
+with every clause a successor sent and every restriction that reaches the successor gives
+nothing the context does not already hold. The check replays the clauses that each context
+received from its successors, so it says nothing about a clause that a successor never
+sent. A diagnostic build ran a version of the check that counted the clauses the replay
+stored and the units it derived, so it could not see a context whose only missing
+conclusion is a ground fact promoted to the root. It attempted the check in 157,672 runs on
+each of three routes, rooted runs that count, rooted runs without counting and runs that
+count without the root, over the generated and fixture ontologies on one and four requested
+threads with both strategies. On each route 2,912 runs ended without a result, and 69,240,
+5,944 and 142,684 runs on the three routes gave an answer without a result from the check.
+The check therefore audited
+85,520, 148,816 and 12,076 runs, and with the replay it found no context open in any of
+them. With `SPARKLES_COUNTING_LATE_UNIT=0` it found open contexts in 5,902, 370 and 2,518
+runs that reported a complete answer on those routes. The dedicated unit tests run the
+check on the ontologies built around each order of arrival. Their version replays in a copy
+of the run, reads only saturations that finished, and also counts the ground facts that a
+hypothetical context promotes to the root. The check is a measurement, and item 1229 stays
+open for the proof that the replay covers every order.
+
+On the same corpora and 4,000 further generated ontologies, 170,620 rooted runs that count
+gave 89,134 answers in full. Apart from one row of a search whose temporary files
+collided, the answers that differ from HermiT's are the four configurations of one of the
+further generated ontologies, which has a second loss. That loss does not come from the
+order of arrival, and ontologies built around individuals with at-most restrictions find
+it often. The original at-most rule applied an individual's restriction only in the
+context of its singleton. Of 10,222 complete answers on the generated at-most set, 312
+differed from HermiT's. On the qualified set 256 of 10,894 differed. A containment that
+counted even unqualified edges found these losses but gave up the consistent cases of
+item 897's compound qualifier. Counting only explicit qualified edges kept those cases
+but missed four answers on a file whose neighbour meets the qualifier under a queried
+class. The broader check gave up 5,346 of the 10,222 answers on the at-most set,
+7,340 of the 10,894 on the qualified set and 1,748 HermiT-confirmed answers on the
+earlier generated and fixture sets.
+
+The [ground at-most rule](#item-1229-at-most-restrictions-at-constants) now derives the
+merge where its premises hold. Four regressions exercise named and anonymous values,
+disjunctive premises and a merge conditional on the queried class. Further tests cover a
+qualifier entailed under a query, a maximum above one, a holder with a second class
+disjunct and a restriction on a successor of a constant. At revision `a271ea00`, all
+568 previously incorrect generated answers finished and agreed with HermiT, including all four
+configurations of the qualified case missed by the narrower containment. The
+[agreement report](../../benchmarks/el-classification/RESULTS.md#rooted-at-most-agreement)
+records coverage and the distribution of derived conclusions for that revision. The
+subsequent repair narrowed the ground-body cut to ground inferences and charged
+short index scans to the work bound. Tests exercise conditional counting in a successor,
+the bounds on counting products and the propagation of an equality between two
+successors of one individual. Item 1229 stays open for the completeness argument for
+ground counting and late Pred replay.
+
+Item 1231 recorded a loss of rooted runs. A fact that holds in a context only under the
 queried class and concerns an individual reached from another individual must reach the
 contexts registered for that individual, and its consequences there must come back to the
 context, and the departures above keep a context's conditional ground literals in that
 context.
-A rooted run therefore looks after its saturation for such a fact that cannot reach a
-registered context, and when it finds one it classifies again without the rooted rules and
-sets `Stats::dl_rooted_declined`. The check exempts four kinds of context without a proof,
-and it withdraws between 2 and 38 complete answers per generated corpus, so it is partial
-containment, and `Limits::rooted_decline` turns it off for measurement.
+A rooted run with `Limits::rooted_decline` therefore looks after its saturation for such a
+fact that cannot reach a registered context, and when it finds one it classifies again
+without the rooted rules and sets `Stats::dl_rooted_declined`. The check exempts four kinds
+of context without a proof, and it withdraws between 2 and 38 complete answers per generated
+corpus, so it is partial containment. It was on by default until item 1231 turned the
+repair on and the check off.
 
-`Limits::rooted_marker_repair`, off by default, repairs the delivery. A context that holds
+`Limits::rooted_marker_repair`, on by default, repairs the delivery. A context that holds
 a ground literal as a condition tells the root, which sends the literal as a marker to the
 contexts registered for its individuals that the root reaches, also to a context that
 registers or becomes reachable later. The root returns its clauses whose bodies hold such
@@ -447,6 +533,101 @@ million and finishes only at 63.2 million conclusions under a bound of 400 milli
 growth is in Pred over successor terms of constants and in Join, and g1-051_p0121 derives
 1.42 million conclusions against 1.17 million with unfiltered repair alone.
 
+Item 1286 keeps the Horn share in rooted runs. A rooted run without counting left out the
+functional, inverse-functional, asymmetric and disjoint properties and the number
+restrictions that need counting, as the rules without the root do, and still took the
+ontology for its disjunctive axioms, while a run without the option gave the same ontology
+to the Horn rules, which take those axioms. A rooted run that was not asked to count now
+checks the axioms outside OWL 2 EL before Tier D normalizes any of them. When the rooted
+rules without counting would leave out an axiom only for a construct that needs counting,
+and the Horn rules take that axiom, the run gives every axiom outside OWL 2 EL to the Horn
+rules and does not try Tier D. The Horn rules then take the axioms in the same build, so
+the run's memory budget, deadline, cancellation and partial answers apply as before.
+
+The check mirrors both normalizations structurally. It reads the axioms, the interner and
+the EL axioms without changing them, its walks allocate nothing, and it polls the run's
+deadline and cancellation every 128 steps. On the Tier D side a minimum of zero hides its
+filler, as the normalization reads it. An axiom that the rooted rules would also leave out
+for a self restriction, a data restriction, the top or bottom property or nesting deeper
+than they read does not refuse, and neither does an irreflexive property. The rooted rules
+with counting unfold a minimum in a positive position, and the dual of a maximum in a
+negative one, before they read its filler, so a minimum above 64 there does not refuse even
+when its filler is empty and the Horn rules take the axiom. They read the filler of a
+minimum in the minimum's own position, the filler of a maximum in the opposite one and the
+filler of an exact cardinality in both, so a number restriction inside a filler has the
+bound of its own position. On the Horn side the check follows the flattening of an
+inclusion, the limit of 64 on a minimum that the rules unfold, the bottom property and the
+simple roles that number restrictions and the property axioms need. The Horn rules remove
+the repeats of an interned expression from a disjunction, and the check compares the
+disjuncts it can match without interning them, such as an existential restriction and a
+minimum of one with the same filler. Two disjuncts that it cannot match count as distinct,
+and so do two whose comparison reaches its limit of 4,096 steps. The comparison charges the
+operands of an intersection or a union before it reads them, polls as it reads each one,
+and stops at that limit or at a cancellation without reading the remaining operands. A bounded search for a chain below a
+role settles its simplicity, reads an equivalence of properties as the ring of inclusions
+that the Horn rules build, and charges and polls every step. It follows that ring one
+inclusion at a time and visits at most 64 roles beyond the one it starts from, so it
+settles a member of an equivalence of 65 properties and not a member of one of 66. A role
+that the search does not settle does not refuse. An axiom that both rules leave out, such
+as a minimum above 64 with a filler that is not empty, therefore keeps the rooted run's
+disjunctive axioms and their consequences. The test for an individual in the axioms walks
+them without listing their individuals, and counts a step for every axiom and every
+expression it reads, so it polls in a long stretch of property axioms or declarations as
+well.
+
+Over item 805's rewriting the rooted rules read the rewritten axioms, and the Horn rules
+read the original axioms that each one stands for, with the role box of the original
+axioms. A run whose rewriting refuses does not build the rewritten axioms, and its build
+over the original axioms gives them to the Horn rules without asking again, since the
+rooted rules leave out the universal property there for a reason of their own. A Horn
+piece of a rewritten disjunctive axiom, such as the `≥2 r.∃U.A ⊑ ⊥` that a disjoint union
+with two such minimums makes, does not refuse, and the run keeps the rewriting.
+
+A refused run interns nothing before the Horn rules do. Its high-water mark equals the
+default run's on sroiq-017, sroiq-030 and sroiq-032 and is 422 bytes below it on
+mixed-031, and it is at most the default run's on the regression ontologies, including one
+over item 805's rewriting, whose plan is released before the Horn rules build. A first
+design tried the axioms that need counting with the Tier D normalization itself and
+dropped the scope of the one it left out. Its trial classes and nodes stayed in the
+interner, so under budgets near the default run's need it could stop a run that the
+default run answered. A refused run counts as one that did not try Tier D, so
+a memory refusal of its Horn build is the Horn rules' own and does not set
+`Stats::dl_over_budget`, and it sets neither `Stats::dl_rooted_over` nor
+`Stats::dl_rooted_declined`. A run asked to count that passes its bound starts again without
+counting and leaves those axioms out, as before counting was built, which item 1324
+follows. Items 1323, 1285 and 768 follow the irreflexive properties, self restrictions and
+data axioms that the rooted rules still leave out.
+
+At b47b582b, `mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032` left out 1, 1, 1 and 4
+more axioms in a rooted run than by default, and `sroiq-032` was consistent where the
+default run and HermiT find it inconsistent. At 17674a34 they left out 2, 1, 2 and 5 more,
+and the consistency of `sroiq-030` and `sroiq-032` was unknown. All four now give the
+default run's answer on one and four threads under both strategies, and `sroiq-030` and
+`sroiq-032` agree with HermiT on inconsistency and taxonomy. With counting, the three `sroiq`
+fixtures meet the refusal for the Nom rule and give the same answer.
+
+Across the 640 fixtures of item 603, a rooted run at 17674a34 left out an axiom that the
+default run takes on 27 fixtures and missed 1,349 of HermiT's subsumptions, against the
+default run's 1,254. A rooted run now misses 1,225, and no run of either kind answers a
+subsumption that HermiT does not. The check before the normalization gives the same counts
+on every fixture as the first design did. It recovers 127 subsumptions on `mixed-032`, `sroiq-013`,
+`sroiq-030` and `sroiq-032` and loses 3 on `sroiq-029` and `sroiq-040`, whose disjunctive
+axioms the rooted rules took beside the Horn axioms they left out. Those come back as the
+rooted rules take the axioms that need counting, which items 896 and 1283 follow, and so
+does the consistency of `sroiq-038` below. `mixed-032`,
+`sroiq-030` and `sroiq-032` become inconsistent as HermiT finds them, three fixtures go
+from unknown to consistent, and `sroiq-038` goes from consistent to unknown. A rooted run
+still leaves out an axiom that the default run takes on five fixtures. `data-015`,
+`mixed-001` and `mixed-010` leave out data axioms, which the disjunctive rules leave out in
+every run, and `sroiq-004` and `sroiq-040` have a default run that takes the disjunctive
+rules without the root, against which the rooted run leaves out fewer axioms. The
+regression of [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) that
+left out a minimum above one while the rooted run took the rest now checks that the Horn
+rules take the ontology. The crate's test of item 805's report of a rewritten axiom left
+out now builds the run without counting that follows the counting bound. The disjoint union
+of row 1304 keeps its rewriting, and its test checks a consequence that only the rewriting
+gives the rooted rules.
+
 Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
 mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
 in a non-root context carries `Stored::gbody` alongside `Stored::sel`, while root clauses
@@ -471,19 +652,215 @@ mode `129` it takes 251,217 derived conclusions, 32,307 stored clauses and 10.9 
 estimated memory, and on four threads eager it takes 336,298 derived conclusions, 41,450
 stored clauses and 12.6 MB peak estimated memory, against 232,622 conclusions (10.2 MB)
 with repair off and 262,033 conclusions (10.9 MB) with mode `1` on one thread cautious. The
-repair's state costs 8 bytes per context with the repair off, which item 1247 removes, and
-a synthetic family whose conditions nest two or more deep grows with the repair's sends,
-which is item 1251. The repair's completeness is not proved, and the check stays on by
-default.
+synthetic family whose conditions nest two or more deep grows with the repair's sends,
+which is item 1251.
+
+Item 1231 turned the repair on by default in mode `129` and the check off. The measurement
+covers the 33 generated corpus sets of the measurements above. They hold 18,916 input
+files, and 18,870 of them have a usable HermiT 1.4.5 reference. Each of those runs in two
+configurations. The first asks for one thread with the cautious strategy. The second, `4e`,
+asks for four threads with the eager strategy, and since a rooted run with the default
+steps saturates on one thread whatever the caller asks for, its saturation runs no workers
+concurrently. The parser rejects 690 files of `fz` and `gen` in both configurations and in
+every compared build, 1,380 rows in all, which leaves 36,360 result rows, 18,180 for each
+configuration. On those rows the default run claims 34,810 answers against 32,674 for the
+previous default, which had the repair off and the check on, and loses 3 claims, each to
+the rooted work bound. The only answers that differ from HermiT's are the two of s2-g2-150,
+which every setting gives and in which the rooted run derives four subsumptions that HermiT
+does not. Against a run with both the repair and the check off, which differs from HermiT
+on 1,456 answers, the repair leaves those two and loses 9 claims to the work bound, 6 of
+them in item 1251's family. The ratios below compare the default run with that run with
+both off, since the previous default claims no answer of the fixtures built for orders of
+arrival or of item 1251's family. On the larger generated sets the previous default claims
+the same answers as the run with both off, or a subset of them, while peak estimated memory
+differs between the two baselines because the previous default runs the decline check. On
+`g6`, where all three arms claim all 4,000 rows, the new default uses 1.0396 times the peak
+estimated memory of the both-off arm and 0.9904 times that of the previous default, and on
+`p3`, with all 2,400 claims in common, the ratios are 1.0349 and 0.9897. Over
+the answers that the default run and the both-off run both claim, the repair derives 3 to 13% more conclusions on the
+larger generated sets and 6.9% more over all sets, with 1.61 times on `av`, 1.96 times on
+the fixtures built for orders of arrival and 34.6 times on item 1251's family. The peak
+estimated memory of the same answers rises by 2.1 to 4.8% on the larger sets and 4.9% over
+all sets, with 1.20 times on `av`, 1.26 times on the fixtures and 4.4 times on item 1251's
+family. On `p2`, `g2` and `g6`, 93 to 98% of the added conclusions are the conclusion that
+each notice of a held literal charges, and most of those notices send no marker and return
+no clause. On `av` and `ps` the products of returned clauses and their consequences make up
+about half. Item 1337 follows the cost of the notices. Three repeated runs with
+`--no-dl-steps` on four threads, whose saturation does run four workers, on six sets, among
+them `av`, `ps` and the fixtures, and a run through `Classifier` on nine sets give no
+answer that differs from HermiT. On the forest set a run through `Classifier` claims the
+same 976 answers with and without the repair. The 18 forest answers that it does not claim
+against the saturation's pass the rooted bound without the repair too. The repair's
+completeness is not proved, which item 823 records for the rooted run as a whole.
+
+Item 1247 moved the repair's state out of the contexts. A run that uses the repair makes
+one table with the repair's first use and charges it to the memory budget. Each context
+that holds repair state keeps it in a slot of that table and names the slot with a 32-bit
+index in the padding after the flags of its Tier D state. A run without the repair makes no
+table, and each context with constants charges 8 bytes less than when it carried a pointer
+to its state. A handler takes a context's state out of its slot and puts it back when it
+finishes or unwinds. It puts the state back before a drain that can reach the same context
+again, and a second take of state that is out of its slot panics. On the 33 corpus sets, on
+one thread cautious and on four threads eager, the change gives the same claims, agreements
+and counts of derived conclusions as the build before it, with the repair on, with both the
+repair and the check off and with the old default. The one exception is an answer on `p3`
+whose count differs by one between runs of the same build. The peak estimated memory of a
+run with the repair off falls by a multiple of 8 bytes, at most 1,488 bytes. With the
+repair on it rises by a median of 0.03% and at most 512 bytes, which is what the table and
+its slots cost beyond the pointers they replace. Those rows come from the same two
+configurations as item 1231's, so their `4e` rows also saturate on one thread. Two repeated
+runs with `--no-dl-steps` on four threads, whose saturation runs four workers that share
+the table, on six sets, among them `av`, `ps` and the fixtures, give no answer that differs
+from HermiT.
+
+Item 1250 records a conditional argument for the cut. It holds for a run without
+counting, and it rests on the obligations of the journal's proof that the departures of
+item 804 already leave open, so it is not a proof that a rooted run with the selection off
+is complete. A clause of a context other than the root is ground-bodied when its body
+holds a literal that mentions neither `x` nor `y`, which is a ground literal, a literal
+over a successor term `f(u)` of a constant or a ground marker. A marker over `x`, such as
+`A(x) → A(x)`, does not make a clause ground-bodied. The cut leaves such a clause out of
+four inferences in that context. The first is Hyper at a constant, apart from the
+universals along a role atom between the constant and `x`, `y` or `f(x)`. The second is
+Hyper on a role atom from a constant whose other end is a constant or `f(u)`, and on that
+path the inferences with a disjoint role are skipped when either premise is cut. The third
+is Join with the clause on the side of the head, and the fourth is Eq or Factor whose two
+literals both mention neither `x` nor `y`. The clause stays a premise of Hyper over `x`,
+of Pred and Succ, of Join on the side of the body, of Eq and Factor with a literal over
+`x`, `y` or `f(x)`, and of the inferences local to the context. It also stays a premise of
+the universals at `x` along a role atom `r(x, u)` to a constant `u`, in either order of
+arrival, and these still merge the bodies of their premises, so `B(v) → (∀r.D)(x)` and
+`E(w) → r(x, u)` give `B(v) ∧ E(w) → D(u)`. The root's clauses are never cut.
+
+The argument has four parts. The first is the stage of facts. The model construction of
+item 1220's proof work starts from the clauses with an empty body of the query context and
+of the root, none of which is ground-bodied, so the cut leaves every inference among them in
+place. The second is the discharge of a ground body in the query context, and it covers
+only body literals whose terms are all constants. Join takes such a literal as its pivot
+and no other, the index of ground body literals holds only such literals, and registration
+with the root uses the same test, so a body literal over a successor term of a constant,
+such as `B(f(u))`, is not discharged by Join. Take a clause in the query context whose body
+literals that mention neither `x` nor `y` are all over constants and all hold in the model,
+and whose head is false in it. Each such body literal has a producer, a processed clause
+with an empty body and the literal maximal, held by the query context or delivered to it
+as a root fact by registration. The induction uses two properties of the producer. Its
+body is empty, so it is not ground-bodied and Join takes it on the side of the head. The
+rest of its head must be false in the model, which holds when it is the clause that makes
+the literal true there, and for a disjunctive producer this means that every other
+disjunct is false. Join with the
+clause on the side of the body and the producer on the side of the head is not cut, and
+the Join exemption keeps its conclusion, since the producer has no ground body literal.
+The conclusion has one ground body literal fewer, and its head is the clause's head with
+the rest of the producer's head, which is false in the model. Otherwise a live clause
+subsumes the conclusion with no more ground body literals and a head that is still false.
+Processing the clause first finds the producer through the index of maximal literals, and
+processing the producer first finds the clause through the index of ground body literals,
+so the order of arrival does not matter. After at most as many Joins as the body has
+literals over constants, the clause has no ground body and takes every inference.
+
+The third part is the elements outside the stage of facts. Each inference that the same
+construction needs at such an element has a pivot of its own, an atom over `x`, a literal
+over `f(x)` or a role atom between `x` and a constant, and the cut keeps all of them. A
+ground-bodied clause whose head holds a literal over a constant either has that literal
+true in the model, where its consequences follow from the clause with an empty body that
+produces it, or is assumed to reach the query context or the root by Pred with its ground
+body intact. In the query context the second part discharges the ground body, while the
+root does not apply the ground-body cut. Pred accepts a clause whose body holds atoms over
+`x`, role atoms `s(y, x)` and literals over constants alone, and whose head holds
+predecessor triggers, constant inequalities or role atoms between `x` and a constant, with
+the role-atom head handled on the rooted path over `f(u)` while ordinary Pred refuses it.
+The assumption therefore covers a clause of a shape that `pred_ready` accepts and the
+corresponding Pred path sends, and a clause of another shape needs a replacement of that
+shape with the same residual head. The fourth part is item 1231's return in mode `129`. The argument resolves
+a returned root clause against producers with an empty body in the query context, or
+against live clauses that subsume them, and the filter keeps those premises, since it
+excludes only holder premises with a ground body literal. The return finds a premise
+through the index of maximal literals, so a live clause that subsumes a producer serves
+as a premise only when it keeps the returned body literal maximal. A subsumer that drops
+that literal needs a separate argument. A returned clause is recorded under every literal
+of its body before the filter runs, and a late premise registers its holder before the
+filter can exclude it, so the order of arrival does not matter here either.
+
+The cut stops part of the growth as well. The side of the head of a Join is a clause
+without a ground body literal, so a Join's conclusion holds part of the ground body of the
+side of the body and never the union of two ground bodies. Hyper at a constant, Hyper on a
+role atom from a constant to a constant or to `f(u)`, the inferences with a disjoint role on
+that path and the ground equality inferences no longer copy a ground body into new
+conditional ground heads. The conditional facts over constants and over `f(u)` that these
+inferences made from other conditional facts, and that Pred took as partners, are no longer
+made. The universals at `x` along a role atom to a constant are not cut and still merge the
+bodies of their premises into a conditional fact over the constant, so the cut leaves that
+route of growth in place. Pred itself keeps ground-bodied partners, since a candidate that
+left them out broke the return of facts over `f(u)` that hold under a marker. The growth is
+cut where the routes above make those partners and not in Pred.
+
+Six obligations stay open. The first is the assumption of the third part, that a
+ground-bodied clause outside the query context whose literal is false in the model, or a
+replacement of the shape that Pred sends, reaches the query context or the root by Pred.
+The second is the holder of such a clause. A clause with a ground body and a literal over
+`f(u)` in its head can be held by a context other than the query context, and the argument
+does not show that such a context can discharge its body or that another context holds a
+replacement with the residual head and the maximality that a later inference needs, so the
+second part covers the query context only. The third is the lifting of clauses with `f(u)`
+to every context, which is the obligation of item 804's departures. The fourth is a body
+literal over a successor term of a constant in the query context, which Join does not take
+as a pivot. The argument needs to show that such a body cannot arise in this part of the
+construction or how its literal is discharged. The fifth is a live clause in mode `129` that
+subsumes a producer and drops the returned body literal. The sixth is that counting is not
+covered and that the filter of the return is checked only against the uses of the return
+that the argument names. No measured run loses an entailment to any of them, and all six
+stay with item 1220's proof, which item 823 waits for. An earlier design also proposed
+selecting one ground body literal for Join and pruning a product early against the store.
+The consult on the design found that the first needs the holder argument above, which is
+open, and that the second breaks the product's guarantee that every union reaches the
+redundancy test, so neither was built.
+
+The cut finishes the ontologies of the item. The measured set holds 104 generated input
+files around g1-051_p0012, which are g1-051_p0011, g1-051_p0012, g1-051_p0121, 17 one-axiom
+deletions, 22 further reductions, 25 ablations, 24 files of item 1251's family with ground
+conditions nested one and two deep, the two files of part022 and 11 fixtures and reductions
+from the tests of the cut. Some files share their axioms, such as `misc/d00.ofn` and
+`q3b-del/d00.ofn`, so the 104 files hold 91 distinct ontologies, and every count below is
+over the 104 files. Each ran on one thread under the cautious strategy and on four under the
+eager one, with the selection off, the partners of item 1220's repair off, the check off, a
+bound of 4 million conclusions and HermiT 1.4.5's taxonomy as the reference. These runs use
+`Saturation::classify` over the logical axioms, as the `el_classify` example does, which
+derives fewer conclusions than `Classifier` on the same file, so g1-051_p0012 takes 143,778
+conclusions in mode `129` on one thread here against the 251,217 above. The harness
+records a combined fallback flag (`dl_rooted_over || dl_over_budget`), which covers
+work-limit and memory-budget fallbacks on the cut and uncut arms (where decline is off)
+and also decline fallbacks on the selection-on arms. Without the cut and with the repair
+off, 26 files fall back under the 4 million conclusion limit in 50 runs. Of these, 24 fall
+back in both configurations, H3 only on one thread and min-C3 only on four threads.
+Without the cut, 37 files fall back in 74 runs in each of modes `129` and `1`, and
+g1-051_p0012 finishes only with the repair off, at 455,969 conclusions on one thread. With
+the cut, every file finishes with the repair off except C4, which falls back with the
+selection on as well. With the repair on, three files of item 1251's family with
+conditions two deep fall back too. Every complete rooted disjunctive answer agrees with HermiT, in 204 runs with the
+repair off and 198 in each of modes `129` and `1`. The two runs of `misc/r1_meet.ofn` in
+each mode finish complete in Tier EL, so they are not among those runs, and they agree with
+HermiT as well. g1-051_p0012 takes 141,886 conclusions with the repair off, 143,778 in mode
+`129` and 145,794 in mode `1` on one thread, H1 takes 135,615, 138,457 and 140,992, and
+g1-051_p0121 takes 95,081, 101,181 and 135,892. The runs with the selection on keep the
+check on and were made with the repair off and in mode `129`. In each of those modes, 156
+runs finish as complete rooted disjunctive runs both with the cut and the selection off and
+with the selection on, and over them the cut derives 1.002 times the total conclusions of
+the selection with the repair off and 1.006 times in mode `129`. With the repair off, 156
+runs also finish as complete rooted disjunctive runs both with and without the cut, and over
+them the cut derives 0.32 times the total conclusions of the uncut runs. C2, C3, min-C2 and
+min-C3 finish between 602,198 and 2,590,900 conclusions with the repair off, above the
+default bound of 524,288, with the cut as with the selection, and U4 does so in mode `129`.
+One file costs more. part022 p01 takes 568,223 conclusions on one thread with the cut,
+against 390,545 without it and 507,837 with the selection, so it exceeds the default bound
+of 524,288 with the selection off, as it does on four threads under the eager strategy with
+the selection on. Item 1324 follows it and C4.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several
-of the repair's scans also charge one conclusion for every 16 entries that they read,
-while others do not. The preparation of an inference, such as the premise lists of a rule
-and their pruning, takes time and memory in proportion to the clauses that the context
-already holds and is not charged while it runs. The redundancy test of each derived
-conclusion against the stored clauses is not counted either, here as in the rest of Tier
-D. The run checks the work bound, the memory budget, the deadline and a cancellation at
+of the repair's scans also charge one conclusion for every 16 entries that they read.
+Item 1280's meter, described below, counts the reads of the repair's other preparation
+and of the rooted rules' premise lists. The redundancy test of each derived conclusion
+against the stored clauses is not counted, here as in the rest of Tier D. The run checks the work bound, the memory budget, the deadline and a cancellation at
 cooperative checkpoints, which come after every 256 choices of a product, after every 64
 sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
 totals. Earlier builds added retained index growth to the memory estimate only after
@@ -507,7 +884,7 @@ product enumeration and marker-repair handlers are guarded against callback unwi
 Non-ground `fold` and ground products pre-admit candidate buffers, retained union payloads,
 table rehashes, step-list growth and `prune` scratch, keep drained buffers charged until
 emitted when switching to streaming at 4,096 unions, and account for live union payloads
-when `slack_covered` pre-reserves table slack on M-return. The discretionary Horn and Tier
+beside any table slack that M-return reserved before item 1280 removed that reservation. The discretionary Horn and Tier
 D memory allowance now uses a deterministic `.len()`-based logical input size independent
 of thread count while `Limits::max_memory` and `Limits::charge` continue to observe full
 container capacities, and `Saturation::retained_bytes` includes `DlRun::lits`. Counting-allocator
@@ -516,7 +893,8 @@ concurrent literal and ledger boundaries, non-ground and ground products, marker
 unwind cleanup and multi-chunk thread invariance. Remaining estimation boundaries outside
 item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment allocations,
 un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
-`DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
+`DlRun::bytes`, and the reads of premise-list preparation, which item 1280 meters as
+described below.
 
 Item 1075 delivers demand-driven binary case splitting over disjunctive constant
 equalities in rooted runs behind the default-off `Limits::rooted_eq_split` switch, as
@@ -531,52 +909,139 @@ the checked-in HermiT oracle and exact `describe` instances, and across all 50 `
 fixtures it completes within the bound with zero taxonomy differences against HermiT.
 Enabling the switch by default waits on benchmark-host qualification under item 823.
 
-A returned clause reserves memory before its products run, both on initial arrival and when a
-late premise replays saved returns. Before item 1291, the product of a clause that
-is not ground charged each union that it kept, as every rule did, but not the table that
-records its unions nor the spare capacity of each step's list. These grow with the number of
-unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
-million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
-and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
-tables before draining their products and release it after them, and each late-replay batch
-reserves the checked sum of its held products and the largest product's table bound before
-draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
-unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
-enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
-refused reservation rolls back any debit it added and stops the run as a refused charge does.
-The bound takes one union per choice of the product,
-which can exceed the unions a step keeps by more than a thousand times. That overcount is
-what makes it a bound. Its model of a step's tables, taken at the unions that the step
-actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
-returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
-24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
-those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
-256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
-conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
-stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
-reservation, so that run did not finish under its own budget either way. Item 1291 now
-charges those product tables and step lists directly on both default and repair paths, while
-item 1280 replaces the loose upfront bound with a shared meter.
+Before item 1280, a returned clause reserved a bound on the tables of its product that is
+not ground before the product ran, both on initial arrival and when a late premise replayed
+saved returns. The bound took one union per choice of the product, which can exceed the
+unions a step keeps by more than a thousand times, and on a product of 2^57 choices it
+could not be represented at all. Item 1291 made the product charge its tables and step lists
+directly as they grow, on both default and repair paths, so the upfront bound only
+duplicated a charge that the product already made.
 
-Some steps of the repair and of the rooted rules read between two checks without counting
-what they read. The steps named here are the ones that were measured or reproduced, and
-other preparation falls under the rule above. The premise lists of a returned clause are
-prepared for one return, and for up to 64 returns when a late premise replays them,
-before the next check. On the three files where the returns derive most, part022 p01,
-g1-051_p0121 and g1-051_p0012 under the containment arm with the repair at 1 and at 129,
-a list read at most 548 premises and kept at most 378, one pruning of a list made at most
-38,226 comparisons, and the preparation of a batch of returns allocated at most 143 KB,
-at most 6.4% of the holder's store at the time. The index of a clause that the root
-offers to its holders is built for the whole body before the first check, so that step is
-bounded by one clause's body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test
-of each of the diagnostic's products scans the context's stored clauses without a count.
-The marker pass that the diagnostic and the decline check run after a rooted run
-saturates checks no bound. The decline check runs it on every rooted run with the check
-on, with the repair on or off. When the last step of a wide product passes 4,096 unions,
-the product derives the 4,097 unions that it holds before its next check, also with the
-repair off. Item 1260 follows the stop latency of the marker pass and of the wide
-product, and item 1280 gives the repair and the store's premise lists one meter that
-counts these reads.
+Item 1280 gives the repair and the rooted rules' premise lists one meter,
+`dl_rules::Meter`. A read is one entry of the store's index, one literal of a clause, or one
+step of a comparison of two premises. During saturation a meter checks the run's work bound,
+memory budget, deadline and cancellation once every 1,024 reads. A step counts each read
+before it makes it. A scan or copy of a premise, a side or a head reads one literal at a time
+or in spans that end one read short of the next check, so that a step makes no more than
+1,024 reads between two checks however wide one premise or clause is, and a check that stops
+the meter comes before the rest of the scan. A count of many reads at once, such as the reads
+that stand for one conclusion of the diagnostic, is split at each check with the rest carried
+to the next. The library sorts of a list's sides by length, of an assembled clause's
+literals and of the root fact offer's destinations are not split, and item 1323 follows
+them. The count since the last check lives in the activation's
+sink, which all meters of an activation share, so that many short scans in a row still meet
+a check. The meter's checks are new, and its reads charge nothing to the work bound except
+where a scan of the repair charged one conclusion for every 16 entries before. Those scans
+keep that charge, so runs with the repair off and the repair's own counts of derived
+conclusions are unchanged. A check that stops a meter ends the scan that made it at once.
+The meter reads these steps.
+
+- The premise lists of a returned clause are read twice, once to size them and once to build
+  them, with a read for each body literal looked up, each index entry, each head literal of
+  a premise, whose count sizes the premise's side, each literal that M-return-cf tests and
+  each literal that the build pass copies, the fixed premise's and the base head's included.
+  The buffer of the lists' sizes is admitted before it is made, and the lists, the product's
+  slot and the pruning's scratch are admitted before the lists are built. The pruning of each
+  list reads each side's literals for its signature and its test of order as it computes
+  them, and a read for each comparison of two sides and for each literal that a comparison
+  steps over. This holds on initial arrival, where the clause's index under its body literals
+  reads through the same meter and the bounds are checked in full before the product is
+  drained, and for every return that a late premise replays, with one meter across the
+  replay, M-return-cf's test of the late premise's body and the search for its literal
+  included, and a check of the bounds before each batch drains.
+- The root's offer of a clause whose body is ground triggers reads through the meter for
+  each body literal it tests, looks up in the index, adds to the index or compares to choose
+  the holders it scans. A stop while the clause is indexed leaves the rest of its body
+  unindexed in a store that the stop interrupts.
+- On the default path, Hyper reads each body position of an ontology clause and each
+  partner in the index, and its restriction, its test of a routable unit, its sizing and its
+  copy read each literal of a partner and of the premise that they touch, in spans as they
+  go. The build of a product's lists reads each body position again and copies the fixed
+  premise in spans through the same meter. Hyper's test of root facts over a constant ends at the first refused read. Join reads each
+  body literal of the given clause and each premise over a ground body literal, and its
+  restriction, its count of the premise's head and its copy read in spans as they go. A stop
+  inside Join's copy releases the conclusion's admission. The root's offer of a fact reads each literal of its head, each lookup of the
+  registrations of a constant and each destination, and admits its list of destinations
+  before it builds it.
+
+The marker pass that the decline check and the diagnostic run after a rooted run saturates
+is outside the saturation. Its redundancy test of each product reads the stored candidates,
+the literals of their comparisons, the copies of the chosen premises and of the base's head,
+each literal that the normalization of an assembled clause filters or compares as it removes
+repeats, each literal that its test of a tautology compares, and each literal of the clause's
+signature, through a meter of its own. The test of a tautology includes the search of the
+head for each equality's inequality and each step of a walk over the sorted body and head.
+The library sorts of the assembled clause and the lookup of its whole head among the root's
+promoted facts read without the meter, and item 1323 follows them. That meter
+checks only the deadline and cancellation through the diagnostic's callback, and it counts
+its reads as separate deficit work, `dwork`, which neither the saturation's work bound nor
+the admission of the deficit pass's scratch takes.
+
+The upfront bound is gone. A return's premise lists are admitted exactly before they are
+built, and the product charges its own tables as they grow. On a return of 64 × 64 premises
+whose conclusions a stored unit subsumes, a counting allocator measures a heap that the
+charged peak covers together with the return's retained record of the clause and its copy of
+it, and the charge stays within four times the heap. A return over a wide body whose first
+literal has no premise admits its buffer of the lists' sizes before it makes it, so that a
+grant below the buffer refuses the return before the heap grows by it. A return of 2^57
+choices now runs until the work bound or its tables' charge against the memory budget stops
+it, where before it stopped at once on an unrepresentable bound. Under a budget of 4 MiB the
+test fixture stops within the product's second step, before the product derives anything.
+
+The tests of the meter cover these cases. They refuse each check of the bounds in turn
+during a return's premise lists and their pruning, the index of a returned clause and of an
+offered clause, an offered clause's holders, Hyper's lists and partners, the root's offer of
+a fact, Join's premises and the search for a root fact. Each time they find no read asked
+of the stopped meter and nothing held once the step returns. For a return's lists, Hyper,
+its partners and Join, a wide premise of Join among them, they find the caller's guard
+holding only what the step kept while the guard is still live, and for a return's lists
+and Join no product or conclusion pushed. For the indexes and the offers they find the
+store interrupted. A stop inside the index of an offered clause leaves the rest of its body
+unlisted and sends nothing, and a stop in the root's offer of a fact sends nothing. A stop
+while the 1,200 holders of an offered clause are scanned sends nothing, and a stop at a
+check between the deliveries of their returns sends fewer returns than there are holders. A pruning of two wide sides reads every
+literal of both, and a refusal of its first read ends it. A redundancy test of a product
+whose head holds 4,096 distinct equalities stops at the first check inside its test of a
+tautology, after exactly 1,024 reads since the check before, and asks no read of the
+stopped meter. A redundancy test of a product whose body holds 4,096 distinct literals below
+its one head literal stops at the first check inside the walk over the body in the same way.
+A copy of a fixed premise of 3,072 literals in Hyper stops at each of its checks with the
+caller's guard holding only what the step kept and no product pushed. A fresh meter that
+charges and is refused at the first check of a count of 2,053 reads charges the 1,024 reads
+up to that check and none of the rest, through a sink and through the diagnostic's
+callback. A late replay whose preparation and flush are granted stops at the first
+charge inside the drain, before it derives anything, and holds nothing. A return of one premise under a sink that
+grants memory without the full check derives nothing after a stop that was already asked
+for. A test reads through guarded views of one sink that keeps the activation's count, with
+a check-only meter and a repair's meter that charges, and finds the check at the 1,024th
+read of the two together and the repair charged one conclusion for every 16 of its own
+reads. A late replay's batches keep M-return's rule across a flush. A test harness grows the
+premises per literal, the length of a premise, the width of a single premise, the returned
+body, the body that a late premise's literal is searched for in, the returns of a late
+premise, the holders and body of an offered clause, the stored clauses of the diagnostic's
+test, Hyper's premises, partners and fixed premise, the root fact offer's registrations and head, and
+Join's premises and given body eight times over, as well as a premise, a partner, a side, a
+returned clause's head and a late premise's body of up to 8,192 literals and a head of up to
+2,048 equalities. It asserts each time that no more than 1,024 reads are counted between two
+checks, that no more than 1,024 reads are made between two checks, as the scans and copies
+count them where they make them, that every read the fixture needs is counted and that the
+sink sees a check for every 1,024 reads. The fixtures are unit fixtures over one context's store, and
+the harness does not run a whole saturation.
+
+Item 1323 follows the scans that the meter does not read. These are Pred's lists in the
+root, the pruning of the products of the other rules on the default path and of the unions
+of one step of a product, the scans of the equality split and merge, which keep a counter of
+their own, Join's head lookups, the universals over role atoms, the moves of universals to
+and from constants, the registration of a context with the root, Hyper's restriction and
+copy of its fixed premise alone for a conjunction or an existential restriction, the
+materialization of the head atoms of a multi-head ontology clause in Hyper, the root fact
+offer's list of constants and the sort, deduplication and delivery of its destinations, the
+library sorts named above, the diagnostic's lookup of an assembled clause's whole head among
+the root's promoted facts, and the copy of a returned clause that M-return takes before it
+admits its lists. Outside the diagnostic's
+counts and redundancy test, which check the deadline and cancellation, the marker pass that
+the decline check and the diagnostic run after a rooted run saturates checks no bound, and
+item 1260 follows it.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -1062,7 +1527,7 @@ authentication and pool-admission refusals, strict selectors, and pool admission
 `503` and `507`, and the JVM's `OntologyTest`
 covers pinned views and read transactions after a later commit and the refusal in a write
 transaction without a flush. The Python and Node.js bindings do not take the selector
-and are item 1325.
+and are item 1339.
 
 ### The OWL 2 EL classifier
 
@@ -1264,13 +1729,14 @@ storage remains counted until the last alias drops. Index copies, functional-dat
 groups and key scratch admit overlapping storage before growth. A numeric memory,
 cancellation or deadline refusal stays a typed classification error through the Horn
 and DL paths. It does not turn the value into an opaque atom or a completed fallback.
-This accounting does not charge standalone XML lexical-validation scratch or complete
-the hierarchical owner integration of item 675.
+Standalone XML lexical validation scratch is uncharged.
 A counting allocator measured each run's peak heap within 15% of the estimate on GO,
 ChEBI lite and the largest ORE 2015 EL ontologies. A run that stops before its saturation ends
 drops its contexts, since the next run starts again. In the handle the threads come from the
-algorithm pool, the budget from the query's memory budget and the server's memory pool
-grant, and a run past the budget answers `507` with `budget: "memory"`.
+algorithm pool, and memory comes from the local limit and the request's grant or pool.
+A live result and a kept saturation own separate credit. The dataset's retained branch
+backs cached classifications when configured. Otherwise the shared work pool covers the
+cache. A run past the memory budget answers `507` with `budget: "memory"`.
 
 **Surfaces.** `Ontologies::classify` and `OntologyScope::classify` classify an open
 ontology. `POST /$/ontology/{ds}/classify`, the `classify` operation of the shared JSON
@@ -2618,8 +3084,8 @@ and JVM bindings and `sparkles ontology classify --partial --expansion` take the
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
 the JSON and of `Classified::complete` stays true only for a run that finished and reported
-no axiom left out. A rooted run can miss entailments with the flag true, which item 1231
-records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
+no axiom left out. The completeness of a rooted run with the flag true is not proved, which
+item 823 records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
@@ -4666,7 +5132,7 @@ of a functional property, one with `∃d.xsd:int[1, 2]` and the other with
 and fires on exactly the premises that Hyper would take with them, since a valid clause
 whose body atoms are not all maximal in the context cannot fire there. This makes the
 unrooted run complete in the sense of the existing tiers. The rooted run takes the same
-rule, and its completeness rests on the rooted calculus, which item 1231 records as not
+rule, and its completeness rests on the rooted calculus, which item 823 records as not
 proved. A search or a set of minimal pairs past its bound passes the work bound as the
 case analysis of an inference does. An earlier design kept the data successors as terms
 of the clauses, with data function symbols, equalities between data terms and a data
@@ -4910,10 +5376,17 @@ to the calculus once the root exists, since a nominal in a class axiom already g
 root ground clauses, such as `⊤ → B(o)` for `{o} ⊑ B`. The run also takes keys over object
 properties and the universal property, as below. Data properties wait on item 768, and self
 restrictions and reflexive properties stay refused. An irreflexive property is left out and
-reported, and the run takes the other axioms, as it does with a minimum above one when
-counting is off. The property is left out because a nominal or an equality of constants can
-close a loop, as `r(a, a)` does, and the rules above check irreflexivity only on simple
-properties without loops. The Nom rule with its generated nominals is not built. Nom fires only when a nominal,
+reported, and the run takes the other axioms. The property is left out because a nominal or
+an equality of constants can close a loop, as `r(a, a)` does, and the rules above check
+irreflexivity only on simple properties without loops. Item 1323 follows the Horn rules'
+share of it. Without counting, the run leaves out the functional, inverse-functional,
+asymmetric and disjoint properties and the number restrictions that need counting, as the
+rules above do. When one of them is Horn, the Horn rules take it in a run without the
+option, so a rooted run does not trade that share for its disjunctive axioms. Every axiom
+outside OWL 2 EL then goes to the Horn rules, and the disjunctive axioms are left out and
+reported instead (roadmap item 1286). A run asked to count that passes its bound starts
+again without counting and keeps its disjunctive axioms, as before counting was built. The
+Nom rule with its generated nominals is not built. Nom fires only when a nominal,
 an inverse property and an at-most restriction meet, so the run refuses that interaction. A
 symmetric or inverse functional property counts as an inverse for this test, and so does
 the symmetric property that replaces the universal property.
@@ -4977,7 +5450,10 @@ Sequoia holds back asserted ground facts from a context in a similar way.
 
 A minimum restriction above one in a positive position is not weakened to an existential
 restriction in a rooted run with counting off, since `A ⊑ ≥2 r.{o}` makes `A`
-unsatisfiable. Such an axiom is reported as left out instead. With counting on, a minimum
+unsatisfiable. Such an axiom is left out instead. When it is a Horn axiom that the Horn
+rules take, a run that was not asked to count gives the ontology to the Horn rules, as
+above, while a disjunctive axiom with such a minimum is left out as the run takes the rest.
+With counting on, a minimum
 restriction gets inequalities between its successor terms, `M(x) → f_i(x) ≉ f_j(x)`, in
 place of the globally disjoint fresh fillers of the rules above, which a nominal can make
 unsound. Three individuals with `M ⊑ ≥2 r.⊤` and `∀r` over two of three shared constants
@@ -5067,8 +5543,9 @@ The hand cases `nominal-inverse-max`, `nominal-bounded-count` and
 `nominal-predecessor-cases` need the Nom rule. Every case in the gate runs with counting
 off, on one and four threads, under both strategies, and must equal HermiT's taxonomy and
 consistency. Regressions with one disjunctive axiom added check that an irreflexive
-property beside a nominal is left out while the run takes the rest, and that a stopped rooted run reports its consistency
-as unknown.
+property beside a nominal is left out while the run takes the rest, that a minimum above
+one without counting sends the ontology to the Horn rules, and that a stopped rooted run
+reports its consistency as unknown.
 
 With the journal's rules as first built, the rooted run finishes 132 of the 200 runs of the 50 `shoi` fixtures,
 on one and four threads under both strategies, within 5 s each in a debug build, and each
@@ -5432,6 +5909,138 @@ is the duplication of ground reasoning across contexts that item 1061 follows. I
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
+
+#### Item 1229: at-most restrictions at constants
+
+Without ground counting, the context of a singleton can merge two values of its
+individual without another context learning the equality. For example, suppose that
+`a` has at most one r-value and both `r(a,b)` and `r(a,c)` hold. If every member of a queried
+class has `b` as a p-value, each has a p-value in every class that contains `c`. Counting only over
+the local element `x` can miss that subsumption.
+
+A rooted run that counts also instantiates the at-most clause at a constant or a
+successor term of a constant. It uses maximal premises in the same context and respects
+the rooted cut on premises with a ground body literal when every participating term
+is ground. In a successor, a ground marker such as `M(a) → M(a)` may meet a local
+edge such as `r(a,x)`. The resulting equality keeps the marker in its body. For a holder of
+`≤n r.B` at term `u`, it takes one qualified edge from `u` to each of `n+1` syntactically
+distinct terms. Its conclusion contains the disjunction of all pairwise equalities of
+those terms. In every interpretation at least two of the values coincide. When a
+conclusion has several alternative equalities, a unit equality already held in this
+context can replace a successor term of a constant by its named value. A pair that
+then coincides already satisfies the conclusion. When the restriction has other class
+disjuncts, the conclusion keeps those alternatives at `u`.
+For example, a maximum of two over three values gives three alternative equalities.
+Choosing any one pair unconditionally would change the meaning.
+
+For a maximum at `x`, counting disables the nominal-successor shortcut in
+`into_nominal`. An existential into a singleton therefore supplies a successor term
+`f(x)` to the ordinary `at_most` rule. The nominal and equality rules then identify the
+term with the named value and rewrite the consequences of the merge. This covers
+two named existential values and a named value beside an anonymous one. An edge
+to a constant or its successor term with no corresponding existential witness is
+outside this argument.
+
+Qualification combines a matching edge, including one on a subrole, with a premise
+for the filler at its other end. Either arrival can complete the inference. Likewise
+a new holder can enumerate its edges, and a new edge can complete a group for an
+existing holder. Each inference retains all premise bodies and all head literals except
+the resolved occurrences. A merge obtained under a query assumption therefore remains
+in its context. A merge from unconditional root premises is available through the
+ordinary root fact delivery and equality rules. These rules already represent and
+rewrite equalities between two successor terms of constants.
+
+The rule draws its terms from the premises and creates neither individuals nor nested
+successor terms. It uses the existing limits on group width, subset count and product
+payload. Scratch space and stored products count against the memory budget. The
+diagnostic switch `SPARKLES_ROOTED_ATMOST=0` disables these additional inferences.
+Relative completeness under the rooted calculus's selection and delivery restrictions,
+and the proof for all orders of late Pred replay, remain part of item 1229.
+
+#### Equality rewrites to known query atoms (item 1284)
+
+A rooted query can obtain the same conclusion many times when a primitive class
+is placed below an enumeration. If rewriting `B(u)` with an equality between the
+individual `u` and the query variable `x` would yield a known unit `B(x)`, ordinary
+clause simplification discards the conclusion. The switch `SPARKLES_ROOTED_EQ_KNOWN=1`
+skips that product whichever premise arrives last. Bottom and locally denied atoms
+still take the ordinary path because the simplifier handles them first. The switch
+is off by default.
+
+On the six-axiom enumeration fixture with its 18 primitive subclasses, this cut
+the one-thread work count from 3,388,100 to 969,033. That still exceeds the
+524,288 default work bound. The two large OBO inputs whose subclass axioms reproduce
+the effect normally take the Horn route under item 1286.
+
+On the generated ontology `s2-g2-150`, both switch settings produce four named
+subsumptions that HermiT 1.4.5.519 omits. Two explicit assertions of the universal
+object property suffice for HermiT to entail all four as well. Those assertions
+already hold in every interpretation of the original ontology. The original
+discrepancy remains part of the evidence for item 823.
+
+#### Item 1061: shared ground reasoning across contexts
+
+Item 1061 shares the ground part of a rooted run's reasoning between the root and the
+other contexts. Three switches, all off by default, control it. `SPARKLES_ROOTED_SHARED_FACTS=1`
+marks a unit that the root delivers to another context as the root's. That context then
+leaves out a ground inference whose premises are all such units and whose conclusion is a
+unit over constants it is registered for, because the root derives the same conclusion and
+delivers it. The context also takes a successor's clause over constants alone once for
+each successor instead of once for each edge to it. `Limits::rooted_merge`, or
+`SPARKLES_ROOTED_MERGE=1`, merges two individuals when the ontology asserts their equality
+or the root derives it as a unit, and starts the run again on the merged ontology within
+the same work bound. Merging alone, with shared facts off, takes shoi-022 within the bound
+with 455,548 derived conclusions on one thread and 479,366 on four eager threads, in one
+run each of the build before forwarding. `SPARKLES_ROOTED_BOUND_PER_CLASS=1` raises
+the bound of a rooted run without counting to 32 conclusions for each named class when
+that is more than 524,288.
+
+With shared facts on, a context that holds a root unit and would send it to a predecessor
+other than the root by Pred sends it as the root's own delivery instead, under the root's
+identifier for the clause. Pred moves such a unit unchanged, because a root unit goes to a
+predecessor only when its body is empty and its literals hold constants alone, so the
+predecessor receives the same clause by either message and runs the same rules on it.
+Only the channel and the provenance change. The root's delivery skips the test by which
+Pred admits a clause over the edge it arrives by. The received unit holds in every model
+because the root derived it, whatever edge links the predecessor to the sender. The
+context's copy takes the root's identifier when the root's delivery arrives, also when the
+context derived the unit itself and already sent it by Pred under its own identifier, so
+every forwarded copy carries the root's identifier whatever the order of arrival. The
+predecessor therefore takes the unit once, however many successors send it, and holds it
+as the root's, so the rule for root units applies there too. The predecessor
+still makes every inference it made before, except those that the rule for root units
+leaves out, so forwarding is complete if that rule is. That rule's completeness is not
+proved, as for the rest of the rooted run. `SPARKLES_ROOTED_FACT_FORWARD=0` turns
+forwarding off, and the run then derives exactly what it derived before forwarding.
+
+The forwarding work counts below come from the forwarding build measured before the
+canonical-ID arrival-order fix. On ore_ont_14924, the rooted run with shared facts and without forwarding needs 5,073,778
+conclusions, and 16,693,380 without shared facts. With forwarding it needs 324,029 on one
+thread and 321,884 on four eager threads, within the bound, and gives HermiT's taxonomy
+with and without merging. On the 393 generated ontologies of item 805 that parse, on one
+and on four threads, forwarding derives fewer conclusions in 220 of the 357 runs on one
+thread that finish with and without it and more in 7. It finishes the same runs apart
+from one four-thread run of s2-g2-115, whose outcome varies between schedules in both
+builds, and it changes no answer.
+The dl1061 regression family derives 0.55 times the conclusions on one thread, and the 50
+`shoi` fixtures all finish with HermiT's taxonomies with merging and item 1075's
+splitting, as before. With shared facts and merging, one run of shoi-022 needs 424,376
+conclusions on one thread and 430,041 on four eager threads with forwarding, against
+425,497 and 470,299 without it. The largest of 20 runs on four eager threads needs 506,938
+conclusions with forwarding and 474,314 without it, both within the bound.
+
+Two parts of the item remain. 36 of the generated ontologies still pass the bound in 71
+runs, all on one thread and all but s2-g2-266 on four. With a bound of 30 million on one
+thread, 11 of them finish, 18 pass that bound, 4 run past 120 s and 3 end without
+finishing or passing it. Ten of the 11 report 529,652 to 29.8 million conclusions. The
+eleventh, s2-g2-266, reports 4,982 under that bound, although its single-thread run passes
+the default bound. In the first 600,000
+conclusions of each, the commonest rule is Pred over the edges `f_e(u)` to successors in
+18 files and Eq on equalities `f_e(u) ≈ v` in 7, both in the contexts other than the root.
+Forwarding does not reach that work, since those clauses are not root units. ore_ont_15803 needs 3,778,620 conclusions with or
+without forwarding, about 9.5 for each of its 398,583 named classes, so no sharing brings
+it under 524,288. It finishes with HermiT's taxonomy of 2,432,194 entailed pairs under the
+per-class bound of 12,754,656, whose adoption is a separate decision about the bound.
 
 #### Item 1075: binary splitting over disjunctive equalities of constants
 
@@ -5952,10 +6561,26 @@ which the classes not yet decided are incomplete, so an answer depends on the in
 alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
 deadline or cancellation during the pass leaves every class incomplete and the
 consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
-dataset retains the saturation but publishes no such answer. On a loaded laptop with four
-threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
-EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+dataset retains the saturation but publishes no such answer. The pass polls the deadline
+and the cancellation every 4,096 axioms while it counts and indexes the axioms, marks the
+left-out ones, checks the terminology's gates and extracts its modules. On a loaded
+laptop with four threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI
+lite with the EL-only rules, which leave axioms of both out. These are single
+approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
 do since they read only the taxonomy.
+
+The pass's index, its extractions and its lists of axioms and classes count against the
+run's memory budget and the pool's grant, as the saturation does, when the pass runs
+through the run that classified, as it does inside a classification and on the server.
+The pass then admits each growth before it allocates. Its own peak is reported as
+`Stats::coverage_memory`, its peak beside what the run holds counts in
+`Stats::peak_memory`, and the held estimate grows only by the list of incomplete classes.
+`Classification::cover` on its own admits nothing and only reports the pass's peak. When
+the budget or the pool refuses the pass, or the merge of the list it answers, the
+classification fails with the memory error, which the server reports as
+`budget-exceeded`. A run with `partial` answers instead as a pass that its deadline
+stopped would, with every class incomplete, the consistency unknown and `coverageStopped`
+set, and fails only when the full list of classes does not fit either.
 
 `strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
 `reason`, `reduce` and `materialize` refuse a run that is not complete for the whole

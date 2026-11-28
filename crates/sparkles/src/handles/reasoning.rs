@@ -51,7 +51,8 @@ impl Reasoning {
     /// run fails with [`Error::Cancelled`](crate::Error) and writes nothing, and a run
     /// that yields to a write ([`ReasonRequest::yield_to_writers`]) fails with a
     /// `reasoner` component error whose code is
-    /// [`SUPERSEDED`](crate::reasoning::run::SUPERSEDED).
+    /// [`SUPERSEDED`](crate::reasoning::run::SUPERSEDED). A run whose record was
+    /// superseded by a later materialization or clear after commit also returns this code.
     ///
     /// [`ReasonRequest::yield_to_writers`]: crate::reasoning::ReasonRequest::yield_to_writers
     #[cfg(feature = "reasoning")]
@@ -116,9 +117,16 @@ impl Reasoning {
     #[cfg(feature = "reasoning")]
     pub fn clear(&self) -> Result<u64> {
         let state = self.ds.state();
-        let n = sparkles_reasoner::clear(&state.store).map_err(super::from_anyhow)?;
-        state.closure.clear();
-        state.set_reasoning(None)?;
+        let (n, (clear, cache_generation)) =
+            crate::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+                sparkles_reasoner::clear_prepared(&state.store, || {
+                    let clear = state.pending_imports.lock().prepare_run();
+                    (clear, state.closure.generation())
+                })
+            })
+            .map_err(super::from_anyhow)?;
+        state.store.failpoint("reasoning-clear-committed");
+        state.finish_reasoning_clear(clear, cache_generation)?;
         Ok(n)
     }
 
@@ -143,6 +151,15 @@ impl Reasoning {
         crate::reasoning::diff::diff(&self.ds, request)
     }
 
+    /// Compare selected states with an owner that retains the output memory credit.
+    #[cfg(feature = "reasoning")]
+    pub fn diff_admitted(
+        &self,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::AdmittedEntailmentDiff> {
+        crate::reasoning::diff::diff_admitted(&self.ds, request)
+    }
+
     /// Compute an entailment delta over the actual complete states of a write preview.
     #[cfg(feature = "reasoning")]
     pub fn diff_preview(
@@ -151,6 +168,16 @@ impl Reasoning {
         request: &crate::reasoning::diff::DiffRequest,
     ) -> Result<crate::reasoning::diff::EntailmentDiff> {
         crate::reasoning::diff::preview(&self.ds, preview, request)
+    }
+
+    /// Compare preview states with an owner that retains the output memory credit.
+    #[cfg(feature = "reasoning")]
+    pub fn diff_preview_admitted(
+        &self,
+        preview: &crate::preview::Preview,
+        request: &crate::reasoning::diff::DiffRequest,
+    ) -> Result<crate::reasoning::diff::AdmittedEntailmentDiff> {
+        crate::reasoning::diff::preview_admitted(&self.ds, preview, request)
     }
 
     /// Find minimal asserted supports for a diagnostic finding or an unsatisfiable class.

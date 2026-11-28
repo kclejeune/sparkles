@@ -79,6 +79,10 @@ pub struct MemorySettings {
     /// the expiry of idle scratch branches that MCP agents leave behind (spec C17 §5.7)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch_branches: Option<ScratchBranches>,
+    /// unified redaction policy for imports, `register_source` and server ingestion
+    /// (spec C18 item 77)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<RedactionSettings>,
 }
 
 /// The shortest idle time after which a scratch branch may expire.
@@ -276,6 +280,152 @@ pub struct SecretPattern {
     pub regex: String,
 }
 
+/// How server-side document ingestion handles a redaction match (spec C18 item 77).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerIngestRedaction {
+    /// replace matches before chunking, storage and extraction
+    #[default]
+    Redact,
+    /// fail the ingestion task with `secret-detected` before writing or calling a model
+    Refuse,
+    /// skip redaction during server-side document ingestion
+    Off,
+}
+
+fn default_entropy_min_length() -> usize {
+    20
+}
+
+fn default_entropy_min_bits() -> f64 {
+    4.0
+}
+
+/// High-entropy token detector thresholds (`memory.redaction.entropy`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EntropySettings {
+    #[serde(default = "default_entropy_min_length")]
+    pub min_length: usize,
+    #[serde(default = "default_entropy_min_bits")]
+    pub min_bits_per_char: f64,
+}
+
+impl Default for EntropySettings {
+    fn default() -> EntropySettings {
+        EntropySettings {
+            min_length: default_entropy_min_length(),
+            min_bits_per_char: default_entropy_min_bits(),
+        }
+    }
+}
+
+/// Unified redaction settings (`memory.redaction`, spec C18 item 77).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RedactionSettings {
+    /// extra named regex patterns, merged with `imports.secretPatterns`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<SecretPattern>,
+    /// high-entropy token detection (off when omitted)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entropy: Option<EntropySettings>,
+    /// opt-in personal data categories: `email`, `phone`, `payment-card`, `iban`, `ip`
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub personal: Vec<String>,
+    /// regex patterns whose matched spans are never redacted
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// redact exact known secret values (server secrets on the server, sensitive env vars
+    /// in the CLI); enabled by default
+    #[serde(default = "default_true")]
+    pub known_values: bool,
+    /// run the `register_source` check on every graph rather than only under `imports.base`
+    #[serde(default)]
+    pub everywhere: bool,
+    /// how server-side document ingestion handles matches (`redact`, `refuse` or `off`)
+    #[serde(default)]
+    pub server_ingest: ServerIngestRedaction,
+}
+
+impl Default for RedactionSettings {
+    fn default() -> RedactionSettings {
+        RedactionSettings {
+            patterns: Vec::new(),
+            entropy: None,
+            personal: Vec::new(),
+            allow: Vec::new(),
+            known_values: true,
+            everywhere: false,
+            server_ingest: ServerIngestRedaction::Redact,
+        }
+    }
+}
+
+const PERSONAL_CATEGORIES: &[&str] = &["email", "phone", "payment-card", "iban", "ip"];
+
+fn validate_secret_patterns(field: &str, patterns: &[SecretPattern]) -> Result<(), String> {
+    if patterns.len() > 100 {
+        return Err(format!("{field}: at most 100 patterns"));
+    }
+    for p in patterns {
+        if p.name.is_empty()
+            || p.name.len() > 64
+            || !p
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(format!(
+                "{field}: invalid name {:?}: use 1 to 64 letters, digits, - or _",
+                p.name
+            ));
+        }
+        if let Err(e) = regex::Regex::new(&p.regex) {
+            return Err(format!("{field}: {}: {e}", p.name));
+        }
+    }
+    Ok(())
+}
+
+impl RedactionSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_secret_patterns("redaction.patterns", &self.patterns)?;
+        if let Some(e) = &self.entropy {
+            if !(8..=1024).contains(&e.min_length) {
+                return Err("redaction.entropy.minLength: must be from 8 to 1024".into());
+            }
+            if !e.min_bits_per_char.is_finite() || !(0.0..=8.0).contains(&e.min_bits_per_char) {
+                return Err(
+                    "redaction.entropy.minBitsPerChar: must be a number from 0 to 8".into(),
+                );
+            }
+        }
+        if self.personal.len() > 16 {
+            return Err("redaction.personal: too many categories".into());
+        }
+        for c in &self.personal {
+            if !PERSONAL_CATEGORIES.contains(&c.as_str()) {
+                return Err(format!(
+                    "redaction.personal: unknown category {c:?}; use email, phone, payment-card, iban or ip"
+                ));
+            }
+        }
+        if self.allow.len() > 100 {
+            return Err("redaction.allow: at most 100 patterns".into());
+        }
+        for (i, expr) in self.allow.iter().enumerate() {
+            if expr.is_empty() {
+                return Err(format!("redaction.allow[{i}]: pattern must not be empty"));
+            }
+            if let Err(e) = regex::Regex::new(expr) {
+                return Err(format!("redaction.allow[{i}]: {e}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `imports` of `memory.json` (§8.10.2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -405,7 +555,83 @@ impl MemorySettings {
                 ));
             }
         }
+        if let Some(r) = &self.redaction {
+            r.validate()?;
+        }
         Ok(())
+    }
+
+    /// All custom secret patterns configured for the dataset: legacy
+    /// `imports.secretPatterns` and `redaction.patterns`.
+    pub fn effective_secret_patterns(&self) -> Vec<&SecretPattern> {
+        self.imports
+            .iter()
+            .flat_map(|i| i.secret_patterns.iter())
+            .chain(self.redaction.iter().flat_map(|r| r.patterns.iter()))
+            .collect()
+    }
+
+    /// How server-side document ingestion handles redaction matches (`redact` by default).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn server_ingest_redaction(&self) -> ServerIngestRedaction {
+        self.redaction
+            .as_ref()
+            .map_or(ServerIngestRedaction::Redact, |r| r.server_ingest)
+    }
+
+    /// Whether `register_source` checks every graph rather than only graphs under `imports.base`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn redaction_everywhere(&self) -> bool {
+        self.redaction.as_ref().is_some_and(|r| r.everywhere)
+    }
+
+    /// Whether known secret values (server secrets on the server) are redacted.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn redaction_known_values(&self) -> bool {
+        self.redaction.as_ref().is_none_or(|r| r.known_values)
+    }
+
+    /// Build the unified redaction [`sparkles_memory_import::redact::Policy`] for this
+    /// dataset, merging built-in patterns, `imports.secretPatterns`, `redaction`, and
+    /// any caller-supplied known values.
+    #[cfg(feature = "mcp")]
+    pub fn redaction_policy(
+        &self,
+        known_values: Vec<String>,
+        known_label: &str,
+    ) -> sparkles_memory_import::redact::Policy {
+        use sparkles_memory_import::redact;
+        let mut patterns = redact::builtin();
+        for p in self.effective_secret_patterns() {
+            if let Ok(pat) = redact::Pattern::new(&p.name, &p.regex) {
+                patterns.push(pat);
+            }
+        }
+        let mut policy = redact::Policy::from_patterns(patterns);
+        if let Some(r) = &self.redaction {
+            if let Some(e) = r.entropy {
+                policy.entropy = Some(redact::EntropyConfig {
+                    min_length: e.min_length,
+                    min_bits_per_char: e.min_bits_per_char,
+                });
+            }
+            for cat in &r.personal {
+                if let Some(c) = redact::PersonalCategory::parse(cat)
+                    && !policy.personal.contains(&c)
+                {
+                    policy.personal.push(c);
+                }
+            }
+            for expr in &r.allow {
+                if let Ok(re) = regex::Regex::new(expr) {
+                    policy.allow.push(re);
+                }
+            }
+        }
+        if self.redaction_known_values() && !known_values.is_empty() {
+            policy = policy.with_known_values(known_values, known_label);
+        }
+        policy
     }
 }
 
@@ -426,26 +652,7 @@ impl Imports {
                 format!("{}*", self.base)
             ));
         }
-        if self.secret_patterns.len() > 100 {
-            return Err("imports.secretPatterns: at most 100 patterns".into());
-        }
-        for p in &self.secret_patterns {
-            if p.name.is_empty()
-                || p.name.len() > 64
-                || !p
-                    .name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-            {
-                return Err(format!(
-                    "imports.secretPatterns: invalid name {:?}: use 1 to 64 letters, digits, - or _",
-                    p.name
-                ));
-            }
-            if let Err(e) = regex::Regex::new(&p.regex) {
-                return Err(format!("imports.secretPatterns: {}: {e}", p.name));
-            }
-        }
+        validate_secret_patterns("imports.secretPatterns", &self.secret_patterns)?;
         Ok(())
     }
 }
@@ -801,9 +1008,61 @@ mod tests {
             json!({"agentGraphs": [], "unknown": 1}),
             json!({"agentGraphs": ["https://x.example/*"], "consolidatedGraph": "https://x.example/c"}),
             json!({"agents": {"a": {"conversationFacts": "later"}}}),
+            json!({"redaction": {"personal": ["ssn"]}}),
+            json!({"redaction": {"entropy": {"minLength": 4}}}),
+            json!({"redaction": {"entropy": {"minLength": 1025}}}),
+            json!({"redaction": {"entropy": {"minBitsPerChar": -0.1}}}),
+            json!({"redaction": {"entropy": {"minBitsPerChar": 9.0}}}),
+            json!({"redaction": {"allow": ["[invalid"]}}),
+            json!({"redaction": {"serverIngest": "ignore"}}),
         ] {
             let (s, _) = send(&app, json_req("PUT", "/$/memory/org", bad.clone())).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        // Without `redaction`, memory.json stays at format 1 for older releases.
+        let disk: Value = serde_json::from_slice(
+            &std::fs::read(ds.store.root().unwrap().join(MEMORY_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disk["format"], 1, "{disk}");
+        // With `redaction`, memory.json stamps format 4.
+        let with_red = json!({
+            "agentGraphs": ["https://example.org/memory/agents/*"],
+            "redaction": {
+                "patterns": [{"name": "acme-id", "regex": "ACME-[0-9]{6}"}],
+                "entropy": {"minLength": 20, "minBitsPerChar": 4.0},
+                "personal": ["email", "iban"],
+                "allow": ["ACME-000000"],
+                "knownValues": true,
+                "everywhere": true,
+                "serverIngest": "refuse"
+            }
+        });
+        let (s, v) = send(&app, json_req("PUT", "/$/memory/org", with_red)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["redaction"]["serverIngest"], "refuse", "{v}");
+        let disk: Value = serde_json::from_slice(
+            &std::fs::read(ds.store.root().unwrap().join(MEMORY_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disk["format"], 4, "{disk}");
+        for entropy in [
+            json!({"minLength": 8, "minBitsPerChar": 8.0}),
+            json!({"minLength": 1024, "minBitsPerChar": 0.0}),
+        ] {
+            let (s, v) = send(
+                &app,
+                json_req(
+                    "PUT",
+                    "/$/memory/org",
+                    json!({
+                        "redaction": { "entropy": entropy }
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+            assert_eq!(v["redaction"]["entropy"], entropy, "{v}");
         }
     }
 

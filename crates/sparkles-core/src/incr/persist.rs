@@ -116,25 +116,51 @@ pub struct Writer<'a> {
     index: FxHashMap<Id, u64>,
     keys: Vec<Vec<u8>>,
     body: Vec<u8>,
+    admission: super::budget::ScratchLease,
+    error: Option<Error>,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(snap: &'a Snapshot, terms: &'a Terms) -> Writer<'a> {
+        Self::with_admission(snap, terms, Default::default())
+    }
+
+    pub(crate) fn with_admission(
+        snap: &'a Snapshot,
+        terms: &'a Terms,
+        admission: super::budget::ScratchLease,
+    ) -> Writer<'a> {
         Writer {
             snap,
             terms,
             index: FxHashMap::default(),
             keys: Vec::new(),
             body: Vec::new(),
+            admission,
+            error: None,
         }
     }
 
-    pub fn u64(&mut self, mut v: u64) {
-        while v >= 0x80 {
-            self.body.push((v as u8) | 0x80);
-            v >>= 7;
+    fn append(&mut self, bytes: &[u8]) {
+        if self.error.is_some() {
+            return;
         }
-        self.body.push(v as u8);
+        let old = self.body.capacity();
+        let cap = sparkles_budget::sizes::vec_grown(old, self.body.len(), bytes.len(), 1);
+        if cap > old {
+            if let Err(error) = self.admission.try_reserve(cap as u64) {
+                self.error = Some(error);
+                return;
+            }
+            self.body.reserve_exact(cap - self.body.len());
+            self.admission.release(old as u64);
+        }
+        self.body.extend_from_slice(bytes);
+    }
+
+    pub fn u64(&mut self, v: u64) {
+        let (bytes, len) = encode_u64(v);
+        self.append(&bytes[..len]);
     }
 
     pub fn i64(&mut self, v: i64) {
@@ -142,16 +168,19 @@ impl<'a> Writer<'a> {
     }
 
     pub fn i128(&mut self, v: i128) {
-        self.body.extend_from_slice(&v.to_le_bytes());
+        self.append(&v.to_le_bytes());
     }
 
     pub fn bytes(&mut self, b: &[u8]) {
         self.u64(b.len() as u64);
-        self.body.extend_from_slice(b);
+        self.append(b);
     }
 
     /// An id, as the number of its term in the table (0 for unbound).
     pub fn id(&mut self, id: Id) -> Result<()> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
         if id.is_undef() {
             self.u64(0);
             return Ok(());
@@ -159,12 +188,16 @@ impl<'a> Writer<'a> {
         let n = match self.index.get(&id) {
             Some(&n) => n,
             None => {
-                let key = self.terms.key(self.snap, id).ok_or_else(|| {
-                    Error::Corrupt(format!(
-                        "a view's state holds an id with no term ({:#x})",
-                        id.0
-                    ))
-                })?;
+                self.admission.try_reserve(160)?;
+                let key = self
+                    .terms
+                    .key_budgeted(self.snap, id, &mut self.admission)?
+                    .ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "a view's state holds an id with no term ({:#x})",
+                            id.0
+                        ))
+                    })?;
                 self.keys.push(key);
                 let n = self.keys.len() as u64;
                 self.index.insert(id, n);
@@ -194,22 +227,46 @@ impl<'a> Writer<'a> {
 
     /// The term table followed by the body.
     pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.body.len() + self.keys.len() * 16 + 8);
-        let mut w = Writer {
-            snap: self.snap,
-            terms: self.terms,
-            index: FxHashMap::default(),
-            keys: Vec::new(),
-            body: Vec::new(),
-        };
-        w.u64(self.keys.len() as u64);
-        for k in &self.keys {
-            w.bytes(k);
-        }
-        out.extend_from_slice(&w.body);
-        out.extend_from_slice(&self.body);
-        out
+        self.finish_charged().unwrap().0
     }
+
+    pub(crate) fn finish_charged(mut self) -> Result<(Vec<u8>, super::budget::ScratchLease)> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let (count, count_len) = encode_u64(self.keys.len() as u64);
+        let bytes = self
+            .keys
+            .iter()
+            .fold(self.body.len().saturating_add(count_len), |n, key| {
+                n.saturating_add(encode_u64(key.len() as u64).1)
+                    .saturating_add(key.len())
+            });
+        let mut output = self.admission.sibling();
+        output.try_reserve(bytes as u64)?;
+        let mut out = Vec::with_capacity(bytes);
+        out.extend_from_slice(&count[..count_len]);
+        for key in &self.keys {
+            let (len, width) = encode_u64(key.len() as u64);
+            out.extend_from_slice(&len[..width]);
+            out.extend_from_slice(key);
+        }
+        out.extend_from_slice(&self.body);
+        drop(self);
+        Ok((out, output))
+    }
+}
+
+fn encode_u64(mut v: u64) -> ([u8; 10], usize) {
+    let mut out = [0; 10];
+    let mut len = 0;
+    while v >= 0x80 {
+        out[len] = (v as u8) | 0x80;
+        v >>= 7;
+        len += 1;
+    }
+    out[len] = v as u8;
+    (out, len + 1)
 }
 
 /// Decodes a state into the id space of a snapshot and a fresh set of local terms.
@@ -438,15 +495,20 @@ pub fn encode(h: &Header, body: &[u8]) -> Vec<u8> {
 /// The bytes of a checkpoint file of `kind`.
 pub fn encode_as(kind: Kind, h: &Header, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + body.len());
-    out.extend_from_slice(kind.magic);
-    out.extend_from_slice(&kind.format.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(h.dataset.as_bytes());
-    out.extend_from_slice(&h.commit.to_le_bytes());
-    out.extend_from_slice(&h.fingerprint.to_le_bytes());
-    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    out.extend_from_slice(&crc32(body).to_le_bytes());
+    out.extend_from_slice(&encoded_header(kind, h, body));
     out.extend_from_slice(body);
+    out
+}
+
+fn encoded_header(kind: Kind, h: &Header, body: &[u8]) -> [u8; HEADER] {
+    let mut out = [0; HEADER];
+    out[..8].copy_from_slice(kind.magic);
+    out[8..12].copy_from_slice(&kind.format.to_le_bytes());
+    out[16..32].copy_from_slice(h.dataset.as_bytes());
+    out[32..40].copy_from_slice(&h.commit.to_le_bytes());
+    out[40..48].copy_from_slice(&h.fingerprint.to_le_bytes());
+    out[48..56].copy_from_slice(&(body.len() as u64).to_le_bytes());
+    out[56..60].copy_from_slice(&crc32(body).to_le_bytes());
     out
 }
 
@@ -553,24 +615,33 @@ pub fn write_as(
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file_name(h.commit));
     let tmp = path.with_extension("tmp");
-    let ours = |b: &[u8]| {
-        b.len() >= 12
-            && &b[..8] == kind.magic
+    let ours = |p: &Path| -> std::io::Result<bool> {
+        use std::io::Read;
+        let mut b = [0; 12];
+        let mut file = std::fs::File::open(p)?;
+        if file.read_exact(&mut b).is_err() {
+            return Ok(false);
+        }
+        Ok(&b[..8] == kind.magic
             && kind
                 .reads
-                .contains(&u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")))
+                .contains(&u32::from_le_bytes(b[8..12].try_into().expect("4 bytes"))))
     };
     // a file of the same commit that another release wrote is left in place
-    if let Ok(existing) = std::fs::read(&path)
-        && !ours(&existing)
-    {
+    if let Ok(false) = ours(&path) {
         return Err(Error::Unsupported(format!(
             "{} holds a {} this release does not write over",
             path.display(),
             kind.what
         )));
     }
-    crate::store::write_synced(&tmp, &encode_as(kind, h, body))?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&encoded_header(kind, h, body))?;
+        file.write_all(body)?;
+        file.sync_all()?;
+    }
     before_rename();
     std::fs::rename(&tmp, &path)?;
     crate::store::sync_dir(dir)?;
@@ -587,7 +658,7 @@ pub fn write_as(
             continue;
         }
         // a file another release wrote is left alone
-        let known = std::fs::read(&p).ok().is_some_and(|b| ours(&b));
+        let known = ours(&p).unwrap_or(false);
         if known {
             let _ = std::fs::remove_file(p);
         }

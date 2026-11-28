@@ -581,12 +581,14 @@ impl std::ops::Deref for LoadedSchema<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explain_inner<'a>(
     snap: &Snapshot,
     leaves: SchemaLeaves,
     graphs: &[Id],
     triple: &[Term; 3],
     limits: ExplainLimits,
+    memory_parent: Option<sparkles_budget::ParentHandle>,
     resolve: Option<&WorkspaceResolver<'_>>,
     load_schema: impl FnOnce(
         &ExplainWorkspace,
@@ -606,7 +608,7 @@ fn explain_inner<'a>(
         leaves,
         deadline,
         cancel,
-        workspace: ExplainWorkspace::for_answer_limit(max_memory),
+        workspace: ExplainWorkspace::with_memory_parent(max_memory, memory_parent),
         reads: std::cell::Cell::new(0),
         resolve,
     };
@@ -785,12 +787,28 @@ impl RdfsOnRead {
         limits: ExplainLimits,
         resolve: Option<&WorkspaceResolver<'_>>,
     ) -> Result<Explained> {
+        self.explain_resolving_with_parent(snap, leaves, graphs, triple, limits, resolve, None)
+    }
+
+    /// Explain an RDFS answer under an enclosing pool allowance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn explain_resolving_with_parent(
+        &self,
+        snap: &Snapshot,
+        leaves: SchemaLeaves,
+        graphs: &[Id],
+        triple: &[Term; 3],
+        limits: ExplainLimits,
+        resolve: Option<&WorkspaceResolver<'_>>,
+        memory_parent: Option<sparkles_budget::ParentHandle>,
+    ) -> Result<Explained> {
         explain_inner(
             snap,
             leaves,
             graphs,
             triple,
             limits,
+            memory_parent,
             resolve,
             |workspace, check| {
                 self.schema_controlled_with_workspace(snap, workspace, check)
@@ -829,8 +847,15 @@ impl RdfsSchema {
         let wrapped =
             resolve.map(|r| move |g: Id, t: &[Term; 3], _workspace: &ExplainWorkspace| r(g, t));
         let resolve = wrapped.as_ref().map(|r| r as &WorkspaceResolver<'_>);
-        explain_inner(snap, leaves, graphs, triple, limits, resolve, |_, _| {
-            Ok(LoadedSchema::Borrowed(self))
-        })
+        explain_inner(
+            snap,
+            leaves,
+            graphs,
+            triple,
+            limits,
+            None,
+            resolve,
+            |_, _| Ok(LoadedSchema::Borrowed(self)),
+        )
     }
 }

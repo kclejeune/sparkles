@@ -261,15 +261,28 @@ impl InternalCircuit {
         if let Some(e) = status_error(&st.status) {
             return Err(e);
         }
+        // The decoded rows stay with the scratch credit that covers them in an owner
+        // that frees the rows first, so no error return below releases the credit
+        // while the rows are still allocated.
+        let mut charged = st
+            .circuit
+            .rows_charged()
+            .map(|(rows, lease)| super::read::ChargedRows { rows, lease })?;
+        let columns = st.circuit.columns_charged(&mut charged.lease)?;
+        charged
+            .lease
+            .try_reserve(std::mem::size_of_val(charged.rows.as_slice()) as u64)?;
+        let rows = std::mem::take(&mut charged.rows)
+            .into_iter()
+            .map(|(r, w)| (r, w.unsigned_abs()))
+            .collect();
         Ok(InternalRows {
             commit: st.circuit.applied,
-            columns: st.circuit.columns(),
-            rows: st
-                .circuit
-                .rows()
-                .into_iter()
-                .map(|(r, w)| (r, w.unsigned_abs()))
-                .collect(),
+            columns,
+            rows,
+            _memory: internal::RowsMemory {
+                _lease: st.circuit.detach_scratch_lease(&mut charged.lease),
+            },
         })
     }
 
@@ -286,15 +299,16 @@ impl InternalCircuit {
                 "the internal circuit keeps no provenance",
             ));
         }
+        let mut lease = st.circuit.scratch_lease();
+        let columns = st.circuit.columns_charged(&mut lease)?;
+        let rows = st.circuit.annotated_rows_charged(&mut lease)?;
         Ok(AnnotatedRows {
             commit: st.circuit.applied,
-            columns: st.circuit.columns(),
-            rows: st
-                .circuit
-                .annotated_rows()
-                .into_iter()
-                .map(|(r, w, a)| (r, w.unsigned_abs(), a.unwrap_or_default()))
-                .collect(),
+            columns,
+            rows,
+            _memory: internal::RowsMemory {
+                _lease: st.circuit.detach_scratch_lease(&mut lease),
+            },
         })
     }
 
@@ -449,7 +463,7 @@ impl Runtime {
         let whole = whole_reason(graphs.as_ref()).map(str::to_string);
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
-        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_runtime_pool(self.pool.clone(), self.circuit_parent());
         circuit.set_local_limit(Some(spec.max_memory_bytes));
         // the dataset's reading of errors in aggregates when the circuit attaches
         let errors = self.host_or_open().aggregate_errors();
@@ -962,29 +976,41 @@ impl Runtime {
             let Some(snap) = st.circuit.snap.clone() else {
                 continue;
             };
-            let r = st.circuit.encode(&snap).and_then(|body| {
-                let mut e = Enc::default();
-                e.u64(body.len() as u64);
-                e.raw(&body);
-                match &st.tally {
-                    None => e.u64(0),
-                    Some(t) => {
-                        e.u64(1);
-                        t.lock().encode(&mut e);
+            let credit = CheckpointCredit(&st.circuit);
+            let r = st
+                .circuit
+                .encode_charged(&snap)
+                .and_then(|(body, mut lease)| {
+                    let tally_bytes = st.tally.as_ref().map_or(0, |t| t.lock().bytes());
+                    lease.try_reserve(
+                        (body.len() as u64)
+                            .saturating_mul(3)
+                            .saturating_add(tally_bytes.saturating_mul(8))
+                            .saturating_add(64),
+                    )?;
+                    let mut e = Enc::default();
+                    e.u64(body.len() as u64);
+                    e.raw(&body);
+                    match &st.tally {
+                        None => e.u64(0),
+                        Some(t) => {
+                            e.u64(1);
+                            t.lock().encode(&mut e);
+                        }
                     }
-                }
-                persist::write_as(
-                    checkpoint_kind(&st.circuit),
-                    &dir(&root, &cell.spec.id),
-                    &persist::Header {
-                        dataset: self.dataset,
-                        commit: applied,
-                        fingerprint: cell.fingerprint,
-                    },
-                    &e.0,
-                    || store.failpoint("internal-checkpoint-written"),
-                )
-            });
+                    persist::write_as(
+                        checkpoint_kind(&st.circuit),
+                        &dir(&root, &cell.spec.id),
+                        &persist::Header {
+                            dataset: self.dataset,
+                            commit: applied,
+                            fingerprint: cell.fingerprint,
+                        },
+                        &e.0,
+                        || store.failpoint("internal-checkpoint-written"),
+                    )
+                });
+            drop(credit);
             match r {
                 Ok(()) => {
                     st.checkpointed = applied;
@@ -1191,7 +1217,7 @@ mod charge_tally_tests {
         let q = parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
         let mut circuit = Circuit::new(compile(&q, None).unwrap(), None);
         let pool = QueryPool::new(1 << 20);
-        circuit.set_pool(Some(pool.clone()), Some(pool.work_parent()));
+        circuit.set_runtime_pool(Some(pool.clone()), Some(pool.work_parent()));
 
         // Populate 50 commits (VecDeque capacity 64), then discard 1..=45, keeping
         // 46..=50 (5 entries) while retaining spare VecDeque capacity (`64 <= 5 + 1 + 64`).

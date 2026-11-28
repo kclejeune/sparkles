@@ -226,10 +226,53 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels and decoding twins
-have shipped. Item 675 remains open for reasoning and incremental-view budgets. Stage 5's
-join-kernel library has shipped, and its other phases follow the
-[plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
+479 of stage 2. Stage 4's query-memory accounting, mode-neutral kernels, decoding twins
+and hierarchical budget have shipped. Stage 5's join-kernel library has shipped, and its
+other phases follow the [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks
+the rest of the work.
+
+Item 675 links materialization, demand reasoning, OWL 2 QL rewriting, bounded ontology
+analysis and incremental view circuits to the query pool. A nested reasoner uses the
+query's parent handle, so its reservations also count against the query's local limit.
+Standalone runs and maintained circuits use the pool's work parent. Children grow their
+reservations in 64 KiB chunks and can request the exact shortfall when a rounded
+reservation fails. Dropping a child returns its full reservation after releasing its
+payloads. Retained view versions can outlive the circuit and hold their own credit until
+their last reader drops them. A kept materialization closure uses the configured pool's
+retained branch. A pool with no retained allowance may reuse saved persistent closure
+state for the next run. Regression tests hold a live query result, a reasoning run
+and a view together under one pool ceiling and check exact credit return on completion,
+refusal, cancellation and unwind.
+
+Ontology reads admit parser expansion and streamed assertions, and release parser
+scratch before handing off the finished ontology. Kept classification uses credit
+already backing the previous saturation when it applies edits. Shared classification
+payloads retain their credit, including the incomplete-class list. OWL 2 RL queries
+give nested SELECTs the remaining request allowance while the private store and any
+earlier answer data are live. The private snapshot skips demand cache publication.
+An import fetch reserves its report entry before a LOAD can commit and returns its
+scratch reservation when the report is ready. A dataset's reasoning record admits
+its warnings and fetched import names before the inference commit. It uses the
+retained pool when configured and otherwise draws exact credit from the dataset's
+work pool, if any. When a pending import and its final record would exceed the
+retained limit together, the active materialization budget admits the transfer
+bookkeeping and the overlapping IRI copy before the inference commit. Each
+in-memory branch admits its journal links before publication and shares the
+pending names. One retained reservation backs each shared name. Each additional
+live copy has its own work credit, including copies in other branches' records.
+Releasing a copy returns its overlap credit. The last owner releases the
+retained reservation. A catalog save
+streams the existing registry bytes for records that the pool refused.
+In-memory branches share the record and its reservation, and
+reopened datasets admit the saved record before publishing it. Runtime checkpoints
+return scratch credit after their guards are released. WAL replay accounts for the
+overlap of growing tables and the conversion to materialization changes.
+
+In Rust, `Opened::ontology` uses `Arc<SharedOntology>` and `Classified::excluded` uses
+`Arc<ClassifiedExclusions>`. These handles preserve credit through detached clones and
+borrow the original ontology and exclusion vector through `AsRef`. The admitted diff
+and DL query methods return `AdmittedEntailmentDiff` and `AdmittedDlQueryAnswer`.
+Their plain value APIs transfer ownership to the application, as does `fetch_imports`.
 
 Item 513 removed the sparse vocabulary and read-window environment switches and moved
 the query prefetch and decoding switches to test controls. The read-ahead target is
@@ -370,8 +413,20 @@ reusable buffer for each key. A full FSST suffix needs no separate length scan w
 the admitted buffer fits the maximum decoded length and the optional decoder headroom.
 For other suffixes the growth check still uses the measured length. Scratch remains
 inside the decoding envelope, and the cursor's checkpoints still report cancellation
-and required decoding refusals. [Forge confirmation](#forge-confirmation-for-item-1088)
-of the streaming cost is pending.
+and required decoding refusals. Unit tests compare bypassed and cached masks with the
+generic filter and with code point order over multi-byte UTF-8, equal strings, proper
+prefixes, long keys and interleaved language-tagged, typed and IRI terms in both codecs.
+Pairs of language-tagged literals with one tag and pairs of integers check that the
+generic fallback keeps the rows that their order keeps. A determinism test runs masks of
+one row more than `PAR_THRESHOLD`, which the four-thread pool splits after the sample,
+and checks that one thread and four give the same masks and, after every mask, the same
+bypass count, table slots, table entries, table bytes and cache reservation and the same
+retained query charge. It does not compare which floors occupy the slots. Cursor tests of
+the colleague and names shapes read the cursor's own floor cache and check that the
+colleague shape bypasses the table without allocating it and that the names shape keeps
+floors without bypassing. The implementation is ready for the
+[forge confirmation](#forge-confirmation-for-item-1088) of the streaming cost, which is
+pending.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
@@ -636,10 +691,9 @@ rather than one cell at a time, and its additional live storage counts against t
 budget. These remain estimated heap charges rather than process RSS limits.
 
 The remaining stage 4 ownership seams are tracked by their own items. Retaining every
-result table under its own lease belongs to the merge phase of item 453, linking the
-reasoner's budgets and incremental views into the query pool belongs to item 675, binding
-result buffers belong to item 1306, strict decoding across all callers belongs to item
-1308 and the post-merge retained-source flip for MCP rendering belongs to item 1305.
+result table under its own lease belongs to the merge phase of item 453. Binding result
+buffers belong to item 1306, strict decoding across all callers belongs to item 1308
+and the post-merge retained-source flip for MCP rendering belongs to item 1305.
 
 MCP tool results, resource reads and completed task results keep their rendered payloads
 and encoded wire frames under query memory credit until the transport writes or drops
@@ -2302,5 +2356,307 @@ for threads in (1, 12):
 if failures:
     sys.exit("\n".join(failures))
 PY
+SH
+```
+
+### Cursor BIND reuse admission (item 293)
+
+Item 293 settles the admission policy of the cursor's exact-id BIND cache in
+`cursor/bind.rs`, which the query-scoped expression memo of stage 5 takes over. A first
+batch that does not admit the map seeds a sketch of one input key in sixteen, chosen by a
+hash of the id, and later batches keep feeding it until it holds as many keys as a full
+map. The exact distinct count of the expression cache's pass over each batch is a second
+signal, because hot keys can all fall outside the sample. Dense inline integers and the
+snapshot hint admit at once as before, and so does a batch whose exact count repeats half
+its rows. An admitted map evaluates its misses once per distinct key, holds a pending
+entry for a missed key until then, and is released when it answers fewer than one row in
+sixteen. The sketch, the map and each batch's scratch are charged to the query's memory
+budget. A sketch or a map whose growth the budget refuses keeps what it holds. A refused
+pilot or batch charge releases the sketch and the map and evaluates the batch the ordinary
+way. The misses run as optional evaluation, which keeps a memory refusal of the result or
+of a term, decode envelope or regular expression on the way to it out of the query's
+sticky failure. After such a refusal the row's expression gives up as it does after a
+sticky failure, so it evaluates no arm that the ordinary evaluation skips and interns no
+discarded value. The map, its reservation and the batch's scratch are then released before
+any row is evaluated again. The misses that finished keep their values and are not
+evaluated again, so a large transient allocation of a finished miss, such as the decode of
+a long triple term, is not met a second time after later rows' results are retained. A
+miss that had not finished is evaluated again, including an earlier row whose miss was
+refused while a later row's miss finished on another worker. Each
+remaining key is evaluated the ordinary way at its first row, in row order, beside the
+values of the finished misses and any intermediate term already interned by a refused
+miss, and a refusal there fails the query. On one worker the finished misses are the
+keys whose first rows come before the refused one, which the evaluation without the map
+has also retained at that row. A batch therefore fits the budget whenever its evaluation
+without the map fits, except in the intra-row case where an unfinished miss takes a large
+transient allocation, interns an intermediate query-local term, and then meets a memory
+refusal later in the same expression so that retrying that row repeats the transient
+allocation beside the retained intermediate term (tracked in item 1322). On several
+workers the finished misses are those that completed while the refusal stopped the
+others, an order that the parallel evaluation without the map can also take. They can
+include later rows, so the retry of an earlier row also meets a later row's retained
+result. A geometry constructor keeps the charge of each
+geometry it builds until the query ends, so an expression that can call one, directly or
+through `fn:apply` or `afn:eval`, never enters the map, and item 1321 tracks a releasable
+charge that would admit it. A CRS warning that the budget
+refuses during the misses is raised again by the ordinary evaluation. A BIND that ends its input releases them for the operators
+above it, and every loop checks cancellation. The batch charge is a bound sized by the batch, so the memory audit's
+`bind` fixture allows its ledger to stand above its heap until item 1320 tightens it.
+
+Weak repetition, from one repeated row in eight up to one in two, admits a
+parallel-capable expression on more than one worker only when it pays for the map. The
+guard keeps the last two timed fallback evaluations of at least 1,024 rows in one size
+bucket and estimates the saving from the lower of their rates. A saving of at least
+100 ns a row admits on one window, at least 50 ns needs two consecutive windows or two
+consecutive exact batch counts, and less declines. A batch that completes no window leaves
+the windows' confirmations alone, since its exact count says nothing about repetition
+across batches. Sustained split losses in the bucket count as a pass, because contended
+parallel evaluation is then the cost that the map saves. A single worker and expressions
+that cannot run in parallel keep the plain one-in-eight rule.
+
+Map misses, per-batch distinct columns and the ordinary fallback evaluation share one
+split controller with two size buckets, 768 to 2,047 and 2,048 to 16,384 evaluated rows.
+Two consecutive splits that run at least 20% slower than their timed sample projects put
+the bucket in a serial cooldown of eight eligible evaluations, after which one retry
+decides whether the pool is used again. The controller survives a declined map, so a
+cheap expression that contends on the pool stays serial without disabling parallelism
+for the rest of the query. Map misses that are all stored IRIs under a direct
+`STR(input)` intern their strings and contend sooner, so they keep a separate controller
+in which one split that does not pay starts a cooldown of 16 evaluations. Tables larger
+than 16,384 rows keep the executor's own parallel threshold.
+
+The policy was chosen on forge, an Intel i5-13500, at 13,320,192 triples from
+`scripts/gen-bind-reuse.py`, with 17 query threads, streaming execution and no result
+cache. Each of the A,B,B,A and B,A,A,B orders ran six rounds of four fresh processes with
+eight timed requests a query, and every answer matched. The prototype `b71512f1`, which
+has the policy above, ran against its own build with the 100 ns rule and the IRI cooldown
+turned off. It also ran against the earlier prototype `d2a50e43`, which kept map misses
+serial after their first unpaid split and admitted at one in eight without a cost guard,
+and against the base `fd47b7ae`. Against the switched-off build it took 0.779 of the time
+on joined SHA256 with random repeats at 65,536 rows, 0.838 and 0.905 on moderate IRI
+repetition and 0.927 to 0.930 on SHA256 with a stride of 8. Against `d2a50e43` it took
+0.54 to 0.59 on unique and low-repeat IRIs and 0.74 to 0.79 on unique and low-repeat
+SHA256. It removed that prototype's 1.21 to 1.24 times regressions on dates and strings with a
+stride of 8 and its 1.105 on joined strings with random repeats. It gave up 7.9% to 12.1%
+against `d2a50e43` on SHA256 with a stride of 8, whose map misses split on every batch,
+8.0% and 5.3% on joined SHA256 and strings with global repeats and 5.5% on strings with a
+stride of 8 at 262,144 rows.
+Against the base, the three 65,536-row repairs measured 1.018 on dates with an interval
+that reaches 1.0, 1.014 on strings and 1.037 on joined strings with random repeats, which
+add 0.15 ms and 0.25 ms. The matrix has no paired comparison against the base on the
+cheap inputs, the 2,048-row inputs or the small eager and dense-string queries, so item
+293 stays open until the landed build is confirmed against its base.
+
+Item 1319 holds the two real costs, one line each. Neither cause is isolated, because the
+base also lacks the shared split controller and the fallback's timing, so each recovery
+names a hypothesis to test first.
+
+- On forge at 13.3M triples with 17 query threads, `b71512f1` against `fd47b7ae` takes
+  1.037 times as long on `join-str-random-60-65536`, 0.25 ms more with an interval above
+  1.0. The query admits its map at the sixth batch, and the hypothesis is that the map
+  costs more than it saves on this cheap expression. The recovery weighs the map's
+  lookup cost against the measured saving in the cost guard, before the expression memo
+  phase starts.
+- On forge at 13.3M triples with 17 query threads, `b71512f1` against `fd47b7ae` takes
+  1.014 times as long on `str-stride-8-65536`, 0.15 ms more with an interval above 1.0.
+  The query never admits its map, and the hypothesis is the cost of the probe. The
+  recovery is item 1083's bound on the probe, before the expression memo phase starts.
+
+The rejected arms are recorded in PERFORMANCE-EXPERIMENTS. A diagnostic arm in `cd5561af`
+gave the map misses of `SHA256(STR(input))` a separate first-unpaid cooldown, to test
+whether split scheduling alone causes the stride-8 SHA256 cost. It was never measured and
+is not part of the policy. The shortcut for the 50M slice and reuse beyond one query
+remain deferred.
+
+The confirmation builds the landed tip and its base `17674a34` as release binaries on one
+build host with the same compiler and profile. The commands below run on forge from the
+candidate checkout in a named terminal with `BASE_BIN` and `TIP_BIN` set. Each pair
+runs beside a same-binary control. The streamed pairs cover the 166 queries at all
+threads and the cheap and 2,048-row queries at one thread. The eager pair runs
+`execution=eager` on the 2,048-row and string queries at all threads, since the eager
+executor shares the batch evaluation that the split timing changes. A query 10% or more
+slower in the first pass of any arm runs again in that arm with 12 rounds of 16 requests.
+So does a candidate query that adds more than 0.5 µs and is either slower in every round
+or has a first-pass 95% bootstrap interval of the median of its per-round ratios that lies
+above 1.0. The selection and the verdict compute that interval with the same code and
+seed, so every query that the first pass would book as a cost runs again. The analysis
+then takes each query's rerun when it has one and computes the same interval for every
+candidate query. The block exits with an error when a summary is invalid, an answer
+differs, or a candidate or its same-binary control stays 10% or more slower, since a
+control that slow means the host was not quiet. A candidate query whose interval lies
+above 1.0 and which adds more than 0.5 µs is a real cost, as the Intel rule defines it,
+whether or not it ran again. The block writes each one to `costs.txt`, and each gets its
+own line in item 1319 with the host and the two revisions. This cost classification is a
+separate check from X14's Intel rule for queries under 0.3 ms, which needs an upper 95%
+bound of at most 1.02 or a median added time of at most 0.5 µs. A confirmation used as
+evidence for that rule applies it to those queries on its own.
+
+```bash
+export BASE_BIN TIP_BIN
+flock "$HOME/lanes/.heavy.lock" bash -s <<'SH'
+set -euo pipefail
+: "${BASE_BIN:?}" "${TIP_BIN:?}"
+repo=$PWD
+runs="$repo/.artifacts/bench-bind-reuse-293/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$runs"
+python3 scripts/gen-bind-reuse.py data | zstd -q -o "$runs/data.nt.zst"
+python3 scripts/gen-bind-reuse.py queries "$runs/queries"
+# The 95% bootstrap interval of the median of per-round ratios, which both the rerun
+# selection and the verdict use, so that the selection covers every cost the verdict books.
+cat >"$runs/ratio_interval.py" <<'PY'
+import random
+import statistics
+
+
+def interval(ratios, n=10000):
+    if len(ratios) < 2:
+        return float("nan"), float("nan")
+    rng = random.Random(42)
+    boots = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(n))
+    return boots[int(0.025 * n)], boots[int(0.975 * n) - 1]
+PY
+
+# Times the queries staged in $1 with $2 rounds of $3 requests a query and server, for
+# the binaries and settings of the current arm.
+run_pass() {
+    local out=$1 rounds=$2 reps=$3
+    install -m 755 "$a" "$out/bin-A"
+    install -m 755 "$b" "$out/bin-B"
+    {
+        printf 'host: %s\nA: %s\nB: %s\n' "$(hostname)" "$a" "$b"
+        sha256sum "$a" "$b" "$runs/data.nt.zst"
+        readelf -p .comment "$a" "$b"
+    } >"$out/manifest.txt"
+    cp "$runs/data.nt.zst" "$out/"
+    cp scripts/nsc-bench-remote.sh "$out/"
+    cat >"$out/run.env" <<ENV
+ROUNDS=$rounds
+REPS=$reps
+WARMUP=3
+ORDERS="A B B A;B A A B"
+BINARY_OF_A=A
+BINARY_OF_B=B
+RAYON_THREADS=$threads
+SERVER_CPU=$server_cpu
+CLIENT_CPU=$client_cpu
+SPIN=$spin
+EXECUTION=$execution
+PORT=31943
+ENV
+    env -u BINARY_OF_A -u BINARY_OF_B -u EXPECTED_ANSWER_CHANGE -u EXPECTED_ANSWER_CHANGE_REASON \
+        bash "$out/nsc-bench-remote.sh"
+    python3 scripts/nsc-bench-summary.py "$out" >"$out/summary.md"
+}
+
+status=0
+for arm in all-control all-candidate one-control one-candidate eager-control eager-candidate; do
+    a=$BASE_BIN b=$TIP_BIN threads=default server_cpu=0-10,12-19 client_cpu=11 spin=0
+    execution=streaming
+    case "$arm" in
+        *-control) b=$BASE_BIN ;;
+    esac
+    out="$runs/$arm"
+    mkdir -p "$out/queries"
+    case "$arm" in
+        all-*) cp "$runs"/queries/*.rq "$out/queries/" ;;
+        one-*)
+            threads=1 server_cpu=2 client_cpu=4 spin=1
+            cp "$runs"/queries/*-2048.rq "$runs"/queries/*-low-repeat-*.rq \
+                "$runs"/queries/*-stride-16-*.rq "$runs"/queries/*-unique-*.rq "$out/queries/"
+            ;;
+        eager-*)
+            execution=eager
+            cp "$runs"/queries/*-2048.rq "$runs"/queries/str-*.rq "$runs"/queries/join-str-*.rq \
+                "$out/queries/"
+            ;;
+    esac
+    run_pass "$out" 6 8
+    if ! python3 scripts/nsc-bench-summary.py --check "$out/summary.json" first; then
+        status=1
+        continue
+    fi
+    flagged=$(python3 -c '
+import json, sys
+sys.path.insert(0, sys.argv[3])
+from ratio_interval import interval
+queries = json.load(open(sys.argv[1]))["queries"]
+candidate = sys.argv[2].endswith("-candidate")
+
+
+def flag(stats):
+    if stats is None:
+        return False
+    if stats["ratio"] >= 1.10:
+        return True
+    added_us = (stats["b"] - stats["a"]) * 1000
+    if not candidate or added_us <= 0.5:
+        return False
+    return all(r > 1 for r in stats["rounds"]) or interval(stats["rounds"])[0] > 1.0
+
+
+print(" ".join(q for q, m in queries.items() if flag(m.get("exec_ms"))))
+' "$out/summary.json" "$arm" "$runs")
+    if [ -n "$flagged" ]; then
+        mkdir -p "$out/rerun/queries"
+        for query in $flagged; do
+            cp "$out/queries/$query.rq" "$out/rerun/queries/"
+        done
+        run_pass "$out/rerun" 12 16
+        python3 scripts/nsc-bench-summary.py --check "$out/rerun/summary.json" rerun "$flagged" ||
+            status=1
+    fi
+done
+python3 - "$runs" <<'PY' || status=1
+import json
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+sys.path.insert(0, str(runs))
+from ratio_interval import interval  # noqa: E402
+
+
+def measured(name):
+    """Each query's execution times in arm `name`, from its rerun when it has one."""
+    path = runs / name / "summary.json"
+    if not path.exists():
+        return None
+    queries = json.loads(path.read_text())["queries"]
+    rerun_path = runs / name / "rerun" / "summary.json"
+    rerun = json.loads(rerun_path.read_text())["queries"] if rerun_path.exists() else {}
+    return {query: rerun.get(query, m).get("exec_ms") for query, m in queries.items()}
+
+
+failures, costs = [], []
+for pair in ("all", "one", "eager"):
+    control, candidate = measured(f"{pair}-control"), measured(f"{pair}-candidate")
+    if control is None or candidate is None:
+        failures.append(f"{pair}: no summary")
+        continue
+    for query in sorted(candidate):
+        same, stats = control.get(query), candidate[query]
+        if same is None or stats is None:
+            failures.append(f"{pair} {query}: no execution times")
+            continue
+        low, high = interval(stats["rounds"])
+        added_us = (stats["b"] - stats["a"]) * 1000
+        line = (
+            f"{pair} {query}: {stats['ratio']:.4f}x, 95% interval {low:.4f} to {high:.4f}, "
+            f"{added_us:+.1f} us, control {same['ratio']:.4f}x"
+        )
+        print(line)
+        if same["ratio"] >= 1.10:
+            failures.append(f"{line}, the control is 10% or more slower after the rerun")
+        elif stats["ratio"] >= 1.10:
+            failures.append(f"{line}, 10% or more slower after the rerun")
+        elif low > 1.0 and added_us > 0.5:
+            costs.append(line)
+(runs / "costs.txt").write_text("".join(f"{line}\n" for line in costs))
+for line in costs:
+    print(f"real cost: {line}")
+if failures:
+    sys.exit("\n".join(failures))
+PY
+exit "$status"
 SH
 ```

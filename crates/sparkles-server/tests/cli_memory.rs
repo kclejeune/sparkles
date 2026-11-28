@@ -327,6 +327,838 @@ fn report<'a>(j: &'a Value, path_end: &str) -> &'a Value {
 const G: &str = "https://example.org/memory/import/ana/claude-code/github.com.acme.shop";
 
 #[test]
+fn memory_redaction_refusal_keeps_an_existing_source_without_a_cache() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\ndescription: The staging database runs on port 5433\n---\nUse the staging database.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let source = report(&first, "staging-db.md");
+    assert_eq!(source["status"], "new", "{first:#}");
+    let graph = source["graph"].as_str().unwrap();
+    let retained = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . \
+         ?m <http://schema.org/description> \"The staging database runs on port 5433\" . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&retained));
+    let before = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    f.write_mem(
+        "other.md",
+        "---\nname: staging-postgres\ndescription: A different memory\n---\nOther text.\n",
+    );
+    let again = mem_json(&f, &s, "ana", &args);
+    let skipped = report(&again, "staging-db.md");
+    assert_eq!(skipped["status"], "skipped", "{again:#}");
+    assert_eq!(skipped["reason"], "redaction-too-large", "{again:#}");
+    assert_eq!(
+        report(&again, "MEMORY.md")["reason"],
+        "linked-redaction-too-large"
+    );
+    assert_eq!(report(&again, "other.md")["status"], "skipped", "{again:#}");
+    assert!(s.ask(&retained));
+    assert_eq!(s.head(), before);
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let missing = |out: &Value| {
+        out["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["source"] == graph)
+    };
+    for with_collision in [true, false] {
+        if !with_collision {
+            std::fs::remove_file(f.memdir().join("other.md")).unwrap();
+        }
+        let out = status();
+        assert!(!missing(&out), "{out:#}");
+        assert_eq!(report(&out, "MEMORY.md")["status"], "ambiguous");
+        let row = report(&out, "staging-db.md");
+        assert_eq!(row["source"], graph);
+        assert_eq!(row["status"], "ambiguous");
+    }
+    std::fs::remove_file(f.memdir().join("staging-db.md")).unwrap();
+    assert!(missing(&status()));
+
+    // A returned file is on disk even when its previous source was marked deleted.
+    let deleted = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&deleted, "staging-db.md")["status"], "deleted");
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    let returned = status();
+    assert!(!missing(&returned), "{returned:#}");
+    assert_eq!(report(&returned, "staging-db.md")["status"], "ambiguous");
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_file_keeps_its_source_across_a_normalized_path_collision() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+
+    let original = r"nested\note.md";
+    f.write_mem(
+        original,
+        "---\nname: shared\ndescription: Original fact\n---\nOriginal body.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, original)["graph"].as_str().unwrap();
+    let query = format!(
+        "SELECT ?r WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?m <http://schema.org/description> \"Original fact\" }} }}"
+    );
+    let rendition = s.select(&query);
+    assert_eq!(rendition.len(), 1);
+    let head = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    f.write_mem(original, &"budget-marker ".repeat(32_769));
+    f.write_mem(
+        "nested/note.md",
+        "---\nname: shared\ndescription: Replacement fact\n---\nDifferent body.\n",
+    );
+    let second = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&second, original)["reason"], "redaction-too-large");
+    assert_eq!(s.select(&query), rendition, "{second:#}");
+    assert_eq!(
+        report(&second, "nested/note.md")["reason"],
+        "uncertain-source-owner"
+    );
+    assert_eq!(s.head(), head);
+}
+
+#[test]
+fn memory_redaction_refusal_keeps_an_existing_source_after_path_policy_changes() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\ndescription: The staging database runs on port 5433\n---\nUse the staging database.\n",
+    );
+    let first = mem_json(&f, &s, "ana", &args);
+    let source = report(&first, "staging-db.md");
+    assert_eq!(source["status"], "new", "{first:#}");
+    let graph = source["graph"].as_str().unwrap();
+    let retained = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . \
+         ?m <http://schema.org/description> \"The staging database runs on port 5433\" . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&retained));
+    let before = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [
+        {"name": "budget", "regex": "budget-marker"},
+        {"name": "filename", "regex": "staging-db[.]md"}
+    ]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+    f.write_mem("staging-db.md", &"budget-marker ".repeat(32_769));
+    let again = mem_json(&f, &s, "ana", &args);
+    let skipped = report(&again, "staging-db.md");
+    assert_eq!(skipped["status"], "skipped", "{again:#}");
+    assert_eq!(skipped["reason"], "redaction-too-large", "{again:#}");
+    assert_eq!(
+        report(&again, "MEMORY.md")["reason"],
+        "linked-redaction-too-large"
+    );
+    assert!(s.ask(&retained));
+    assert_eq!(s.head(), before);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let refused = report(&status, "staging-db.md");
+    assert_eq!(refused["source"], graph);
+    assert_eq!(refused["status"], "ambiguous", "{status:#}");
+}
+
+#[test]
+fn memory_redaction_refusal_keeps_imports_hidden_by_a_refused_instruction_file() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(status, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (status, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(status, 200, "{output:#}");
+
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, "docs/testing.md")["graph"].as_str().unwrap();
+    let live = format!(
+        "ASK {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?i a <urn:x-sparkles:mem:Instructions> . \
+         FILTER NOT EXISTS {{ <{graph}> <http://www.w3.org/ns/prov#invalidatedAtTime> ?t }} }} }}"
+    );
+    assert!(s.ask(&live));
+    let head = s.head();
+    std::fs::remove_dir_all(f.state()).unwrap();
+    std::fs::write(
+        p.join("CLAUDE.md"),
+        format!(
+            "# Shop\n@docs/testing.md\n{}",
+            "budget-marker ".repeat(32_769)
+        ),
+    )
+    .unwrap();
+    let again = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&again, "CLAUDE.md")["reason"], "redaction-too-large");
+    assert!(s.ask(&live), "{again:#}");
+    assert_eq!(s.head(), head);
+
+    // A subsequent complete scan resumes deletion reconciliation.
+    std::fs::remove_file(p.join("CLAUDE.md")).unwrap();
+    std::fs::remove_file(p.join("docs/testing.md")).unwrap();
+    let complete = mem_json(&f, &s, "ana", &args);
+    assert_eq!(report(&complete, "CLAUDE.md")["status"], "deleted");
+    assert!(!s.ask(&live), "{complete:#}");
+}
+
+#[cfg(unix)]
+fn check_hidden_instruction_owner(user: bool) {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let root = if user {
+        f.home().join(".claude")
+    } else {
+        p.clone()
+    };
+    let link_prefix = if user { "~/.claude/" } else { "" };
+    let original = r"sub\note.md";
+    let replacement = "sub/note.md";
+    let args = ["sync", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+
+    std::fs::write(p.join("CLAUDE.md"), format!("@{link_prefix}{original}\n")).unwrap();
+    std::fs::write(
+        root.join(original),
+        "---\ndescription: Original rule\n---\nOld body.\n",
+    )
+    .unwrap();
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, original)["graph"].as_str().unwrap();
+    assert_eq!(graph.contains("/user/instructions/"), user);
+    let query = format!(
+        "SELECT ?r WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?i <http://schema.org/description> \"Original rule\" }} }}"
+    );
+    let original_rendition = s.select(&query);
+    assert_eq!(original_rendition.len(), 1);
+    std::fs::remove_dir_all(f.state()).unwrap();
+    std::fs::write(p.join("CLAUDE.md"), "budget-marker ".repeat(32_769)).unwrap();
+    std::fs::write(
+        p.join("CLAUDE.local.md"),
+        format!("@{link_prefix}{replacement}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(
+        root.join(replacement),
+        "---\ndescription: Replacement rule\n---\nNew body.\n",
+    )
+    .unwrap();
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let sync = mem_json(&f, &s, "ana", &args);
+    assert_eq!(s.select(&query), original_rendition, "{sync:#}");
+    assert_eq!(
+        report(&sync, replacement)["reason"],
+        "uncertain-source-owner"
+    );
+    let row = report(&status, replacement);
+    assert_eq!(row["source"], graph);
+    assert_eq!(row["status"], "ambiguous", "{status:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_parent_preserves_hidden_project_instruction_owner() {
+    check_hidden_instruction_owner(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_parent_preserves_hidden_user_instruction_owner() {
+    check_hidden_instruction_owner(true);
+}
+
+#[test]
+fn status_reports_removed_cursor_rule_despite_refused_rule_with_same_graph() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let project = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "budget", "regex": "budget-marker"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+
+    let rules = p.join(".cursor/rules");
+    let original = rules.join("nested.rule.md");
+    std::fs::create_dir_all(rules.join("nested")).unwrap();
+    std::fs::write(&original, "Use four spaces.\n").unwrap();
+    let first = mem_json(&f, &s, "ana", &["sync", "generic", "--project", project]);
+    let graph = report(&first, "nested.rule.md")["graph"].as_str().unwrap();
+    let status = || {
+        mem_json(
+            &f,
+            &s,
+            "ana",
+            &["status", "--project", project, "--harness", "cursor"],
+        )
+    };
+
+    std::fs::write(&original, "budget-marker ".repeat(32_769)).unwrap();
+    assert_eq!(report(&status(), "nested.rule.md")["status"], "ambiguous");
+    std::fs::rename(original, rules.join("nested/rule.md")).unwrap();
+    let out = status();
+    assert_eq!(
+        out["sourcesWithoutFile"],
+        json!([{"source": graph, "path": ".cursor/rules/nested.rule.md", "deleted": false}]),
+        "{out:#}"
+    );
+    assert_eq!(out["files"], json!([]));
+}
+
+#[test]
+fn status_matches_public_source_with_an_unrelated_masked_candidate() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    f.write_mem("public.md", "---\nname: shared\n---\nPublic body.\n");
+    let first = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "claude-code", "--project", p.to_str().unwrap()],
+    );
+    let graph = &report(&first, "public.md")["graph"];
+    let (code, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(code, 200);
+    settings["redaction"] = json!({"patterns": [{"name": "filename", "regex": "private-note"}]});
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+    f.write_mem(
+        "subdir/private-note.md",
+        "---\nname: shared\n---\nOther body.\n",
+    );
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p.to_str().unwrap()]);
+    let out = status();
+    assert_eq!(report(&out, "public.md")["status"], "imported", "{out:#}");
+    assert_eq!(report(&out, "private-note.md")["status"], "not-imported");
+    // The stored path can still identify its owner when today's policy masks both filenames alike.
+    settings["redaction"]["patterns"][0]["regex"] = "public|private-note".into();
+    let (code, output) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(code, 200, "{output:#}");
+    f.write_mem("private-note.md", "---\nname: shared\n---\nAnother body.\n");
+    let masked = status();
+    assert_eq!(
+        report(&masked, "public.md")["status"],
+        "imported",
+        "{masked:#}"
+    );
+    std::fs::remove_file(f.memdir().join("public.md")).unwrap();
+    let out = status();
+    assert!(
+        out["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| &r["source"] == graph),
+        "{out:#}"
+    );
+}
+
+#[test]
+fn memory_project_commands_resolve_the_imported_redacted_identity() {
+    check_redacted_project_commands(None);
+}
+
+#[test]
+fn memory_project_commands_resolve_identities_from_per_run_redaction() {
+    for flag in ["--redact-patterns", "--redact-known-values"] {
+        check_redacted_project_commands(Some(flag));
+    }
+}
+
+fn check_redacted_project_commands(flag: Option<&str>) {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let mut args = vec!["import", "claude-code", "--project", p];
+    let policy_file = f.dir.path().join("redaction-input");
+    match flag {
+        Some(flag) => {
+            let text = if flag == "--redact-patterns" {
+                "project github[.]com/acme/shop\n"
+            } else {
+                "github.com/acme/shop\n"
+            };
+            std::fs::write(&policy_file, text).unwrap();
+            args.extend([flag, policy_file.to_str().unwrap()]);
+        }
+        None => {
+            let (status, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+            assert_eq!(status, 200);
+            settings["redaction"] =
+                json!({"patterns": [{"name": "project", "regex": "github[.]com/acme/shop"}]});
+            let (status, output) =
+                s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+            assert_eq!(status, 200, "{output:#}");
+        }
+    }
+    let import = mem_json(&f, &s, "ana", &args);
+    if flag.is_some() {
+        std::fs::remove_file(policy_file).unwrap();
+        std::fs::remove_dir_all(f.state()).unwrap();
+    }
+    assert_eq!(import["failed"], 0, "{import:#}");
+    let graph = report(&import, "staging-db.md")["graph"].as_str().unwrap();
+    assert!(graph.contains("/redacted-project."), "{graph}");
+    let sources = mem_json(&f, &s, "ana", &["sources", "--project", p]);
+    let source = sources["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["source"] == graph)
+        .unwrap_or_else(|| panic!("{sources:#}"));
+    let key = source["project"].as_str().unwrap();
+    assert!(key.starts_with("redacted-project."), "{source:#}");
+    assert_eq!(
+        mem_json(&f, &s, "ana", &["sources", "--project", key]),
+        sources
+    );
+    let inbox = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "inbox",
+            "--project",
+            p,
+            "--kind",
+            "import",
+            "--limit",
+            "500",
+        ],
+    );
+    assert!(
+        inbox["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|fact| fact["graph"] == graph),
+        "{inbox:#}"
+    );
+    let brief = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["brief", "--project", p, "--include-unreviewed"],
+    );
+    assert!(
+        brief["text"].as_str().unwrap().contains("port 5433"),
+        "{brief:#}"
+    );
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    assert_eq!(status["project"], key, "{status:#}");
+    assert!(
+        status["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| { file["source"] == graph && file["status"] == "imported" }),
+        "{status:#}"
+    );
+    let out = f.dir.path().join("export-redacted");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    assert!(out.join("staging-db.md").is_file(), "{export:#}");
+    let forgotten = mem_json(&f, &s, "ana", &["forget", "--project", p, "--yes"]);
+    assert!(
+        forgotten["deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == graph),
+        "{forgotten:#}"
+    );
+}
+
+#[test]
+fn directory_selectors_include_both_imported_project_keys() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    let one_file = |name: &str, redact| {
+        let path = f.memdir().join(name);
+        let mut args = vec![
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            path.to_str().unwrap(),
+        ];
+        if redact {
+            args.extend(["--redact-known-values", policy.to_str().unwrap()]);
+        }
+        let result = mem_json(&f, &s, "ana", &args);
+        report(&result, name)["graph"].as_str().unwrap().to_owned()
+    };
+    let alias = one_file("staging-db.md", true);
+    f.write_mem(
+        "local.md",
+        "---\nname: local\ndescription: Local development instructions\n---\nRun locally.\n",
+    );
+    let raw = one_file("local.md", false);
+    std::fs::remove_file(policy).unwrap();
+    std::fs::remove_dir_all(f.state()).unwrap();
+
+    let sources = mem_json(&f, &s, "ana", &["sources", "--project", p]);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    let inbox = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "inbox",
+            "--project",
+            p,
+            "--kind",
+            "import",
+            "--limit",
+            "500",
+        ],
+    );
+    let brief = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["brief", "--project", p, "--include-unreviewed"],
+    );
+    let out = f.dir.path().join("export");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    let forgotten = mem_json(&f, &s, "ana", &["forget", "--project", p, "--yes"]);
+    for graph in [raw, alias] {
+        assert!(
+            sources["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["source"] == graph),
+            "{sources:#}"
+        );
+        assert!(
+            status["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["source"] == graph && r["status"] == "imported"),
+            "{status:#}"
+        );
+        assert!(
+            inbox["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["graph"] == graph),
+            "{inbox:#}"
+        );
+        assert!(
+            forgotten["deleted"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(graph)),
+            "{forgotten:#}"
+        );
+    }
+    for description in ["Local development instructions", "port 5433"] {
+        assert!(
+            brief["text"].as_str().unwrap().contains(description),
+            "{brief:#}"
+        );
+    }
+    assert!(
+        out.join("staging-db.md").is_file() && out.join("local.md").is_file(),
+        "{export:#}"
+    );
+}
+
+#[test]
+fn status_matches_shared_graph_names_to_each_project_keys_stored_path() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    let a = f.memdir().join("a.md");
+    let b = f.memdir().join("nested/b.md");
+    let parked = f.dir.path().join("parked");
+    f.write_mem("a.md", "---\nname: shared\n---\nFirst memory.\n");
+    let alias = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            a.to_str().unwrap(),
+            "--redact-known-values",
+            policy.to_str().unwrap(),
+        ],
+    );
+    let alias = &report(&alias, "a.md")["graph"];
+    std::fs::rename(&a, &parked).unwrap();
+    f.write_mem("nested/b.md", "---\nname: shared\n---\nSecond memory.\n");
+    let raw = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--only",
+            b.to_str().unwrap(),
+        ],
+    );
+    let raw = &report(&raw, b.to_str().unwrap())["graph"];
+    assert_ne!(raw, alias);
+    std::fs::rename(&parked, &a).unwrap();
+    std::fs::remove_dir_all(f.state()).unwrap();
+
+    let status = || mem_json(&f, &s, "ana", &["status", "--project", p]);
+    let rows = |out: &Value, graph: &Value| -> Vec<(String, String)> {
+        out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| &r["source"] == graph && r["status"] != "not-imported")
+            .map(|r| {
+                (
+                    r["path"].as_str().unwrap().to_owned(),
+                    r["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let both = status();
+    assert_eq!(
+        rows(&both, raw),
+        [(b.display().to_string(), "imported".into())],
+        "{both:#}"
+    );
+    assert_eq!(
+        rows(&both, alias),
+        [(a.display().to_string(), "imported".into())],
+        "{both:#}"
+    );
+    #[cfg(unix)]
+    {
+        f.write_mem(r"nested\b.md", "---\nname: shared\n---\nThird memory.\n");
+        let ambiguous = status();
+        let matches = rows(&ambiguous, raw);
+        assert_eq!(matches.len(), 2, "{ambiguous:#}");
+        assert!(
+            matches.iter().all(|(_, state)| state == "ambiguous"),
+            "{ambiguous:#}"
+        );
+        assert_eq!(
+            rows(&ambiguous, alias),
+            [(a.display().to_string(), "imported".into())]
+        );
+        std::fs::remove_file(f.memdir().join(r"nested\b.md")).unwrap();
+    }
+    f.write_mem(
+        "nested/b.md",
+        "---\nname: shared\n---\nEdited second memory.\n",
+    );
+    let edited = status();
+    assert_eq!(
+        rows(&edited, raw),
+        [(b.display().to_string(), "changed".into())]
+    );
+    assert_eq!(
+        rows(&edited, alias),
+        [(a.display().to_string(), "imported".into())]
+    );
+    std::fs::remove_file(&b).unwrap();
+    let missing = status();
+    assert!(rows(&missing, raw).is_empty(), "{missing:#}");
+    assert!(
+        missing["sourcesWithoutFile"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| &r["source"] == raw),
+        "{missing:#}"
+    );
+}
+
+#[test]
+fn principal_scoped_commands_use_the_callers_project_identity() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let policy = f.dir.path().join("values");
+    std::fs::write(&policy, "github.com/acme/shop\n").unwrap();
+    mem_json(
+        &f,
+        &s,
+        "agent-7",
+        &[
+            "import",
+            "claude-code",
+            "--project",
+            p,
+            "--redact-known-values",
+            policy.to_str().unwrap(),
+        ],
+    );
+    mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
+    let status = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    assert_eq!(status["project"], "github.com/acme/shop", "{status:#}");
+    assert_eq!(report(&status, "staging-db.md")["status"], "imported");
+    let out = f.dir.path().join("export");
+    let export = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            out.to_str().unwrap(),
+            "--project",
+            p,
+        ],
+    );
+    assert!(out.join("staging-db.md").is_file(), "{export:#}");
+}
+
+#[test]
+fn memory_reimport_reconciles_index_facts_without_changing_its_text() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let args = ["import", "claude-code", "--project", p.to_str().unwrap()];
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let first = mem_json(&f, &s, "ana", &args);
+    let graph = report(&first, "MEMORY.md")["graph"].as_str().unwrap();
+    let index = || {
+        s.select(&format!(
+            "SELECT ?m ?pos ?text ?r WHERE {{ GRAPH <{graph}> {{ \
+         ?m <urn:x-sparkles:mem:indexPosition> ?pos ; <urn:x-sparkles:mem:indexText> ?text . \
+         <{graph}> <urn:x-sparkles:rendition> ?r }} }}"
+        ))
+    };
+    let before = index();
+    assert_eq!(before.len(), 1, "{before:?}");
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-postgres\n---\nThe same file now has a different key.\n",
+    );
+    let second = mem_json(&f, &s, "ana", &args);
+    assert_eq!(second["failed"], 0, "{second:#}");
+    assert_eq!(
+        report(&second, "MEMORY.md")["status"],
+        "edited",
+        "{second:#}"
+    );
+    let after = index();
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_ne!(after[0]["m"], before[0]["m"]);
+    for field in ["pos", "text", "r"] {
+        assert_eq!(after[0][field], before[0][field]);
+    }
+    let subject = after[0]["m"]["value"].as_str().unwrap();
+    let memory = report(&second, "staging-db.md")["graph"].as_str().unwrap();
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH <{memory}> {{ <{subject}> <urn:x-sparkles:mem:file> <{memory}> }} }}"
+    )));
+    let head = s.head();
+    let third = mem_json(&f, &s, "ana", &args);
+    assert_eq!(
+        report(&third, "MEMORY.md")["status"],
+        "unchanged",
+        "{third:#}"
+    );
+    assert_eq!(s.head(), head);
+}
+
+#[test]
 fn memory_import_sync_and_brief() {
     let s = start_server(&["--mem", DS]);
     let f = Fixture::new();

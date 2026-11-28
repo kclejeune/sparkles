@@ -548,9 +548,9 @@ happens to materialized inferences, and the limits.
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
 | `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. The update vocabulary `delta.vocab` grows the same way, by up to 1 MiB at a time, and a commit that adds terms writes them as one checksummed chunk with `O_DIRECT` and `O_DSYNC` at the same time as its log records, so it no longer waits for a journal commit either. Commit messages and digests in `annotations.bin` grow the same way, by up to 256 KiB at a time, and a record that fits is written with `O_DIRECT` and `O_DSYNC`, by an ordinary commit before its log records and by a group commit fence at the same time as its records. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`. The log ends at its last commit and the vocabulary at its last chunk for readers, backups and the quota, and the annotations end at their last record for readers and the quota, while a backup of a running store copies their zeros too. A close trims the zeros. A global flag. |
 | `--no-group-commit` | | Give every commit its own synchronization. By default concurrent commits of a persistent dataset share one, and each is acknowledged only once it is durable. Datasets with a full-text, spatial or embedding index group their commits too, except while a full-text index recovers or rebuilds, or while a spatial index builds or after its build failed. Grouping holds up to 64 commits or 4 MiB of log records per dataset in memory, plus the speculative snapshots of the commits in flight. `SPARKLES_GROUP_COMMIT=off`, `false`, `no` or `0` does the same, and an unrecognised value logs a warning and is ignored. Node takes `groupCommit: false` and Python `group_commit=False`. The JVM library has no option and always groups a persistent dataset. A global flag. |
-| `--no-patterns` | | Build no predicate patterns (`patterns.bin`) when a bulk load or a compaction writes a generation. Predicate listings and `spk:hasPredicate` then read the permutations. A global flag. |
+| `--no-patterns` | | This global flag skips predicate patterns unless dataset index settings enable them. Predicate listings read the permutations when the tables are absent. |
 | `--pattern-memory-mb N` | `1024` | Memory for the distinct predicate patterns while a bulk load or a compaction builds them. A generation that needs more is built without patterns, the reason is logged and kept in its `meta.json`, and queries read the permutations. A global flag. |
-| `--vocab-codec front\|fsst` | | How a bulk load or a full compaction stores the vocabulary. `front` front-codes the keys. `fsst` also compresses each key's suffix with FSST when that makes it shorter, with symbol tables in `vocab.fsst`, which makes the generation index format 4. Releases that read only format 3 cannot open it. Without the flag, a new database is front-coded and a compaction keeps the codec of the generation it replaces. A compaction asked for another codec rebuilds the generation in full. A global flag. |
+| `--vocab-codec front\|fsst` | | This global flag sets the default vocabulary codec for each build. Both codecs use index format 5, and a rebuild with no configured codec inherits its current codec. A codec switch requires a full compaction. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 40 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use. |
@@ -4309,11 +4309,32 @@ the facts that cite the old text to the place their quote now occurs. A fact who
 quote is gone is retracted. A moved file changes only its path, and a deleted file's
 facts are retracted while its source keeps its text and the time it went. A file
 renamed with its body unchanged gets a new graph that `dcterms:replaces` the old one,
-and the facts an agent extracted from it move along. Secrets that the built-in
-patterns, the dataset's `secretPatterns` or `--redact-patterns FILE` recognize are
-replaced by `[redacted:NAME]` before anything leaves the machine, and the server
-refuses a text under the import base in which it still finds one (`secret-detected`).
-Redaction is pattern matching and cannot find every secret.
+and the facts an agent extracted from it move along. The import replaces matches with
+`[redacted:NAME]` in source text, titles and file paths before sending them. Built-in
+patterns and the dataset's `memory.redaction.patterns` always apply, including legacy
+`imports.secretPatterns`. Local patterns come from `--redact-patterns FILE` or
+`memory.toml`. The dataset can also enable entropy and personal data detectors and
+allow specific matches. See [Memory redaction](API.md#memory-redaction) for the settings.
+
+By default the CLI also matches exact values of local environment variables whose
+names contain `KEY`, `SECRET`, `TOKEN` or `PASSWORD`. Set `redaction.knownValues` to
+false in the dataset settings to turn off environment matching. To add local values
+explicitly, pass `--redact-known-values FILE` or set
+`known-values = ["path/to/values.txt"]` in `memory.toml`. Each file holds one value per
+line. Blank lines, comments beginning with `#` and values shorter than eight characters
+are skipped. Directory selectors include sources published under either the original or the
+redacted project key, including imports that used a per-run flag. Status and export
+use the caller's own imports. Status matches each source to its stored file path. It
+reports `ambiguous` when several files could own the source or the stored path cannot
+establish ownership. A redaction refusal can also leave ownership uncertain when the
+scanner cannot read a file or follow its instruction imports. If two sources export to the same path, select one
+with its explicit project key. When a file exceeds the redaction budget, sync keeps
+existing sources whose ownership or absence it cannot establish. The next complete
+sync checks the server again before recording deletions.
+
+A direct registration under the import base, or in any graph when
+`redaction.everywhere` is true, fails with `secret-detected` when the server detects a
+match. Redaction coverage depends on the configured detectors.
 
 The prose of a memory becomes facts when an agent extracts them. `sparkles memory
 sources --needs-extraction` lists the files whose current text no extraction has cited
@@ -4498,10 +4519,12 @@ rows go to the `summarize` providers for summaries, and the output says so. An o
 who wants no document text to leave the server locks `assistant.send` in the settings
 file, and `memory init` then reports the lock. On NixOS,
 [`services.sparkles.settings`](#declarative-dataset-settings) declares the settings
-file. In the web UI, a dataset admin turns them on in the dataset page's **Settings**
-tab, which [The Settings tab](#the-settings-tab) describes. The UI's **Ingest** section
-uploads documents and configures source retention and ingest profiles, but it does not
-turn on the assistant.
+file. In the web UI, the dataset's **Ingest** panel and the memory page's ingest
+settings show the active document recipients. A dataset admin can turn on ingestion
+after confirming the proposed changes and recipients. A changed proposal requires
+another confirmation. A setting from server config or a prior runtime change can
+block enablement, in which case the panel links to that field in **Settings**.
+Turning ingestion off changes only the `ingest` field.
 
 The server keeps the fields changed at runtime in `assistant.json` in a persistent
 dataset's database directory. With the
@@ -4534,8 +4557,20 @@ end the review branch, such as `ingest.standup-1`, with the number of facts prop
 of entities linked and created. The review page of that branch shows each fact next to
 its passage. A task whose estimate is above the dataset's `confirmTokens` waits for
 `POST /$/ingest/org/{task}/confirm`, and `mode=preview` holds the facts in the task
-until `POST /$/ingest/org/{task}/approve`. Without a model, or with `extract=false`, the
-task registers the text on the branch and proposes no facts.
+until `POST /$/ingest/org/{task}/approve`. When ingestion is off, the panel asks before
+sending `extract: false`. The selected mode still controls where the source is written.
+Branch mode writes to the review branch. Preview requires approval to write to main.
+Automatic mode merges the source into main when the merge checks pass.
+
+The server applies `memory.redaction.serverIngest` to converted text before it
+stores a source or contacts an extraction provider. The default `redact` replaces
+matches and reports counts by detector. `refuse` stops on a match and `off` passes
+the text through. Exact matching against the server's secret inventory applies to
+server-wide administrators and the local operator. Dataset principals use the
+configured patterns and other detectors. A stored rendition that needs redaction
+must be replaced before it can be used for extraction. Table mapping drafts report
+counts for the model's sample. The mapping preview and the subsequent table upload
+operate on the original rows.
 
 On the dataset page of the web UI, the **Ingest** section uploads a document with the
 same options, shows the task's progress, asks for the confirmation or the approval when
@@ -4960,6 +4995,11 @@ settings file can lock a field. A patch that the server refuses, for example bec
 server's settings file locks the field, is reported, the other datasets are still
 patched, and the exit status is 1. Datasets created later do not get the values, which
 is what the settings file of `--settings` is for.
+
+For the `index` kind, `sparkles settings diff` compares overrides with the server's
+resolved base, including the invocation flags and the current generation's codec.
+Standalone `load --loc` and `compact` report when saved index settings override an
+invocation flag.
 
 ### The Settings tab
 

@@ -1454,7 +1454,7 @@ fn call_on(handle: &super::Ontologies, op: &str, args: &J, opts: &QueryOptions) 
             let opts = handle.anchored(opts)?;
             let o = handle.open(&req, &opts)?;
             let q = dl_expression(handle, &o, a, q, &prefixes, &opts)?;
-            let out = handle.dl_query_opened(o, &req, &q, &opts)?;
+            let out = handle.dl_query_opened_admitted(o, &req, &q, &opts)?;
             Ok(dl_query_body(
                 name,
                 &out,

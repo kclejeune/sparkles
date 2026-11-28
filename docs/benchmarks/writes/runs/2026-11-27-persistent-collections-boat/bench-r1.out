@@ -1,0 +1,4 @@
+    Finished `release` profile [optimized] target(s) in 5.30s
+ 04:45:19 up 3 days, 39 min,  2 users,  load average: 1.00, 2.21, 3.74
+05f39530e4d3a774b87913ab155a8c451fcd4511d98aad4c2ec26666e1ae3e22  target/release/pmap-bench
+ 04:45:46 up 3 days, 40 min,  2 users,  load average: 1.00, 2.11, 3.67

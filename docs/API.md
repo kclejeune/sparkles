@@ -2487,8 +2487,9 @@ chains, reflexivity or ranges, or to an axiom with a data property or datatype, 
 everything again. The kept state costs memory for the time the dataset is open, about
 115 MB estimated and 190 MB resident for GO, and it is dropped after a run whose estimate
 passes one gigabyte, evicting the other mode's slot when both together pass that cap. A
-run is bounded by the request's deadline and memory budget, from indexing to the taxonomy,
-and answers `507` with `budget: "memory"` past the budget.
+run is bounded by the request's deadline and memory budget, from indexing to the taxonomy
+and through the coverage pass that lists `incomplete`, and answers `507` with
+`budget: "memory"` past the budget.
 
 `tier` names the rules that the ontology's axioms need, `el`, `horn` or `disjunctive`.
 `partial: true` in the body or the query string asks a classification run at any tier
@@ -2500,8 +2501,9 @@ classes are entailed, `incomplete` lists the classes whose superclasses it may m
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
 other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`.
 It is `unknown` when a run stopped before deciding, when an excluded axiom, unread assertion
-or unmapped triple could change consistency, or when the coverage pass hit a deadline or
-cancellation before deciding, and in those cases every class is in `incomplete`. When the
+or unmapped triple could change consistency, or when a deadline, a cancellation or, in a
+`partial` run, the memory budget stopped the coverage pass before it decided, and in those
+cases every class is in `incomplete`. When the
 coverage pass hits its work bound instead, classes not yet decided stay in `incomplete`, and
 `consistency` becomes `unknown` only if consistency had not yet been established. `consistent`
 is false only for an ontology proved inconsistent, so a caller that needs to know reads
@@ -6690,8 +6692,8 @@ Errors are `{error, code, requestId}`. Some codes add `task`, `holder`, `policie
 | 400 | `invalid-name`. `invalid-config`: a bad repository or policy setting, a repository body that is JSON but not a repository configuration, or a refused destination. `field` names the setting. `invalid-request`: a body that is not JSON (on every route), a backup, restore, verification, GC or policy body of the wrong shape, a malformed query parameter, a repository verification at level `restore`, or a negative `graceHours`. `invalid-schedule`: a bad schedule or an unknown time zone. |
 | 403 | `server-read-only` |
 | 404 | `no-such-repository`, `no-such-backup` (also for a backup of another dataset), `no-such-policy`, `no-such-dataset`, `no-such-lock` |
-| 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the 10 min wait, with `holder`), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`) |
-| 422 | `incompatible-repository` (an unsupported repository format or encryption configuration), `incompatible-format` (an index format this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
+| 409 | `repository-exists`, `policy-exists`, `not-a-repository` (a location with other files), `location-immutable`, `repository-in-use` (with `policies` or `task`), `read-only-config`, `backup-exists`, `backup-in-progress` (with `task`), `backup-busy` (with `task`), `repository-read-only`, `repository-locked` (a conflicting lock outlived the wait, a new lease was absent from the listing, or a held lease was lost), `dataset-exists`, `dataset-busy` (with `task`), `not-managed`, `duplicate-dataset-id`, `policy-running` (with `task`), `object-retained` (S3 Object Lock prevents deletion), `archive-restore-required` (S3 must thaw a requested blob) |
+| 422 | `incompatible-repository` (an unsupported repository format or encryption configuration), `incompatible-format` (an index format, blob codec or chunker this build cannot read), `invalid-backup` (a manifest that fails validation, with `field`) |
 | 500 | `restore-mismatch`, `internal` |
 | 501 | `not-implemented` (backup repositories are not enabled on this server) |
 | 502 | `repository-unavailable`: a storage error after retries. The message never includes URL query strings. |
@@ -6705,12 +6707,21 @@ component. Storage requests are retried with exponential backoff, up to 10 retri
 ### Locks and garbage collection
 
 Operations take a lease object `locks/<uuid>.json` in the repository. Create, delete,
-restore and verify take a **shared** lock, and GC's sweep takes an **exclusive** one. A
-held lock is rewritten every 5 minutes. A lock not rewritten for 30 minutes is **stale**:
-other operations ignore it and GC removes it. Staleness is judged by the storage server's
-clock, never this host's. An operation that meets a conflicting lock retries with backoff
-for up to 10 minutes, then fails with `409 repository-locked`. These leases let several
-servers, and the CLI, share a repository. Read-only repositories take no locks.
+restore and verify take a **shared** lock, and GC's sweep takes an **exclusive** one.
+A held lease renews every 5 minutes. Object stores with conditional writes update
+the held version. On a filesystem the holder updates the mtime of the open inode.
+Single-writer object stores check that the lease exists and then overwrite it, so
+a concurrent manual lock break can race with renewal.
+
+A lease without renewal for 30 minutes becomes **stale**. Acquirers use the
+storage server's clock to ignore stale leases and GC removes them. Time spent
+suspended counts toward the holder's expiry. Restore and verify check their lease
+between batches of blob requests. A lost or expired lease returns
+`409 repository-locked` on those checks, when create or copy tries to publish, or
+during a GC sweep. An operation that meets a conflicting lock retries with backoff
+for up to 10 minutes and then returns the same code with `holder` when known.
+These leases let several servers and the CLI share a repository. Read-only
+repositories take no locks.
 
 GC first marks the blobs that every manifest references, under a shared lock, so backups
 continue. It then takes the exclusive lock, lists the manifests again and deletes the
@@ -13133,15 +13144,18 @@ prefix of every import graph in `imports`:
 ```json
 {
   "agentGraphs": ["https://example.org/memory/import/*"],
-  "imports": { "base": "https://example.org/memory/import/", "extract": "agent",
-               "secretPatterns": [ { "name": "internal-token", "regex": "itk_[A-Za-z0-9]{32}" } ] }
+  "imports": { "base": "https://example.org/memory/import/", "extract": "agent" },
+  "redaction": {
+    "patterns": [{ "name": "internal-token", "regex": "itk_[A-Za-z0-9]{32}" }],
+    "personal": ["email"],
+    "serverIngest": "redact"
+  }
 }
 ```
 
 `base` is an IRI that ends in `/` or `#`, and `agentGraphs` must cover it, so imported
-facts are unreviewed until a person promotes them. `secretPatterns` adds redaction
-patterns to the built-in ones, and each regex must compile. `transcripts` (off by
-default) lets the people who opt in import their session transcripts. `extract` is
+facts are unreviewed until a person promotes them. `transcripts` is off by default.
+It lets the people who opt in import their session transcripts. `extract` is
 `agent` (the default), `server` or `none`, and says who extracts facts from the prose
 of imported files. With `server`, each `sparkles memory sync` starts a server extraction
 of every new, edited or renamed file that needs one, with `source` and `mode: "memory"`
@@ -13168,12 +13182,6 @@ query parameters, needs `read` and counts as a query. Three arguments of
 | `reanchor` | For a changed text, the same commit gives each fact that cites the previous rendition a second reifier at the one place its quote occurs in the new text, and retracts with supersession the facts whose quote no longer occurs exactly once. The result counts `reanchored` and `retracted`. |
 | `reanchorFrom` | An earlier source, such as a renamed file's. Each fact that cites it and whose quote occurs in the new text is copied into the new graph with a reifier derived from the old one, and the result counts `copied`. It needs `write` on both graphs. |
 
-In a graph under `imports.base`, a text that matches a built-in secret pattern or one of
-`secretPatterns` is refused with a `422` and code `secret-detected`. The error names the
-pattern and the offset of the match, never the matched text, so a client that skipped
-redaction cannot store a secret the server recognizes. Pattern matching cannot find
-every secret.
-
 `list_sources` reports `needsExtraction` for each source. A rendition needs extraction
 until a fact cites a span of it through an activity that is neither a re-anchoring nor
 the import's own, whose agent is named `sparkles-import/<harness>`. With
@@ -13193,6 +13201,7 @@ scope, as plain text a session start hook can print:
 | Member | Meaning |
 |---|---|
 | `scope` | `project` (with `projectKey`), `entity` (with `entity`, an IRI or a label that must link exactly) or `session` (with `query`). |
+| `includeProjectAliases` | Include readable imports under both the project key and its redacted alias in a project brief. The default is false. |
 | `includeUnreviewed` | Adds unreviewed facts, each marked `(unreviewed)`. By default the brief holds reviewed facts only. |
 | `maxChars`, `maxFacts` | The bounds, 8000 characters and 60 facts by default. The brief stops at whichever comes first. |
 | `halfLifeDays`, `unreviewedWeight` | The ranking: a fact's weight halves every 90 days by default, grows with the number of graphs that assert it, and is multiplied by 0.7 when it is unreviewed. |
@@ -13218,6 +13227,31 @@ unless `includeUnreviewed` is set. They follow the header as a `# communities le
 line, a `##` line per report with its IRI, quoted title, member count and status, and a
 `summary` line with the quoted summary, and the answer lists them in `communities`. The
 reports count toward `maxChars`, so a brief drops the lowest rated reports that do not fit.
+
+#### Memory redaction
+
+`memory.redaction` is stored as format 4 of `memory.json`. The policy combines
+the built-in patterns with `redaction.patterns` and legacy `imports.secretPatterns`.
+Every regex must compile. The optional `entropy` detector scans values in
+assignments, headers, query parameters and quoted strings. It accepts
+`minLength` from 8 to 1024 and `minBitsPerChar` from 0 to 8. Their defaults are
+20 and 4. Zero entropy matches any eligible token meeting the length threshold.
+`personal` can enable `email`, `phone`, `payment-card`, `iban` and `ip`. A
+detection wholly covered by a regex in `allow` is ignored.
+
+`knownValues` defaults to true. On the server it enables exact matching against the
+server's secret inventory only for a server-wide administrator or the local operator.
+A dataset reader, writer or dataset administrator uses the same pattern, entropy and
+personal data detectors regardless of the server secret inventory. The CLI checks
+its own sensitive environment variables when `knownValues` is true and can also read
+explicit local values using `--redact-known-values`.
+
+Direct `register_source` and `POST /{ds}/sources` check normalized text, retained
+original bytes, the title and source and graph IRIs when the graph is under
+`imports.base` or `redaction.everywhere` is true. A detected match fails with
+`422 secret-detected` and gives its detector and character offset. Ingestion tasks
+use the independent `redaction.serverIngest` setting described under
+[Ingestion](#ingestion).
 
 ### Ingest profiles
 
@@ -13283,6 +13317,16 @@ role for the facts, links their entities with `link_entities`, and writes them w
 `assert_facts`, each with the span of its quote. Every tool runs as the caller, so an
 ingestion writes nothing the caller could not write with those tools.
 
+**`GET /$/assistant/{ds}`** includes `status.ingest`, which says if server extraction
+is on, and `status.extract`, which lists the configured extract provider and model
+pairs before their send limits. Only pairs allowed by the installed model configuration
+appear in the list. The Web UI confirms the proposed enable patch and its document recipients. It sends
+`If-Match` and `If-Ingest-Confirmation` on the assistant settings PATCH. The latter
+is percent-encoded JSON with `fields` in the order `enabled`, `ingest`, `send`, each
+as `[field, currentValue, source]`, `recipients` as the proposed ordered
+`[provider, model]` pairs, and `modelRevision` from `status.modelRevision`.
+A change to the approved fields, recipients or installed model revision fails with `412`.
+
 **`POST /$/ingest/{ds}`** starts a task and answers `202` with it and a `Location`
 header. The document is the `file` part of a multipart upload, with the options as
 further fields, or JSON with `text` or a `url` that the server fetches through its
@@ -13298,7 +13342,7 @@ curl -H 'Content-Type: application/json' \
 | Option | Meaning |
 |---|---|
 | `format` | The media type, when the file name or content does not say it. |
-| `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. A `url` is the source's IRI by default. |
+| `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. An eligible fetch `url` is the default source IRI. A URL with user info, a query string, a fragment or a policy match gets a generated IRI. An explicitly supplied IRI matching the policy fails with `sensitive-locator`. |
 | `mode` | `branch` (the default) writes on `ingest.<slug>-<n>`, or `proposals.<agent>.ingest-<slug>-<n>` for an agent of the memory settings. `preview` writes nothing until an approval. `auto` merges into `main` when every check passes and needs `admin`. `memory` needs `source` and writes the facts on `main` into the source's graph, which must be an agent graph (`not-agent-memory` otherwise), so they are unreviewed memory. A `source` cannot be previewed. |
 | `source` | The IRI of a registered source, or of its graph, to extract from instead of a new document. The task reads the source's live rendition with `read_chunks`. It cannot be combined with `file`, `text` or `url`, and fails with `unknown-source` (`404`) when no live source matches. |
 | `branch` | The review branch to use instead. |
@@ -13342,6 +13386,19 @@ bound of the converter, such as a ZIP bomb or a small file that would need more 
 128 MiB of output, fails with `too-large`, and a conversion that outlasts the task's
 deadline with `conversion-timeout`.
 
+The default `redaction.serverIngest: "redact"` applies the memory policy to converted
+document text and title before storage and extraction. The result includes
+`redactions` with counts by detector when there are replacements. In `refuse` mode a
+match fails the task with `secret-detected`. In `off` mode the ingestion pipeline leaves
+the text alone, including in graphs covered by the direct registration policy. An
+extraction from a stored rendition requiring replacement fails with
+`422 redaction-required` before model calls or writes. Register a redacted rendition
+before retrying. A table draft applies the policy to the model sample and reports the
+sample's counts. A workbook also reports the sum of its sheet counts. The preview
+and table upload use the original rows. Task listings keep the request mode, canonical
+media type and size when available. When redaction would exceed the rendition size
+or replacement limit, the task fails with `too-large`.
+
 Before any model call the task estimates the extraction's tokens from the chunks, the
 profile and the answer, and its cost from the first pair's pricing. Above the dataset's
 `confirmTokens` the task waits in `awaiting-confirmation` for
@@ -13370,17 +13427,20 @@ it and to admins of the dataset, and finished tasks are kept for 7 days.
 **`DELETE /$/ingest/{ds}/{task}`** cancels a running task, which keeps what it already
 wrote on its branch, or forgets one that has ended.
 
-A `preview` task ends in `awaiting-approval` with the proposals in its result.
+A new `preview` task ends in `awaiting-approval` with its pending source and any proposals.
 **`POST /$/ingest/{ds}/{task}/approve`** writes the source and the facts to `main` as the
 caller, and fails with `409` when `main` changed since the preview. An `auto` task
 merges its branch when no fact failed, no entity is ambiguous, the guard reported
 nothing, every fact's confidence is at least `autoConfidence` and the merge preview has
-no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`. A
-`claims` task publishes an evidence batch and reports the evidence `operation`,
-`revision`, `evidenceRendition`, `records`, `recordCounts` and `previousRevision` (the
-linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`,
-and omitted when no predecessor evidence revision is linked, when the recorded link is
-hidden from the caller or when `outcome` is `already-proposed`).
+no conflict. A source-only `auto` task runs the merge checks without fact checks.
+When a check blocks the merge, the task keeps the branch and reports `autoFallback`.
+
+A `claims` task publishes an evidence batch and reports the evidence `operation`,
+`revision`, `evidenceRendition`, `records` and `recordCounts`. Its `previousRevision`
+is the linked prior evidence `SourceRevision` IRI. The C18 `previousRendition` identifies a
+prior rendition. The task omits `previousRevision` when no predecessor evidence revision
+is linked, when the recorded link is hidden from the caller or when `outcome` is
+`already-proposed`.
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.
@@ -14940,9 +15000,10 @@ figures of the runs and reviews since the server started.
 
 ### Settings
 
-A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths`, `forms`
-and [`evidence`](#evidence-settings) settings are settings kinds. The effective value of a kind is computed from four layers, and a
-later layer overrides an earlier one.
+A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths`, `forms`,
+[`evidence`](#evidence-settings), and [`index`](#index-settings) settings are settings kinds.
+The effective value of a kind is computed from four layers, and a later layer overrides
+an earlier one.
 
 1. The built-in defaults of the kind.
 2. The `defaults` of the settings file of `serve --settings`.
@@ -15043,6 +15104,29 @@ is `400` with the code `bad-settings`. An unknown kind is `404` with `unknown-ki
 read-only server (`serve --read-only`) refuses every settings write with `403`, the
 older `PUT /$/assistant/{ds}`, `PUT /$/memory/{ds}` and `PUT /$/ingest/{ds}/settings`
 included.
+
+#### Index settings
+
+`GET /$/settings/{ds}/index` reports the choices for the next generation build.
+The `vocabCodec` field takes `front` or `fsst`, and `patterns` takes a boolean. The
+built-in choices are `front` for a new dataset and `true` for patterns. Without a configured
+codec, an existing dataset or branch inherits its current generation's codec.
+Server invocation flags `--vocab-codec` and `--no-patterns` also contribute to the
+default layer. A runtime edit of a field such as `patterns` follows
+the same locking and reset rules as other kinds. The settings file can lock
+`index.patterns`. A request with `?branch=NAME` reads the choices for that
+branch and writes overrides shared by the dataset. A write requires administration
+rights over the whole dataset.
+
+The response includes `base`, the choices inherited before applying runtime overrides.
+A `PUT` replaces the runtime layer with the explicit values even when they match
+`base`. An omitted or null field inherits its base value again.
+
+The runtime overrides are kept in the dataset's `index-settings.json`. A bulk
+load or compaction captures the effective choices for the generation it builds.
+Queries keep using the files of their selected generation. The
+[storage guide](storage/README.md#dataset-index-settings) covers the command line
+and compaction behavior.
 
 #### Prefixes
 

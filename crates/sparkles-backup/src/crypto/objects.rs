@@ -15,6 +15,7 @@ pub(crate) struct EpochKeys {
     pub epoch: u32,
     pub master: super::memory::LockedKey,
     pub id: super::memory::LockedKey,
+    pub chunker: super::memory::LockedKey,
     blob: super::memory::LockedKey,
     manifest: super::memory::LockedKey,
 }
@@ -40,6 +41,11 @@ impl EpochKeys {
                 master.as_ref(),
                 &[],
                 b"sparkles/f07/repo/id",
+            )?)?,
+            chunker: super::memory::LockedKey::new(primitive::derive(
+                master.as_ref(),
+                &[],
+                b"sparkles/f07/repo/chunker",
             )?)?,
             blob: super::memory::LockedKey::new(primitive::derive(
                 master.as_ref(),
@@ -153,7 +159,12 @@ impl EpochKeys {
                     .map_err(|_| invalid("invalid encrypted compressed payload"))?;
                 (plain, 9 + cursor.position() as usize)
             }
-            _ => return Err(invalid("unsupported encrypted codec")),
+            codec => {
+                return Err(crate::BackupError::new(
+                    crate::Code::IncompatibleFormat,
+                    format!("unsupported encrypted blob codec {codec}"),
+                ));
+            }
         };
         if plain.len() as u64 != expected
             || self.blob_id(&plain) != id
@@ -307,6 +318,12 @@ mod tests {
             bad[offset] ^= 1;
             assert!(keys.open_blob(&seal_inner(&bad), &valid.id, 100).is_err());
         }
+        let mut reserved = inner.clone();
+        reserved[0] = blob::Codec::Zstd as u8;
+        let error = keys
+            .open_blob(&seal_inner(&reserved), &valid.id, 100)
+            .unwrap_err();
+        assert_eq!(error.code(), crate::Code::IncompatibleFormat);
         let encoded = blob::encode(&plain, true);
         let mut two_frames = vec![1];
         two_frames.extend_from_slice(&100u64.to_le_bytes());

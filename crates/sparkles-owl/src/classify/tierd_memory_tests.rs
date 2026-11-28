@@ -1006,11 +1006,13 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
     let _ = exact_needed;
 }
 
-/// Non-ground `fold` with `slack_covered > 0`, `FOLD_PRUNE` streaming transition, and wide
+/// Non-ground `fold` with wide unions, the `FOLD_PRUNE` streaming transition, and wide
 /// unions under spare capacity (on both non-ground and ground paths) must keep every live
-/// buffer charged through its last use and stop immediately on refusal.
+/// buffer charged through its last use and stop immediately on refusal. Since item 1280 no
+/// caller reserves a bound on fold's tables before it drains, so fold's own charge covers
+/// them.
 #[test]
-fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
+fn fold_charges_wide_unions_prune_streaming_and_wide_spare_capacity() {
     struct TrackSink<'a> {
         run: &'a DlRun,
         cap: usize,
@@ -1057,8 +1059,8 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
     );
     let run = DlRun::new(false, Default::default());
 
-    // A. `slack_covered > 0` with large wide unions (`union_now` >> `slack_covered`):
-    // reservation must include `union_now` on both growth and prune paths and cover heap.
+    // A. Large wide unions: fold's own reservation covers the heap on both growth and
+    // prune paths, with nothing reserved before the drain.
     {
         let mut st = State::default();
         let _ = super::dl_rules::ds(&mut st);
@@ -1067,34 +1069,31 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
         let list_b: Vec<_> = (0..8u32).map(|i| wide(10_000 + i * 300)).collect();
         let mut found = Found::default();
         found.products(vec![list_a, list_b], (Vec::new(), Vec::new()));
-        let slack = found.fold_slack();
-        assert!(slack > 0);
         let mut sink = TrackSink {
             run: &run,
             cap: usize::MAX,
-            live: slack, // caller pre-reserved `slack`
-            peak: slack,
+            live: 0,
+            peak: 0,
             stopped: false,
         };
         let (_, sample) = measure(|| {
-            super::dl_rules::drain_covered(&ix, &mut st, found, &mut sink, false, slack);
+            super::dl_rules::drain(&ix, &mut st, found, &mut sink);
         });
         assert!(
             sink.peak >= sample.peak,
-            "covered fold peak ({}) undercounted heap ({})",
+            "fold peak ({}) undercounted heap ({})",
             sink.peak,
             sample.peak
         );
-        // After drain, only `slack` plus retained Store growth remains in `sink.live`.
+        // After drain, only retained Store growth remains in `sink.live`.
         let store_bytes = super::dl_rules::dl(&st).map_or(0, |d| d.store.bytes());
         assert_eq!(
-            sink.live,
-            slack + store_bytes,
+            sink.live, store_bytes,
             "fold must release all temporary reservations"
         );
 
-        // Tight cap covering `slack` + `held` + 64 KiB (not enough for 128 wide unions) must
-        // refuse before allocating all unions even with `slack_covered > 0`.
+        // A tight cap covering `held` + 64 KiB (not enough for 128 wide unions) must refuse
+        // before allocating all unions.
         let mut st2 = State::default();
         let _ = super::dl_rules::ds(&mut st2);
         let list_a2: Vec<_> = (0..16u32).map(|i| wide(100 + i * 300)).collect();
@@ -1104,15 +1103,15 @@ fn fold_covered_slack_prune_streaming_and_wide_spare_capacity() {
         let held2 = found2.held_bytes();
         let mut tight = TrackSink {
             run: &run,
-            cap: slack + held2 + (64 << 10),
-            live: slack,
-            peak: slack,
+            cap: held2 + (64 << 10),
+            live: 0,
+            peak: 0,
             stopped: false,
         };
-        super::dl_rules::drain_covered(&ix, &mut st2, found2, &mut tight, false, slack);
-        assert!(tight.stopped, "tight cap must refuse wide covered fold");
+        super::dl_rules::drain(&ix, &mut st2, found2, &mut tight);
+        assert!(tight.stopped, "tight cap must refuse wide fold");
         assert!(st2.interrupted);
-        assert_eq!(tight.live, slack);
+        assert_eq!(tight.live, 0);
     }
 
     // B. `FOLD_PRUNE` (4,096) streaming transition:
@@ -1333,7 +1332,7 @@ fn mrep_regs_rreach_replay_avoids_tombstone_rehash_and_credits_freed_vec() {
         "rreach must credit freed regs vectors back (credited={})",
         sink.credited
     );
-    let dl_bytes = super::dl_rules::dl(&st).expect("dl state").bytes();
+    let dl_bytes = super::dl_rules::dl(&st).expect("dl state").bytes() + run.mtab_bytes();
     assert_eq!(
         sink.live,
         std::mem::size_of::<super::saturate::Extra>() + dl_bytes,
@@ -1475,6 +1474,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
         // `head_bytes` (`32 * 8 = 256 B`) from the unwound TOP clause.
         let committed_st = std::mem::size_of::<super::saturate::Extra>()
             + super::dl_rules::dl(&st).map_or(0, |d| d.bytes())
+            + run2.mtab_bytes()
             + run2.lits.bytes();
         assert_eq!(
             live.load(Ordering::Relaxed),
@@ -1524,7 +1524,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
             );
             assert!(x.store.next(&ix3, Some(&ord), &mut max).is_some());
         }
-        let before_dl = super::dl_rules::dl(&st).unwrap().bytes();
+        let before_dl = super::dl_rules::dl(&st).unwrap().bytes() + run3.mtab_bytes();
         let live = Arc::new(AtomicUsize::new(0));
         let mut sink = PanicOnPollSink {
             run: &run3,
@@ -1537,7 +1537,7 @@ fn callback_panic_unwinds_and_releases_temporary_reservations() {
             let _ = super::dl_root::rret(&ix3, &mut st, cid, &mut sink);
         }));
         assert!(res.is_err(), "expected simulated go_on panic inside rret");
-        let after_dl = super::dl_rules::dl(&st).unwrap().bytes();
+        let after_dl = super::dl_rules::dl(&st).unwrap().bytes() + run3.mtab_bytes();
         assert_eq!(
             live.load(Ordering::Relaxed),
             after_dl.saturating_sub(before_dl),
@@ -2007,7 +2007,8 @@ fn rreach_replay_callback_panic_drops_vec_before_crediting_retained_memory() {
         "detached registration vector must be deallocated before credit_dl runs"
     );
     let expected_live = std::mem::size_of::<super::saturate::Extra>()
-        + super::dl_rules::dl(&st).expect("dl state").bytes();
+        + super::dl_rules::dl(&st).expect("dl state").bytes()
+        + run.mtab_bytes();
     assert_eq!(
         live.load(Ordering::Relaxed),
         expected_live,
@@ -5990,11 +5991,16 @@ fn post_merge_replan_admits_long_iri_key_expansion_and_polls_cancellation() {
             restarts: 1,
             outcome: PlanKind::PollErr
         }));
+        // the 300 individuals take 475,505 conclusions without item 1231's repair, and the
+        // repair's notices take the run past the rooted bound, so the recovery runs without
+        // it and with the check, which item 1327 follows
         let rec = k
             .classify(&Limits {
                 threads: 1,
                 rooted: true,
                 rooted_merge: true,
+                rooted_marker_repair: false,
+                rooted_decline: true,
                 ..Limits::default()
             })
             .expect("recovery after wide DifferentIndividuals cancel");
@@ -10145,6 +10151,47 @@ fn split_round6_reduced_merge_does_not_copy_unchanged_exclusions() {
     );
 }
 
+/// A rewritten axiom can equal an axiom the ontology states as it is (row 1304). Both
+/// members of the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`,
+/// which the first axiom states too. The run without counting after the counting bound
+/// leaves that axiom out, and the report names both original axioms, while a run that was
+/// not asked to count gives the axioms to the Horn rules (roadmap item 1286).
+#[test]
+fn the_run_after_the_counting_bound_names_every_original_axiom_of_a_rewritten_one() {
+    let input = axioms(
+        "SubClassOf(:D ObjectUnionOf(:E :F))
+         SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
+         DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
+             ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         ClassAssertion(:B :b)",
+    );
+    let refs: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
+    let mut sat = Saturation::new();
+    sat.no_counting = true;
+    let out = sat
+        .classify(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                rooted: true,
+                counting: true,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
+    let left: Vec<&AxiomKind> = sat.excluded().iter().map(|e| &e.axiom).collect();
+    assert_eq!(left.len(), 2, "{left:#?}");
+    assert!(
+        left.contains(&refs[1]) && left.contains(&refs[2]),
+        "{left:#?}"
+    );
+    // the disjunction is the only axiom outside OWL 2 EL that the run takes
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
 #[test]
 fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
     let input = axioms(
@@ -10181,10 +10228,14 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
     let held_bytes = excluded_copy_bytes(&old_report)
         + red.retained_bytes()
         + reduced.capacity() * std::mem::size_of::<&AxiomKind>();
+    // the run without counting after the counting bound, which leaves the rewritten
+    // minimum out where a run not asked to count gives the axioms to the Horn rules
+    // (roadmap item 1286)
     let build = |outside: &Vec<_>, cap| {
         let mut sat = Saturation::new();
         sat.active_hub = hub.clone();
         sat.hide_internal = true;
+        sat.no_counting = true;
         sat.excluded = old_report.clone();
         let result = sat.build(
             &reduced,
@@ -10196,6 +10247,7 @@ fn reduced_exclusion_restore_accounts_for_taken_profile_diagnostics() {
             &Limits {
                 max_memory: cap,
                 rooted: true,
+                counting: true,
                 threads: 1,
                 ..Limits::default()
             },
@@ -10591,4 +10643,298 @@ fn split_round4_pre_plan_counts_retained_split_metadata() {
     run.branch_neq = Box::new([(1, 2)]);
     let metadata = run.split_meta_bytes();
     assert_eq!(sat.pre_plan_live_bytes(0), before + metadata);
+}
+
+/// The ledger of the marker repair's table tests (item 1247). It refuses the admission it
+/// is told to by its count, runs `hook` with its first admission, and fails a test that
+/// admits under the table's lock.
+struct MTabLedger<'a> {
+    run: &'a DlRun,
+    live: usize,
+    admits: usize,
+    refuse: Option<usize>,
+    hook: Option<MTabHook<'a>>,
+    /// when set, the tables that may be alive when a table's charge goes back unkept
+    tables_at_refund: Option<isize>,
+    refunds: usize,
+}
+
+/// What [`MTabLedger`] runs with its first admission.
+type MTabHook<'a> = Box<dyn FnOnce(&DlRun) + 'a>;
+
+impl<'a> MTabLedger<'a> {
+    fn new(run: &'a DlRun) -> Self {
+        Self {
+            run,
+            live: 0,
+            admits: 0,
+            refuse: None,
+            hook: None,
+            tables_at_refund: None,
+            refunds: 0,
+        }
+    }
+}
+
+impl Sink for MTabLedger<'_> {
+    fn send(&mut self, _: Ex, _: Concl) {}
+    fn me(&mut self, _: Concl) {}
+    fn dl(&self) -> &DlRun {
+        self.run
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        assert!(
+            !self.run.mtab.get().is_some_and(|t| t.locked()),
+            "an admission ran under the repair table's lock"
+        );
+        let n = self.admits;
+        self.admits += 1;
+        if let Some(hook) = self.hook.take() {
+            hook(self.run);
+        }
+        if self.refuse == Some(n) {
+            return false;
+        }
+        self.live += bytes;
+        true
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        assert!(kept <= admitted);
+        assert!(
+            !self.run.mtab.get().is_some_and(|t| t.locked()),
+            "a commit ran under the repair table's lock"
+        );
+        if let Some(live) = self.tables_at_refund
+            && admitted == super::dl_root::MTAB_BYTES
+            && kept == 0
+        {
+            assert_eq!(
+                super::dl_root::mtabs_live(),
+                live,
+                "a losing table was alive when its charge went back"
+            );
+            self.refunds += 1;
+        }
+        self.live -= admitted - kept;
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.live = self.live.saturating_sub(bytes);
+    }
+    fn worked(&mut self, _: usize) {}
+}
+
+/// Item 1247: a rooted run without the marker repair makes no table for the repair, and
+/// its contexts name no slot, while a run with it gives each context that holds repair
+/// state its own slot of the run's table, which the run's ledger holds.
+#[test]
+fn the_marker_repair_state_is_in_a_table_that_only_a_run_with_the_repair_makes() {
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let slot = |st: &State| super::dl_rules::dl(st).map_or(0, |x| x.mslot);
+    for mode in [0, MREPAIR_ON | super::dl_rules::MREPAIR_CF] {
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let mut sink = MTabLedger::new(&run);
+        let mut root_st = State::default();
+        super::dl_root::init(&ix, &mut root_st, &mut sink);
+        let mut ctxs: Vec<State> = (0..3).map(|_| State::default()).collect();
+        for (i, st) in ctxs.iter_mut().enumerate() {
+            let me = 100 + i as Ex;
+            assert!(super::dl_root::redge(&mut root_st, me, 0, &mut sink));
+            if mode != 0 {
+                assert!(super::dl_root::rreach(
+                    &ix,
+                    me,
+                    st,
+                    super::index::TOP,
+                    &mut sink
+                ));
+            }
+        }
+        let named: Vec<u32> = std::iter::once(&root_st)
+            .chain(&ctxs)
+            .map(slot)
+            .filter(|&s| s != 0)
+            .collect();
+        if mode == 0 {
+            assert!(
+                run.mtab.get().is_none(),
+                "a run without the repair made the table"
+            );
+            assert!(
+                named.is_empty(),
+                "a context names a slot without the repair"
+            );
+            assert_eq!(run.mtab_bytes(), 0);
+        } else {
+            let tab = run.mtab.get().expect("the repair makes its table");
+            assert_eq!(named.len(), 4, "the root and the three reached contexts");
+            let mut distinct = named.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct, named, "each context has a slot of its own");
+            assert_eq!(
+                tab.len(),
+                named.len(),
+                "a slot for each context that holds one"
+            );
+            assert!(run.mtab_bytes() > 0 && sink.live >= run.mtab_bytes());
+        }
+    }
+}
+
+/// A context's repair state is taken out of its slot once at a time (item 1247), so that a
+/// handler that reached its context's rules again while it held the state would panic in
+/// the tests rather than lose a change.
+#[test]
+#[should_panic(expected = "taken once at a time")]
+fn a_context_s_repair_state_is_taken_once_at_a_time() {
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let mut run = DlRun::new(false, Default::default());
+    run.mrepair = MREPAIR_ON;
+    let mut sink = MTabLedger::new(&run);
+    let mut st = State::default();
+    super::dl_root::init(&ix, &mut st, &mut sink);
+    let x = super::dl_rules::dl(&st).expect("dl state");
+    let _held = super::dl_root::mrep_get(x, &sink);
+    let _again = super::dl_root::mrep_get(x, &sink);
+}
+
+/// A run with the marker repair, for the table tests of item 1247.
+fn mtab_run() -> DlRun {
+    let mut run = DlRun::new(false, Default::default());
+    run.mrepair = MREPAIR_ON | super::dl_rules::MREPAIR_CF;
+    run
+}
+
+/// Item 1247: a refused admission of the run's table, of a context's first slot or of the
+/// growth of the slots leaves the context naming no slot and the ledger holding exactly
+/// what the table holds, and the table grows past its first allocation with each slot
+/// charged exactly.
+#[test]
+fn the_marker_repair_table_admits_each_slot_exactly_and_keeps_nothing_it_refused() {
+    use super::dl_root::{MTAB_BYTES, mrep_admit};
+    use super::dl_rules::ds;
+    let run = mtab_run();
+    let mut sink = MTabLedger::new(&run);
+    let mut ctxs: Vec<State> = (0..12).map(|_| State::default()).collect();
+
+    // a refusal of the table itself makes nothing
+    sink.refuse = Some(0);
+    assert!(mrep_admit(ds(&mut ctxs[0]), &mut sink).is_none());
+    assert!(run.mtab.get().is_none(), "a refused table was made");
+    assert_eq!(ds(&mut ctxs[0]).mslot, 0);
+    assert_eq!(sink.live, 0);
+
+    // a refusal of the first slot keeps the table, empty, and its charge
+    sink.refuse = Some(2);
+    assert!(mrep_admit(ds(&mut ctxs[0]), &mut sink).is_none());
+    let tab = run.mtab.get().expect("the table stays once it is admitted");
+    assert_eq!(ds(&mut ctxs[0]).mslot, 0);
+    assert_eq!(tab.len(), 0);
+    assert_eq!(tab.bytes(), MTAB_BYTES);
+    assert_eq!(sink.live, tab.bytes());
+
+    // four slots fill the first allocation, each charged exactly
+    sink.refuse = None;
+    for (i, st) in ctxs[..4].iter_mut().enumerate() {
+        let held = mrep_admit(ds(st), &mut sink).expect("admitted");
+        drop(held);
+        assert_eq!(ds(st).mslot, i as u32 + 1);
+        assert_eq!(sink.live, tab.bytes(), "the ledger after slot {}", i + 1);
+    }
+    let full = tab.bytes();
+
+    // a refusal of the growth past the first allocation keeps the four slots as they were
+    sink.refuse = Some(sink.admits);
+    assert!(mrep_admit(ds(&mut ctxs[4]), &mut sink).is_none());
+    assert_eq!(ds(&mut ctxs[4]).mslot, 0);
+    assert_eq!(tab.len(), 4);
+    assert_eq!(tab.bytes(), full);
+    assert_eq!(sink.live, full);
+
+    // the slots grow twice past it, with the ledger exact after every slot
+    sink.refuse = None;
+    for (i, st) in ctxs.iter_mut().enumerate().skip(4) {
+        let held = mrep_admit(ds(st), &mut sink).expect("admitted");
+        drop(held);
+        assert_eq!(ds(st).mslot, i as u32 + 1);
+        assert_eq!(sink.live, tab.bytes(), "the ledger after slot {}", i + 1);
+    }
+    assert_eq!(tab.len(), ctxs.len());
+    assert!(
+        tab.bytes()
+            >= MTAB_BYTES
+                + 16 * std::mem::size_of::<Option<Box<super::dl_root::MRep>>>()
+                + ctxs.len() * std::mem::size_of::<super::dl_root::MRep>(),
+        "twelve slots grew past eight"
+    );
+
+    // a context that has its slot takes it again with nothing more charged
+    let before = sink.live;
+    drop(mrep_admit(ds(&mut ctxs[0]), &mut sink).expect("its slot"));
+    assert_eq!(sink.live, before);
+    assert_eq!(run.mtab_bytes(), sink.live);
+}
+
+/// Item 1247: two workers that both find the run without its table make one each, and the
+/// one that loses the race frees its table and gives its charge back, so that the two
+/// contexts share the winner's table and the two ledgers together hold exactly its bytes.
+#[test]
+fn the_worker_that_loses_the_marker_repair_table_race_gives_its_charge_back() {
+    use super::dl_root::{MTAB_BYTES, mrep_admit};
+    use super::dl_rules::ds;
+    let run = mtab_run();
+    let mut winner_st = State::default();
+    let winner_live = std::cell::Cell::new(0);
+    let mut loser = MTabLedger::new(&run);
+    {
+        let (winner_st, winner_live) = (&mut winner_st, &winner_live);
+        loser.hook = Some(Box::new(move |run: &DlRun| {
+            assert!(run.mtab.get().is_none(), "the loser found the table");
+            let mut winner = MTabLedger::new(run);
+            drop(mrep_admit(ds(winner_st), &mut winner).expect("the winner admits"));
+            winner_live.set(winner.live);
+        }));
+    }
+    // only the winner's table may be alive when the loser gives its table's charge back
+    let tables_before = super::dl_root::mtabs_live();
+    loser.tables_at_refund = Some(tables_before + 1);
+    let mut loser_st = State::default();
+    drop(mrep_admit(ds(&mut loser_st), &mut loser).expect("the loser admits"));
+    assert_eq!(loser.refunds, 1, "the loser gave its table's charge back");
+    assert_eq!(super::dl_root::mtabs_live(), tables_before + 1);
+    let loser_live = loser.live;
+    drop(loser);
+    let tab = run.mtab.get().expect("the winner's table");
+    assert_eq!(tab.len(), 2, "both contexts have a slot of the one table");
+    assert_eq!(ds(&mut winner_st).mslot, 1);
+    assert_eq!(ds(&mut loser_st).mslot, 2);
+    assert_eq!(
+        loser_live,
+        std::mem::size_of::<super::dl_root::MRep>(),
+        "the loser keeps its state's charge and none of its table's"
+    );
+    assert!(winner_live.get() >= MTAB_BYTES);
+    assert_eq!(winner_live.get() + loser_live, tab.bytes());
+}
+
+/// A context's repair state is read only while it is in its slot (item 1247), so that a
+/// handler that read it while it held it would panic in the tests.
+#[test]
+#[should_panic(expected = "read while it is in its slot")]
+fn a_context_s_repair_state_is_read_only_in_its_slot() {
+    use super::dl_root::{mrep_admit, mrep_peek};
+    use super::dl_rules::ds;
+    let run = mtab_run();
+    let mut sink = MTabLedger::new(&run);
+    let mut st = State::default();
+    let _held = mrep_admit(ds(&mut st), &mut sink).expect("admitted");
+    let x = super::dl_rules::dl(&st).expect("dl state");
+    mrep_peek(x, &sink, |_| ());
 }

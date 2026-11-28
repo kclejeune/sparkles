@@ -479,8 +479,8 @@ pub(super) fn historical_geo_view(config: Arc<GeoConfig>, epoch: u64) -> Arc<Geo
         lookup,
         base: None,
         overlay: Arc::new(Overlay::empty()),
-        tail: imbl::Vector::new(),
-        skipped: imbl::Vector::new(),
+        tail: crate::store::append_vec::AppendVec::new(),
+        skipped: crate::store::append_vec::AppendVec::new(),
     })
 }
 
@@ -896,8 +896,8 @@ fn index_commit(
             .copied()
             .collect();
         v.overlay = Arc::new(Overlay::build(rows, skipped));
-        v.tail = imbl::Vector::new();
-        v.skipped = imbl::Vector::new();
+        v.tail = crate::store::append_vec::AppendVec::new();
+        v.skipped = crate::store::append_vec::AppendVec::new();
     }
     Ok(())
 }

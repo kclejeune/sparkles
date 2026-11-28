@@ -1055,3 +1055,213 @@ fn diff_performance() {
     assert!(s.head_commit().bulk);
     time("compare across a bulk commit", before, s.head_commit().seq);
 }
+
+#[test]
+fn changed_id_admission_reuses_capacity_across_cancelled_wal_toggles() {
+    use sparkles_core::id::Id;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.set_retention(keep_all()).unwrap();
+    let before = s.snapshot().commit;
+    for _ in 0..32 {
+        update(&s, "INSERT DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+        update(&s, "DELETE DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+    }
+    update(&s, "INSERT DATA { <urn:s> <urn:p> 1 }", &Default::default()).unwrap();
+    let held = std::cell::Cell::new(0);
+    let head = s.snapshot();
+    let admission = |bytes| {
+        let next = held.get() + bytes;
+        if next > 512 {
+            return Err(Error::BudgetExceeded(sparkles_core::error::Budget {
+                kind: sparkles_core::error::BudgetKind::Memory,
+                limit: 512,
+                requested: next,
+            }));
+        }
+        held.set(next);
+        Ok(())
+    };
+    let changes = s
+        .changed_ids_with_admission(
+            before,
+            &head,
+            &[Id::DEFAULT_GRAPH],
+            &DiffOptions::default(),
+            Some(&admission),
+        )
+        .unwrap()
+        .expect("the WAL is retained");
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].1);
+    assert!(held.get() > size_of::<([Id; 4], bool)>() as u64);
+}
+
+#[test]
+fn changed_id_table_admits_both_backings_at_resize_and_returns_table_credit() {
+    use sparkles_budget::sizes::table_bytes_for;
+    use sparkles_core::id::Id;
+    type Row = ([Id; 4], bool);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        &dir.path().join("db"),
+        StoreOptions {
+            bulk_threshold: 10_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let before = store.snapshot().commit;
+    update(
+        &store,
+        "INSERT DATA { <urn:a> <urn:p> 1, 2, 3, 4 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let head = store.snapshot();
+    let live = std::cell::Cell::new(0u64);
+    let peak = std::cell::Cell::new(0u64);
+    let limit = std::cell::Cell::new(table_bytes_for::<Row>(7) as u64);
+    let admit = |bytes| {
+        let next = live.get() + bytes;
+        if next > limit.get() {
+            return Err(Error::invalid("resize cannot fit both tables"));
+        }
+        live.set(next);
+        peak.set(peak.get().max(next));
+        Ok(())
+    };
+    let release = |bytes| live.set(live.get() - bytes);
+    let run = || {
+        store.changed_ids_metered(
+            before,
+            &head,
+            &[Id::DEFAULT_GRAPH],
+            &DiffOptions::default(),
+            Some(&admit),
+            &release,
+        )
+    };
+    assert!(run().unwrap_err().to_string().contains("both tables"));
+    assert_eq!(live.replace(0), table_bytes_for::<Row>(3) as u64);
+    limit.set(4096);
+    let result = run().unwrap().unwrap();
+    assert_eq!(result.len(), 4);
+    assert!(peak.get() >= (table_bytes_for::<Row>(3) + table_bytes_for::<Row>(7)) as u64);
+    assert_eq!(live.get(), (result.capacity() * size_of::<Row>()) as u64);
+}
+
+#[test]
+fn changed_id_table_admits_tombstone_triggered_resize() {
+    use sparkles_budget::sizes::table_bytes_for;
+    use sparkles_core::id::Id;
+    type Row = ([Id; 4], bool);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    use std::hash::BuildHasher;
+
+    // Intern the names before the measured WAL range. Choose keys with identical
+    // starting buckets so a deletion inside the full marker run leaves a tombstone.
+    let names: Vec<_> = (0..1024).map(|i| format!("urn:subject:{i}")).collect();
+    let mut seed = String::from("INSERT DATA { GRAPH <urn:seed> { <urn:o> <urn:p> ");
+    seed.push_str(
+        &names
+            .iter()
+            .map(|name| format!("<{name}>"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    seed.push_str(" } }");
+    update(&store, &seed, &Default::default()).unwrap();
+    let snap = store.snapshot();
+    let before = snap.commit;
+    let p = snap.lookup_iri("urn:p").unwrap();
+    let o = snap.lookup_iri("urn:o").unwrap();
+    let row = |subject: &str| [snap.lookup_iri(subject).unwrap(), p, o, Id::DEFAULT_GRAPH];
+    let mut buckets = [const { Vec::new() }; 32];
+    for subject in &names {
+        let bucket = rustc_hash::FxBuildHasher.hash_one(row(subject)) as usize & 31;
+        buckets[bucket].push(subject);
+    }
+    let subjects = buckets.iter().find(|bucket| bucket.len() >= 28).unwrap();
+    let mut table = hashbrown::HashMap::<_, bool, rustc_hash::FxBuildHasher>::default();
+    for subject in &subjects[..28] {
+        table.reserve(1);
+        table.insert(row(subject), true);
+        update(
+            &store,
+            &format!("INSERT DATA {{ <{subject}> <urn:p> <urn:o> }}"),
+            &Default::default(),
+        )
+        .unwrap();
+    }
+    assert_eq!(table.capacity(), 28);
+    let cancelled = subjects[..28]
+        .iter()
+        .find(|subject| {
+            let mut copy = table.clone();
+            copy.remove(&row(subject));
+            copy.capacity() == copy.len()
+        })
+        .expect("at least one deletion leaves a tombstone");
+    update(
+        &store,
+        &format!("DELETE DATA {{ <{cancelled}> <urn:p> <urn:o> }}"),
+        &Default::default(),
+    )
+    .unwrap();
+    update(
+        &store,
+        "INSERT DATA { <urn:extra> <urn:p> <urn:o> }",
+        &Default::default(),
+    )
+    .unwrap();
+
+    let head = store.snapshot();
+    let old = table_bytes_for::<Row>(28) as u64;
+    let grown = table_bytes_for::<Row>(56) as u64;
+    let live = std::cell::Cell::new(0);
+    let peak = std::cell::Cell::new(0);
+    let limit = std::cell::Cell::new(old + grown - 1);
+    let admit = |bytes| {
+        let next = live.get() + bytes;
+        if next > limit.get() {
+            assert_eq!(live.get(), old);
+            assert_eq!(bytes, grown);
+            return Err(Error::invalid("tombstone resize overlap"));
+        }
+        live.set(next);
+        peak.set(peak.get().max(next));
+        Ok(())
+    };
+    let release = |bytes| live.set(live.get() - bytes);
+    let run = || {
+        store.changed_ids_metered(
+            before,
+            &head,
+            &[Id::DEFAULT_GRAPH],
+            &DiffOptions::default(),
+            Some(&admit),
+            &release,
+        )
+    };
+    assert!(
+        run()
+            .unwrap_err()
+            .to_string()
+            .contains("tombstone resize overlap")
+    );
+    assert_eq!(live.replace(0), old);
+    limit.set(old + grown + 4096);
+    let rows = run().unwrap().unwrap();
+    assert_eq!(rows.len(), 28);
+    assert!(peak.get() >= old + grown);
+    assert_eq!(live.get(), (rows.capacity() * size_of::<Row>()) as u64);
+}

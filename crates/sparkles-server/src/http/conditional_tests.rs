@@ -464,13 +464,13 @@ async fn cors_allows_the_conditional_headers() {
     let r = call(
         &app,
         "OPTIONS",
-        "/h/data?default",
+        "/$/settings/h/assistant",
         &[
             ("origin", "https://app.example"),
-            ("access-control-request-method", "PUT"),
+            ("access-control-request-method", "PATCH"),
             (
                 "access-control-request-headers",
-                "if-match,if-none-match,sparkles-commit-message",
+                "if-match,if-none-match,if-ingest-confirmation,sparkles-commit-message",
             ),
         ],
         "",
@@ -480,7 +480,12 @@ async fn cors_allows_the_conditional_headers() {
         .header("access-control-allow-headers")
         .unwrap()
         .to_ascii_lowercase();
-    for h in ["if-match", "if-none-match", "sparkles-commit-message"] {
+    for h in [
+        "if-match",
+        "if-none-match",
+        "if-ingest-confirmation",
+        "sparkles-commit-message",
+    ] {
         assert!(allowed.contains(h), "{allowed}");
     }
 }

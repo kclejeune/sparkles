@@ -1060,6 +1060,54 @@ pub fn stored(dir: &FsPath) -> BTreeMap<String, SystemTime> {
     out
 }
 
+/// All readable server secret values (model provider keys, `--model-secret` sources, and
+/// runtime secrets in `<dataDir>/secrets`) for exact-value redaction before document text
+/// is stored or sent to a model (C18 item 77). Values are never logged or returned.
+pub fn known_values(
+    st: &crate::state::AppState,
+    principal: &crate::auth::Principal,
+) -> Vec<String> {
+    // Matching can change even a successful response's digest, length or model output.
+    // Only principals with server-wide authority may observe any of those differences.
+    if !principal.has(crate::auth::ServerPerm::ServerAdmin) {
+        return Vec::new();
+    }
+    let mut seen = BTreeSet::new();
+    let mut push = |raw: String| {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            seen.insert(trimmed);
+        }
+    };
+    if let Some(m) = st.models() {
+        for v in m.known_secret_values() {
+            push(v);
+        }
+    }
+    for source in st.settings.server.secret_sources().values() {
+        match source {
+            sparkles::vector::embed::SecretSource::Env(var) => {
+                if let Ok(v) = std::env::var(var) {
+                    push(v);
+                }
+            }
+            sparkles::vector::embed::SecretSource::File(path) => {
+                if let Ok(v) = std::fs::read_to_string(path) {
+                    push(v);
+                }
+            }
+        }
+    }
+    if let Some(dir) = st.settings.server.secrets_dir() {
+        for name in stored(&dir).keys() {
+            if let Ok(v) = st.settings.server.sealing.read(&dir.join(name), name) {
+                push(v);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
 fn rfc3339(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

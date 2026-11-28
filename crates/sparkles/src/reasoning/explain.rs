@@ -410,7 +410,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
         };
         // Check visible asserted answers before building a cold graph-backed schema they
         // do not need, and share one ExplainWorkspace across proof search and resolver.
-        let found = on.explain_resolving(
+        let found = on.explain_resolving_with_parent(
             &view,
             leaves,
             &graphs,
@@ -423,6 +423,7 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                 max_memory: req.max_memory,
             },
             resolve,
+            ds.pool().map(|p| p.work_parent()),
         )?;
         if !matches!(found, Explained::NotFound) {
             return Ok(Explanation {

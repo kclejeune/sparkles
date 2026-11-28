@@ -332,6 +332,7 @@ async function handleTasks(
           },
           preview: { rows: 3, triples: ['<http://example.org/people/1> <x> <y> .'] },
           drafted: 'model',
+          redactions: { email: 1 },
         },
       });
     } else if (
@@ -347,6 +348,19 @@ async function handleTasks(
           message:
             "1 of the PDF's 4 pages has no usable text: OCR is needed, and this server has none",
           pages: [{ page: 3, reasons: ['scanned'] }],
+        },
+      });
+    } else if (fields.extract === 'false') {
+      t = newTask(name, input, mode === 'preview' ? 'awaiting-approval' : 'done', {
+        result: {
+          outcome: mode === 'preview' ? 'preview' : mode === 'auto' ? 'merged' : 'registered',
+          mode,
+          format: lower.endsWith('.pdf') ? 'pdf' : 'markdown',
+          source: `https://example.org/sources/${st.tasks.length + 1}`,
+          graph: `https://example.org/sources/${st.tasks.length + 1}`,
+          rendition: `urn:x-sparkles:rendition:${st.tasks.length + 1}`,
+          length: file.size,
+          chunks: 1,
         },
       });
     } else if (lower.includes('big') && fields.confirm !== 'true') {

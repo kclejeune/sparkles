@@ -247,6 +247,8 @@ pub trait ReasoningProvider: Send + Sync {
     /// provider's schema and not the query's data, and stops when `req.stop` fails.
     /// `bound` gives the variables of the query's initial bindings, without their sigil,
     /// with their values, which the planner substitutes into the rewritten query.
+    /// The compatibility result is caller-owned. Use `rewrite_guarded` to
+    /// retain the provider's memory admission while using the rewritten algebra.
     fn rewrite(
         &self,
         query: &spargebra::Query,

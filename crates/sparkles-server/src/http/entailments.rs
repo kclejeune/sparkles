@@ -149,7 +149,7 @@ pub(super) async fn diff(
         request.analysis.cancel = Some(cancel);
         let limit = st.limits.max_result_bytes;
         blocking(move || {
-            let result = dataset.dataset.reasoning().diff(&request)?;
+            let result = dataset.dataset.reasoning().diff_admitted(&request)?;
             let text = match format {
                 1 => result.to_trig()?,
                 2 | 3 => result.to_patch()?,

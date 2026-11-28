@@ -160,9 +160,17 @@ fn facade_reasoning_operations_return_exact_pool_credit_to_zero() {
     assert_eq!(pool.granted(), 0, "why-not explain must return credit");
 
     // 6. Entailment diff, justify, diagnostics
-    let diff = ds.reasoning().diff(&DiffRequest::new("1", "head")).unwrap();
+    let diff = ds
+        .reasoning()
+        .diff_admitted(&DiffRequest::new("1", "head"))
+        .unwrap();
     assert!(diff.added > 0);
-    assert_eq!(pool.granted(), 0, "entailment diff must return credit");
+    assert!(
+        pool.granted() > 0,
+        "the live diff report must keep its credit"
+    );
+    drop(diff);
+    assert_eq!(pool.granted(), 0, "dropping the diff must return credit");
 
     let _just = ds
         .reasoning()
@@ -302,6 +310,131 @@ fn concurrent_query_and_reasoner_overshoot_refused_with_server_memory() {
 }
 
 #[test]
+fn query_reasoning_and_view_share_one_capacity() {
+    use sparkles::incr::views::ViewDef;
+    use sparkles::task::{Control, Progress};
+    use std::time::Duration;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let wait = Duration::from_secs(10);
+    ds.views()
+        .put("types", ViewDef::table("SELECT ?s ?t WHERE { ?s a ?t }"))
+        .unwrap();
+    use sparkles::incr::views::ViewState;
+    assert_eq!(
+        ds.views().wait_built("types", wait).unwrap().state,
+        ViewState::Current
+    );
+    assert!(ds.views().settle_checked(wait));
+    let view_bytes = pool.granted();
+    assert!(view_bytes > 0, "the maintained view must hold credit");
+
+    let grant = Arc::new(pool.empty_grant());
+    let result = ds
+        .query_with(
+            "CONSTRUCT { ?s a ?t } WHERE { ?s a ?t }",
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                max_memory_bytes: Some(32 * MIB),
+                no_cache: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    let query_bytes = grant.granted();
+    assert!(query_bytes > 0);
+    let siblings = view_bytes + query_bytes;
+    assert_eq!(pool.granted(), siblings);
+
+    let mut ctl = Control::none();
+    let cancel = ctl.cancel.clone();
+    let probe_pool = pool.clone();
+    let probe_grant = grant.clone();
+    ctl.progress = Progress::new(move |_, stage| {
+        if stage != "reasoning" || cancel.is_cancelled() {
+            return;
+        }
+        let admitted = probe_pool.granted();
+        assert!(admitted > siblings, "the active reasoner must hold credit");
+        let used = probe_grant.used();
+        let slack = query_bytes - used;
+        let more = probe_pool.capacity() - admitted + slack + 1;
+        let err = probe_grant.charge(more).unwrap_err();
+        assert!(is_server_memory(&err), "query growth error: {err:?}");
+        assert_eq!(probe_grant.used(), used);
+        assert_eq!(probe_pool.granted(), admitted);
+        cancel.cancel();
+    });
+    let err = ds
+        .reasoning()
+        .run_with(
+            &ReasonRequest {
+                profile: Profile::RdfsSimple,
+                max_memory: Some((32 * MIB) as usize),
+                incremental: false,
+                ..Default::default()
+            },
+            &ctl,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err:?}");
+    drop(ctl);
+    assert_eq!(pool.granted(), siblings);
+
+    drop(result);
+    drop(grant);
+    assert_eq!(pool.granted(), view_bytes);
+    assert!(ds.views().delete("types").unwrap());
+    assert!(ds.views().settle_checked(wait));
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn owl_ql_status_uses_the_request_pool_and_releases_its_credit() {
+    use sparkles::reasoning::QuerySetting;
+
+    let (_dir, dataset_pool, ds) = pooled_dataset(16 * MIB);
+    ds.set_query_reasoning(Some(QuerySetting {
+        profile: Some("owl-ql".into()),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let request_pool = QueryPool::new(4 * MIB);
+    let opts = QueryOptions {
+        pool: Some(request_pool.clone()),
+        ..Default::default()
+    };
+    let full = request_pool
+        .work_parent()
+        .reserve(request_pool.capacity())
+        .unwrap();
+    let err = ds.owl_ql_status(&opts).unwrap_err();
+    assert!(is_server_memory(&err), "OWL 2 QL status error: {err:?}");
+    assert_eq!(request_pool.granted(), full.bytes());
+    assert_eq!(dataset_pool.granted(), 0);
+
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..opts.clone()
+    };
+    assert!(matches!(
+        ds.owl_ql_status(&cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(request_pool.granted(), full.bytes());
+    drop(full);
+    assert!(ds.owl_ql_status(&opts).unwrap().is_some());
+    assert!(matches!(
+        ds.owl_ql_status(&cancelled),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(request_pool.granted(), 0);
+    assert_eq!(dataset_pool.granted(), 0);
+}
+
+#[test]
 fn public_rewritten_and_literal_typings_struct_literals_compile_and_work() {
     use sparkles::reasoning::reasoner::diagnostics::LiteralTypings;
     use sparkles::sparql::reasoning::{
@@ -424,4 +557,2334 @@ fn only_unguarded_payloads_implement_clone() {
         (query.payload_is_clone(), typings.payload_is_clone()),
         (true, true)
     );
+}
+
+#[test]
+fn materialization_unwind_joins_writer_monitor_and_refunds_credit() {
+    use sparkles::task::{Control, Progress};
+    struct Interrupted;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let observed = pool.clone();
+    let control = Control {
+        progress: Progress::new(move |_, stage| {
+            if stage == "reasoning" {
+                assert!(observed.granted() > 0);
+                std::panic::panic_any(Interrupted);
+            }
+        }),
+        ..Control::none()
+    };
+    let before = ds.store().head_commit().seq;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ds.reasoning().run_with(
+            &ReasonRequest {
+                profile: Profile::RdfsSimple,
+                yield_to_writers: true,
+                incremental: false,
+                ..Default::default()
+            },
+            &control,
+        )
+    }));
+    assert!(outcome.unwrap_err().is::<Interrupted>());
+    assert_eq!(ds.store().head_commit().seq, before);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn cold_rl_inspector_refuses_a_full_pool_before_materialization() {
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let before = ds.store().head_commit().seq;
+    let error = ds
+        .reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::OwlRl,
+            incremental: false,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(ds.store().head_commit().seq, before);
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn classifier_and_rl_dl_query_respect_pool_without_explicit_grant() {
+    use sparkles::handles::ontology::{
+        OntologyRequest,
+        classify::ClassifyRequest,
+        dl_query::{DlQueryRequest, DlReasoning},
+    };
+    use sparkles::owl::Class;
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    let req = OntologyRequest::default();
+    let classify = ClassifyRequest {
+        assertions: true,
+        ..Default::default()
+    };
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let error = ds
+        .ontology()
+        .classify(&req, &classify, &Default::default())
+        .err()
+        .expect("classification must see the dataset pool");
+    assert!(is_server_memory(&error), "{error:?}");
+
+    let mut dl = DlQueryRequest::new(Class::new("http://ex.org/A").into());
+    dl.reasoning = DlReasoning::Rl;
+    let error = ds
+        .ontology()
+        .dl_query(&req, &dl, &Default::default())
+        .err()
+        .expect("RL private copy must see the dataset pool");
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    assert_eq!(pool.granted(), 0);
+
+    let partial_room = pool.work_parent().reserve(pool.capacity() - 4096).unwrap();
+    let error = ds
+        .ontology()
+        .open(&req, &Default::default())
+        .err()
+        .expect("cold decoding must fail even after graph discovery fits");
+    assert!(is_server_memory(&error), "{error:?}");
+    assert_eq!(pool.granted(), partial_room.bytes());
+    drop(partial_room);
+
+    assert!(
+        !ds.ontology()
+            .open(&req, &Default::default())
+            .unwrap()
+            .cached
+    );
+    assert!(
+        ds.ontology()
+            .open(&req, &Default::default())
+            .unwrap()
+            .cached
+    );
+    let open_credit = pool.granted();
+    assert!(open_credit > 0);
+
+    let grant = Arc::new(pool.empty_grant());
+    grant.charge(128).unwrap();
+    let answer = ds
+        .ontology()
+        .classify(
+            &req,
+            &classify,
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        grant.used() > 128,
+        "the live one-shot classification owns caller credit"
+    );
+    drop(answer);
+    assert_eq!(grant.used(), 128);
+    drop(grant);
+    assert_eq!(pool.granted(), open_credit);
+
+    let kept = ds
+        .ontology()
+        .classify(&req, &Default::default(), &Default::default())
+        .unwrap();
+    assert!(pool.granted() > 0);
+    drop(ds);
+    assert!(
+        pool.granted() > 0,
+        "the published taxonomy outlives its dataset"
+    );
+    drop(kept);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn kept_materialization_owns_its_configured_retained_branch() {
+    use sparkles::store::{Store, StoreOptions};
+
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 4 * MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.update(
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { <urn:A> rdfs:subClassOf <urn:B> . <urn:s> a <urn:A> }",
+    )
+    .unwrap();
+    let report = ds
+        .reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::RdfsSimple,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(report.report.inferred > 0);
+    assert_eq!(pool.granted(), 0);
+    assert!(pool.domain_stats().retained_reserved > 0);
+    drop(ds);
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn cold_rdfs_explanation_respects_the_dataset_pool() {
+    use sparkles::reasoning::rdfs::NewSchema;
+
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    ds.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("default".into()))
+        .unwrap();
+    let mut req = ExplainRequest::new([ex("x"), rdf_type(), ex("C")]);
+    req.source = Some(ExplainSource::RdfsOnRead);
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let err = ds.reasoning().explain(&req).unwrap_err();
+    assert!(is_server_memory(&err), "{err:?}");
+    assert_eq!(pool.granted(), sibling.bytes());
+    drop(sibling);
+    ds.reasoning().explain(&req).unwrap();
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn classification_retention_refusal_leaves_a_request_owned_answer() {
+    use sparkles::handles::ontology::OntologyRequest;
+    use sparkles::store::{Store, StoreOptions};
+
+    let data = "INSERT DATA { <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> }";
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 4 * MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.update(data).unwrap();
+    let request = OntologyRequest::default();
+    let retained = pool.retained_parent().reserve(4 * MIB).unwrap();
+    let answer = ds
+        .ontology()
+        .classify(&request, &Default::default(), &Default::default())
+        .unwrap();
+    assert!(answer.classification.complete);
+    assert!(pool.granted() > 0);
+    drop(answer);
+    assert_eq!(pool.granted(), 0);
+    drop(retained);
+
+    let unpooled = Dataset::memory();
+    unpooled.update(data).unwrap();
+    for use_grant in [true, false] {
+        let grant = Arc::new(pool.empty_grant());
+        let opts = QueryOptions {
+            grant: use_grant.then(|| grant.clone()),
+            pool: (!use_grant).then(|| pool.clone()),
+            ..Default::default()
+        };
+        let answer = unpooled
+            .ontology()
+            .classify(&request, &Default::default(), &opts)
+            .unwrap();
+        assert!(pool.granted() > 0);
+        assert!(!answer.reused);
+        drop(answer);
+        assert_eq!(grant.used(), 0);
+        drop(opts);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+    let grant = Arc::new(pool.empty_grant());
+    let opened = unpooled
+        .ontology()
+        .open(
+            &request,
+            &QueryOptions {
+                grant: Some(grant.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ontology: Arc<sparkles::handles::ontology::SharedOntology> = opened.ontology.clone();
+    let _: &sparkles::owl::read::Ontology = ontology.as_ref().as_ref();
+    drop(opened);
+    assert!(
+        grant.used() > 0,
+        "the shared ontology owns its decoding credit"
+    );
+    drop(ontology);
+    assert_eq!(grant.used(), 0);
+    let error = unpooled
+        .ontology()
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(1),
+                grant: Some(grant),
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("cold opening obeys the request limit");
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+}
+
+#[test]
+fn fetching_resolved_imports_polls_and_admits_discovery_without_load() {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs, fetch_imports};
+    let (_dir, pool, ds) = pooled_dataset(16 * MIB);
+    ds.update(
+        "INSERT DATA { <urn:source> <http://www.w3.org/2002/07/owl#imports> <urn:import> .
+         GRAPH <urn:import> { <urn:a> <urn:p> <urn:b> } }",
+    )
+    .unwrap();
+    let inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    let before = ds.head_commit();
+    let sibling = pool.work_parent().reserve(pool.capacity()).unwrap();
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let error = fetch_imports(ds.store(), &inputs, &[], &opts).unwrap_err();
+    assert!(
+        error.downcast_ref::<Error>().is_some_and(is_server_memory),
+        "{error:#}"
+    );
+    drop(sibling);
+    let late = QueryOptions {
+        deadline: Some(std::time::Instant::now()),
+        ..opts.clone()
+    };
+    let error = fetch_imports(ds.store(), &inputs, &[], &late).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<Error>(),
+        Some(Error::Timeout)
+    ));
+    assert!(
+        fetch_imports(ds.store(), &inputs, &[], &opts)
+            .unwrap()
+            .fetched
+            .is_empty()
+    );
+    assert_eq!(ds.head_commit().seq, before.seq);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn shared_expression_growth_refuses_after_the_cold_ontology_fits() {
+    use sparkles::handles::ontology::OntologyRequest;
+    let ds = Dataset::memory();
+    let mut turtle = String::from(
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         <urn:A> rdfs:subClassOf _:shared . _:shared owl:intersectionOf (",
+    );
+    for i in 0..16 {
+        turtle.push_str(&format!("<urn:{}:{i}> ", "x".repeat(2048)));
+    }
+    turtle.push_str(") .");
+    ds.load_str(&turtle, RdfFormat::Turtle).unwrap();
+    let opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(MIB),
+        ..Default::default()
+    };
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    assert!(!handle.open(&request, &opts).unwrap().ontology.is_empty());
+    let additions = (0..64)
+        .map(|i| format!("<urn:C{i}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _:shared ."))
+        .collect::<String>();
+    // Reload the shared node in a single document so it has the same RDF identity.
+    ds.update("CLEAR DEFAULT").unwrap();
+    ds.load_str(&(turtle + &additions), RdfFormat::Turtle)
+        .unwrap();
+    assert!(
+        matches!(handle.open(&request, &opts), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+    );
+    assert!(
+        handle
+            .open(
+                &request,
+                &QueryOptions {
+                    max_memory_bytes: Some(8 * MIB),
+                    ..opts
+                }
+            )
+            .unwrap()
+            .ontology
+            .len()
+            >= 64
+    );
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn shared_expression_parser_scratch_returns_before_classification_and_cache_admission() {
+    use sparkles::handles::ontology::OntologyRequest;
+
+    let mut ttl = String::from(
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         _:shared owl:intersectionOf (",
+    );
+    for i in 0..8 {
+        ttl.push_str(&format!("<urn:{}:{i}> ", "x".repeat(4096)));
+    }
+    ttl.push_str(") .");
+    for i in 0..12 {
+        ttl.push_str(&format!("<urn:C{i}> rdfs:subClassOf _:shared ."));
+    }
+
+    let pool = QueryPool::with_retained_capacity(128 * MIB, MIB).unwrap();
+    let ds = Dataset::from_store_with(
+        sparkles::store::Store::in_memory(Default::default()),
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            ..Default::default()
+        },
+    );
+    ds.load_str(&ttl, RdfFormat::Turtle).unwrap();
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    let grant = Arc::new(pool.empty_grant());
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let opened = handle.open(&request, &opts).unwrap();
+    let opening_peak = grant.peak();
+    assert!(opening_peak > 2 * grant.used());
+    assert!(grant.used() >= opened.ontology.retained_bytes() as u64);
+    drop(opened);
+    assert_eq!(grant.used(), 0);
+
+    let opened = handle.open(&request, &Default::default()).unwrap();
+    assert!(handle.open(&request, &Default::default()).unwrap().cached);
+    assert!(pool.domain_stats().retained_reserved < opening_peak);
+    drop(opened);
+
+    let probe = Arc::new(pool.empty_grant());
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                grant: Some(probe.clone()),
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+    let cap = opening_peak.max(probe.peak());
+    drop(answer);
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(cap + 8 * 1024),
+                ..opts
+            },
+        )
+        .unwrap();
+    assert!(answer.classification.complete_for_taken);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn terminology_only_coverage_refuses_an_assertion_after_opening_fits() {
+    use sparkles::handles::ontology::OntologyRequest;
+    let ds = Dataset::memory();
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:A> a <http://www.w3.org/2002/07/owl#Class> .
+         <urn:s> <urn:assertion> \"{}\" }}",
+        "a".repeat(64 << 10)
+    ))
+    .unwrap();
+    let request = OntologyRequest::default();
+    let handle = ds.ontology();
+    let opts = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(128 << 10),
+        ..Default::default()
+    };
+    assert_eq!(
+        handle.open(&request, &opts).unwrap().ontology.triples.len(),
+        1
+    );
+    let error = handle
+        .classify(&request, &Default::default(), &opts)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+    let answer = handle
+        .classify(
+            &request,
+            &Default::default(),
+            &QueryOptions {
+                max_memory_bytes: Some(8 * MIB),
+                ..opts
+            },
+        )
+        .unwrap();
+    assert!(!answer.complete());
+    assert!(!answer.excluded.is_empty() || answer.classification.unmapped.count > 0);
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn detached_classification_and_exclusions_keep_their_caller_grant() {
+    use sparkles::handles::ontology::{OntologyRequest, classify::ClassifyRequest};
+    let ds = Dataset::memory();
+    ds.update(
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { <urn:A> rdfs:subClassOf [ owl:unionOf ( <urn:B> <urn:C> ) ] . }",
+    )
+    .unwrap();
+    let pool = QueryPool::new(16 * MIB);
+    let grant = Arc::new(pool.empty_grant());
+    for keep_classification in [true, false] {
+        let answer = ds
+            .ontology()
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest {
+                    el_only: true,
+                    ..Default::default()
+                },
+                &QueryOptions {
+                    grant: Some(grant.clone()),
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let classification: Arc<sparkles::owl::classify::Classification> =
+            answer.classification.clone();
+        let excluded: Arc<sparkles::handles::ontology::classify::ClassifiedExclusions> =
+            answer.excluded.clone();
+        let _: &Vec<sparkles::owl::classify::Excluded> = excluded.as_ref().as_ref();
+        assert!(!excluded.is_empty());
+        drop(answer);
+        assert!(grant.used() > 0);
+        if keep_classification {
+            drop(excluded);
+            assert!(grant.used() > 0);
+            drop(classification);
+        } else {
+            drop(classification);
+            assert!(grant.used() > 0);
+            drop(excluded);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+}
+
+#[test]
+fn invalid_import_warning_text_is_admitted_and_owned_after_fetch() {
+    use sparkles::reasoning::reasoner::inputs::{ImportMode, Inputs, fetch_imports_admitted};
+    let ds = Dataset::memory();
+    let pool = QueryPool::new(16 * MIB);
+    let grant = Arc::new(pool.empty_grant());
+    let refresh: Vec<_> = (0..4).map(|i| format!("urn:import:{i}")).collect();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    for iri in &refresh {
+        inputs
+            .location_mapping
+            .names
+            .insert(iri.clone(), "x".repeat(32 << 10));
+    }
+    let opts = QueryOptions {
+        grant: Some(grant.clone()),
+        max_memory_bytes: Some(160 << 10),
+        ..Default::default()
+    };
+    let error = fetch_imports_admitted(ds.store(), &inputs, &refresh, &opts).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("keeping import warnings"),
+        "{error:#}"
+    );
+    assert_eq!(grant.used(), 0);
+    let (report, credit) = fetch_imports_admitted(
+        ds.store(),
+        &inputs,
+        &refresh,
+        &QueryOptions {
+            max_memory_bytes: Some(MIB),
+            ..opts
+        },
+    )
+    .unwrap();
+    assert_eq!(report.warnings.len(), refresh.len());
+    assert!(grant.used() >= report.warnings.iter().map(|s| s.len() as u64).sum());
+    drop(report);
+    drop(credit);
+    assert_eq!(grant.used(), 0);
+}
+
+fn import_warning_request(ds: &Dataset) -> ReasonRequest {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs};
+    ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    inputs
+        .location_mapping
+        .names
+        .insert("urn:missing".into(), "x".repeat(32 << 10));
+    ReasonRequest {
+        inputs,
+        ..Default::default()
+    }
+}
+
+fn reasoning_record_bytes(ds: &Dataset) -> u64 {
+    let state = ds.state().read_reasoning();
+    let record = state.as_ref().unwrap();
+    [&record.fetched_imports, &record.warnings]
+        .into_iter()
+        .map(|strings| {
+            strings.capacity() * size_of::<String>()
+                + strings.iter().map(String::capacity).sum::<usize>()
+        })
+        .sum::<usize>() as u64
+}
+
+fn memory_with_reasoning_pool(pool: Arc<QueryPool>) -> Dataset {
+    use sparkles::store::{Store, StoreOptions};
+    Dataset::from_store_with(
+        Store::in_memory(StoreOptions::default()),
+        DatasetOptions {
+            pool: Some(pool),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn admitted_fetch_report_outlives_its_request_grant() {
+    use sparkles::reasoning::reasoner::inputs::fetch_imports_admitted;
+    use sparkles::sparql::pool::{GRANULE, INITIAL_GRANT};
+
+    let pool = QueryPool::new(INITIAL_GRANT);
+    let grant = Arc::new(pool.try_grant(INITIAL_GRANT).unwrap());
+    let ds = Dataset::memory();
+    let mut request = import_warning_request(&ds);
+    request.load.grant = Some(grant.clone());
+    let other = grant.memory_parent().reserve(4096).unwrap();
+    let (report, credit) =
+        fetch_imports_admitted(ds.store(), &request.inputs, &[], &request.load).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    drop(request);
+    drop(grant);
+    assert!(pool.domain_stats().work_reserved >= credit.bytes() as u64 + other.bytes());
+    drop(other);
+    assert_eq!(pool.domain_stats().work_reserved, credit.bytes() as u64);
+    assert!(pool.try_grant(GRANULE).is_some());
+    drop(report);
+    drop(credit);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn refused_import_record_can_refresh_the_document_on_retry() {
+    use sparkles::reasoning::reasoner::ImportMode;
+
+    // Refuse the name before LOAD, then allow LOAD and refuse the complete
+    // record (including a long warning) before the inference commit.
+    for (free, committed) in [(100, false), (24 << 10, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+        let options = DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        };
+        let ds = Dataset::open_with(&root, options.clone()).unwrap();
+        let previous = ds.reasoning().run(&ReasonRequest::default()).unwrap();
+        let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+        ds.update(&format!(
+            "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+        let source = dir.path().join("import.ttl");
+        std::fs::write(&source, "<urn:s> <urn:p> <urn:first> .").unwrap();
+        let mut request = ReasonRequest::default();
+        request.inputs.imports = ImportMode::Fetch;
+        ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+            .unwrap();
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert("urn:missing".into(), "x".repeat(32 << 10));
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert(iri.clone(), format!("file://{}", source.display()));
+        let blocker = pool.retained_parent().reserve(MIB - free).unwrap();
+        let error = ds.reasoning().run(&request).unwrap_err();
+        assert!(is_server_memory(&error), "{error}");
+        assert_eq!(
+            ds.reasoning_record().unwrap().commit,
+            previous.record.commit
+        );
+        assert_eq!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+            ))
+            .unwrap()
+            .boolean,
+            committed
+        );
+        drop(ds);
+        drop(blocker);
+        std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+        let ds = Dataset::open_with(&root, options).unwrap();
+        request.refresh_imports = true;
+        let outcome = ds.reasoning().run(&request).unwrap();
+        assert!(!root.join("reasoning-imports.json").exists());
+        assert_eq!(outcome.record.fetched_imports.len(), 1);
+        assert_eq!(outcome.record.fetched_imports[0], iri);
+        assert!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:updated> }} }}"
+            ))
+            .unwrap()
+            .boolean
+        );
+        assert!(
+            !ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+            ))
+            .unwrap()
+            .boolean
+        );
+    }
+}
+
+#[test]
+fn reopen_reconciles_an_interrupted_import_with_the_recovered_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update("INSERT DATA { GRAPH <urn:committed> { <urn:s> <urn:p> <urn:o> } }")
+        .unwrap();
+    drop(ds);
+    let path = dir.path().join("reasoning-imports.json");
+    let mut journal = serde_json::json!({
+        "format": 2,
+        "imports": [],
+        "publishing": ["urn:committed", "urn:aborted"]
+    });
+    std::fs::write(&path, journal.to_string()).unwrap();
+    assert!(Dataset::open(dir.path()).is_err());
+    journal["format"] = 1.into();
+    std::fs::write(&path, journal.to_string()).unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(recovered["imports"], serde_json::json!(["urn:committed"]));
+    assert_eq!(recovered["publishing"], serde_json::json!([]));
+    ds.reasoning().clear().unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn fetch_record_uses_retained_credit_and_releases_the_request_grant() {
+    use sparkles::reasoning::reasoner::fetch_imports;
+    use sparkles::sparql::pool::{GRANULE, INITIAL_GRANT};
+
+    let request_pool = QueryPool::new(INITIAL_GRANT);
+    let grant = Arc::new(request_pool.try_grant(INITIAL_GRANT).unwrap());
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let mut request = import_warning_request(&ds);
+    request.load.grant = Some(grant.clone());
+    let owned = fetch_imports(ds.store(), &request.inputs, &[], &request.load).unwrap();
+    assert_eq!(owned.warnings.len(), 1);
+    assert_eq!(grant.used(), 0);
+
+    let result = ds.reasoning().run(&request).unwrap();
+    assert!(result.record.warnings.contains(&owned.warnings[0]));
+    assert_eq!(grant.used(), 0);
+    drop(result);
+    drop(request);
+    drop(grant);
+    assert_eq!(request_pool.domain_stats().work_reserved, 0);
+    assert!(request_pool.try_grant(GRANULE).is_some());
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+    assert_eq!(
+        pool.domain_stats().retained_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    assert!(pool.domain_stats().retained_reserved > 32 << 10);
+    ds.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn inherited_fetch_record_keeps_credit_until_its_last_branch_clears() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let request = import_warning_request(&ds);
+    let outcome = ds.reasoning().run(&request).unwrap();
+    let warnings = outcome.record.warnings;
+    let retained = reasoning_record_bytes(&ds);
+    assert!(retained > 32 << 10);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+
+    ds.create_branch("one", &Default::default()).unwrap();
+    ds.create_branch("two", &Default::default()).unwrap();
+    let one = ds.branch("one").unwrap();
+    let two = ds.branch("two").unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, retained);
+    ds.reasoning().clear().unwrap();
+    one.reasoning().clear().unwrap();
+
+    assert_eq!(two.reasoning_record().unwrap().warnings, warnings);
+    assert_eq!(pool.domain_stats().retained_reserved, retained);
+    two.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn replaced_fetch_record_keeps_previously_fetched_names_when_warnings_change() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let mut request = import_warning_request(&ds);
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:original> .").unwrap();
+    request
+        .inputs
+        .location_mapping
+        .names
+        .insert(iri.clone(), format!("file://{}", source.display()));
+
+    let first = ds.reasoning().run(&request).unwrap();
+    assert_eq!(first.record.fetched_imports, [iri.as_str()]);
+    assert!(!first.record.warnings.is_empty());
+    let first_retained = pool.domain_stats().retained_reserved;
+    assert_eq!(first_retained, reasoning_record_bytes(&ds));
+    ds.update("INSERT DATA { GRAPH <urn:missing> { <urn:s> <urn:p> <urn:present> } }")
+        .unwrap();
+    let next = ds.reasoning().run(&request).unwrap();
+    assert_eq!(next.record.fetched_imports, first.record.fetched_imports);
+    assert!(
+        next.record.warnings.is_empty(),
+        "{:?}",
+        next.record.warnings
+    );
+    let next_retained = pool.domain_stats().retained_reserved;
+    assert!(next_retained < first_retained);
+    assert_eq!(next_retained, (iri.len() + size_of::<String>()) as u64);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+    ds.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+}
+
+#[test]
+fn persistent_rename_readmits_fetch_record() {
+    use sparkles::catalog::{CatalogOptions, MemoryOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = sparkles::Catalog::open(
+        dir.path(),
+        CatalogOptions {
+            dataset: DatasetOptions {
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+            memory: MemoryOptions {
+                pool_bytes: Some(16 * MIB),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let ds = catalog.create("before", &Default::default()).unwrap();
+    let pool = ds.pool().unwrap().clone();
+    let request = import_warning_request(&ds);
+    let outcome = ds.reasoning().run(&request).unwrap();
+    assert_eq!(
+        pool.domain_stats().work_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    drop(ds);
+
+    let renamed = catalog.rename("before", "after").unwrap();
+    assert_eq!(
+        renamed.reasoning_record().unwrap().warnings,
+        outcome.record.warnings
+    );
+    assert_eq!(
+        pool.domain_stats().work_reserved,
+        reasoning_record_bytes(&renamed)
+    );
+    renamed.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn refusing_replacement_record_credit_preserves_the_previous_materialization() {
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 1024).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let previous = ds.reasoning().run(&ReasonRequest::default()).unwrap();
+    let request = import_warning_request(&ds);
+    let before = ds.store().snapshot().commit;
+    let error = ds.reasoning().run(&request).unwrap_err();
+    assert!(is_server_memory(&error), "{error}");
+    assert_eq!(ds.store().snapshot().commit, before);
+    assert_eq!(
+        ds.reasoning_record().unwrap().commit,
+        previous.record.commit
+    );
+    assert_eq!(
+        pool.domain_stats().retained_reserved,
+        reasoning_record_bytes(&ds)
+    );
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn materialization_refreshes_the_import_named_in_its_record() {
+    use sparkles::reasoning::reasoner::{ImportMode, Inputs};
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:import> }")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:original> .").unwrap();
+    let mut inputs = Inputs {
+        imports: ImportMode::Fetch,
+        ..Default::default()
+    };
+    inputs
+        .location_mapping
+        .names
+        .insert("urn:import".into(), format!("file://{}", source.display()));
+    let mut request = ReasonRequest {
+        inputs,
+        ..Default::default()
+    };
+    let first = ds.reasoning().run(&request).unwrap();
+    assert_eq!(first.record.fetched_imports, ["urn:import"]);
+
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+    request.refresh_imports = true;
+    let next = ds.reasoning().run(&request).unwrap();
+    assert_eq!(next.record.fetched_imports, first.record.fetched_imports);
+    let ask = |object| {
+        ds.query(&format!(
+            "ASK {{ GRAPH <urn:import> {{ <urn:s> <urn:p> <{object}> }} }}"
+        ))
+        .unwrap()
+        .boolean
+    };
+    assert!(ask("urn:updated"));
+    assert!(!ask("urn:original"));
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn public_owl_and_entailment_structs_allow_downstream_literals_and_patterns() {
+    use sparkles::handles::ontology::{
+        OntologyRequest,
+        dl_query::{DlQueryAnswer, DlQueryRequest},
+    };
+    use sparkles::owl::{Class, read::Ontology};
+    use sparkles::reasoning::diff::{DiffState, EntailmentDiff};
+
+    let ontology = Ontology {
+        error_count: 1,
+        ..Ontology::default()
+    };
+    let Ontology {
+        header: _,
+        header_graph: _,
+        other_headers: _,
+        axioms: _,
+        triples: _,
+        graph_of: _,
+        unmapped: _,
+        diagnostics: _,
+        diagnostics_dropped: _,
+        error_count,
+        typing: _,
+        mode: _,
+        terminology_only: _,
+        reification_nodes: _,
+        ontology_nodes: _,
+    } = ontology;
+    assert_eq!(error_count, 1);
+
+    let state = DiffState {
+        selector: "head".into(),
+        commit: 0,
+    };
+    let diff = EntailmentDiff {
+        from: state.clone(),
+        to: state,
+        added: 0,
+        removed: 0,
+        added_triples: Vec::new(),
+        removed_triples: Vec::new(),
+        by_predicate: Default::default(),
+        by_class: Default::default(),
+        new_findings: Vec::new(),
+        findings_complete: true,
+        sample_truncated: false,
+        warnings: Vec::new(),
+    };
+    let EntailmentDiff {
+        from: _,
+        to: _,
+        added,
+        removed,
+        added_triples: _,
+        removed_triples: _,
+        by_predicate: _,
+        by_class: _,
+        new_findings: _,
+        findings_complete: _,
+        sample_truncated: _,
+        warnings: _,
+    } = diff;
+    assert_eq!(added + removed, 0);
+
+    let ds = Dataset::memory();
+    let request = DlQueryRequest::new(Class::thing().into());
+    let answer = ds
+        .ontology()
+        .dl_query(&OntologyRequest::default(), &request, &Default::default())
+        .unwrap();
+    let DlQueryAnswer {
+        opened,
+        expression,
+        reasoning,
+        satisfiable,
+        consistent,
+        equivalents,
+        superclasses,
+        direct_superclasses,
+        subclasses,
+        direct_subclasses,
+        instances,
+        incremental,
+        elapsed,
+    } = answer;
+    let reconstructed = DlQueryAnswer {
+        opened,
+        expression,
+        reasoning,
+        satisfiable,
+        consistent,
+        equivalents,
+        superclasses,
+        direct_superclasses,
+        subclasses,
+        direct_subclasses,
+        instances,
+        incremental,
+        elapsed,
+    };
+    assert_eq!(reconstructed.expression, request.expression);
+}
+
+fn mapped_import(ds: &Dataset, source: &std::path::Path, iri: &str) -> ReasonRequest {
+    use sparkles::reasoning::reasoner::ImportMode;
+    ds.update(&format!(
+        "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+    ))
+    .unwrap();
+    std::fs::write(source, "<urn:s> <urn:p> <urn:first> .").unwrap();
+    let mut request = ReasonRequest::default();
+    request.inputs.imports = ImportMode::Fetch;
+    request
+        .inputs
+        .location_mapping
+        .names
+        .insert(iri.into(), format!("file://{}", source.display()));
+    request
+}
+
+fn assert_refreshed(ds: &Dataset, mut request: ReasonRequest, source: &std::path::Path, iri: &str) {
+    std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+    request.refresh_imports = true;
+    ds.reasoning().run(&request).unwrap();
+    for (object, expected) in [("first", false), ("updated", true)] {
+        assert_eq!(
+            ds.query(&format!(
+                "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+            ))
+            .unwrap()
+            .boolean,
+            expected,
+            "{object}"
+        );
+    }
+}
+
+#[test]
+fn intervening_run_preserves_pending_import_across_reopen() {
+    use sparkles::reasoning::reasoner::ImportMode;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let options = DatasetOptions {
+        pool: Some(pool.clone()),
+        closure_cache_triples: 0,
+        ..Default::default()
+    };
+    let ds = Dataset::open_with(&root, options.clone()).unwrap();
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+    assert!(
+        ds.query("ASK { GRAPH <urn:import> { <urn:s> <urn:p> <urn:first> } }")
+            .unwrap()
+            .boolean
+    );
+    drop(blocker);
+    let mut other = ReasonRequest::default();
+    other.inputs.imports = ImportMode::None;
+    ds.reasoning().run(&other).unwrap();
+    drop(ds);
+    let ds = Dataset::open_with(&root, options).unwrap();
+    assert_refreshed(&ds, request, &source, "urn:import");
+}
+
+#[test]
+fn fixed_retained_cap_admits_pending_import_into_record() {
+    for reopen_pending in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let source = dir.path().join("import.ttl");
+        let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+        let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+        let options = DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        };
+        let ds = Dataset::open_with(&root, options.clone()).unwrap();
+        let req = mapped_import(&ds, &source, &iri);
+        let ds = if reopen_pending {
+            let mut refused = import_warning_request(&ds);
+            refused
+                .inputs
+                .location_mapping
+                .names
+                .extend(req.inputs.location_mapping.names.clone());
+            assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+            assert!(
+                ds.query(&format!(
+                    "ASK {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+                ))
+                .unwrap()
+                .boolean
+            );
+            drop(ds);
+            let ds = Dataset::open_with(&root, options).unwrap();
+            ds.update(
+                "DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }",
+            )
+            .unwrap();
+            ds
+        } else {
+            ds
+        };
+        if reopen_pending {
+            let before = pool.domain_stats().retained_reserved;
+            let tmp = root.join("reasoning.tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            assert!(matches!(
+                ds.reasoning().run(&req),
+                Err(sparkles::Error::Io(_))
+            ));
+            assert!(root.join("reasoning-imports.json").exists());
+            assert_eq!(pool.domain_stats().work_reserved, 0);
+            assert_eq!(pool.domain_stats().retained_reserved, before);
+            std::fs::remove_dir(tmp).unwrap();
+        }
+        let record = ds.reasoning().run(&req).unwrap().record;
+        assert_eq!(record.fetched_imports, [iri]);
+        assert_eq!(
+            pool.domain_stats().retained_reserved,
+            reasoning_record_bytes(&ds) + size_of::<sparkles_budget::MemoryLease>() as u64
+        );
+        assert_eq!(pool.domain_stats().work_reserved, 0);
+        assert!(!root.join("reasoning-imports.json").exists());
+        drop(ds);
+        assert_eq!(pool.domain_stats().retained_reserved, 0);
+    }
+}
+
+#[cfg(feature = "backup")]
+fn backup_racing_import(memory: bool) {
+    use sparkles::backup::{CreateOptions, OpenEnv, RepoConfig, RestoreOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let options = DatasetOptions {
+        pool: Some(pool.clone()),
+        closure_cache_triples: 0,
+        ..Default::default()
+    };
+    let ds = if memory {
+        memory_with_reasoning_pool(pool.clone())
+    } else {
+        Dataset::open_with(&root, options).unwrap()
+    };
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    let point = if memory {
+        "reasoning-before-memory-capture"
+    } else {
+        "backup-capture-unlocked"
+    };
+    if !memory {
+        assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+        drop(blocker);
+    }
+    let racing = ds.clone();
+    let run = request.clone();
+    ds.store().set_failpoint(
+        point,
+        Some(Arc::new(move |_| {
+            if memory {
+                assert!(is_server_memory(&racing.reasoning().run(&run).unwrap_err()));
+            } else {
+                racing
+                    .update("INSERT DATA { <urn:later> <urn:p> <urn:o> }")
+                    .unwrap();
+                racing.reasoning().run(&run).unwrap();
+            }
+        })),
+    );
+    let config = RepoConfig::from_url(
+        "local",
+        &format!("file://{}", dir.path().join("repo").display()),
+    )
+    .unwrap();
+    let repo = sparkles::backup::open(&config, &OpenEnv::default()).unwrap();
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "captured".into(),
+                dataset_name: "test".into(),
+                ..Default::default()
+            },
+            &sparkles::task::Control::none(),
+        )
+        .unwrap();
+    ds.store().set_failpoint(point, None);
+    let restored = dir.path().join("restored");
+    sparkles::backup::blocking(&repo)
+        .restore_to_dir("captured", &restored, &RestoreOptions::default())
+        .unwrap();
+    let copy = Dataset::open(&restored).unwrap();
+    assert!(
+        copy.query("ASK { GRAPH <urn:import> { <urn:s> <urn:p> <urn:first> } }")
+            .unwrap()
+            .boolean
+    );
+    assert_refreshed(&copy, request, &source, "urn:import");
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn persistent_backup_keeps_import_history_at_wal_cut() {
+    backup_racing_import(false);
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn memory_backup_keeps_import_history_at_snapshot() {
+    backup_racing_import(true);
+}
+
+#[test]
+fn concurrent_materialization_preserves_pending_history_after_reopen() {
+    use sparkles::task::{Control, Progress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut request = import_warning_request(&ds);
+    request.inputs.location_mapping.names.extend(
+        mapped_import(&ds, &source, "urn:import")
+            .inputs
+            .location_mapping
+            .names,
+    );
+    let blocker = pool.retained_parent().reserve(MIB - 1024).unwrap();
+    assert!(is_server_memory(&ds.reasoning().run(&request).unwrap_err()));
+    drop(blocker);
+    let other = ds.clone();
+    let concurrent = request.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "loading triples" {
+                assert_eq!(
+                    other
+                        .reasoning()
+                        .run(&concurrent)
+                        .unwrap()
+                        .record
+                        .fetched_imports,
+                    ["urn:import"]
+                );
+            }
+        }),
+        ..Control::none()
+    };
+    let result = ds.reasoning().run_with(&request, &ctl).unwrap();
+    assert_eq!(result.record.fetched_imports, ["urn:import"]);
+    drop(ctl);
+    drop(ds);
+    assert_refreshed(
+        &Dataset::open(&root).unwrap(),
+        request,
+        &source,
+        "urn:import",
+    );
+}
+
+#[test]
+fn partial_journal_retirement_fits_the_live_retained_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let covered = format!("urn:import:{}", "x".repeat(16 << 10));
+    let ds = Dataset::open(&root).unwrap();
+    let names = ["urn:left", &covered, "urn:right"];
+    let mut requests = Vec::new();
+    for iri in names {
+        requests.push(mapped_import(&ds, &source, iri));
+        ds.update(&format!(
+            "INSERT DATA {{ GRAPH <{iri}> {{ <urn:s> <urn:p> <urn:first> }} }}"
+        ))
+        .unwrap();
+    }
+    for iri in ["urn:left", "urn:right"] {
+        ds.update(&format!(
+            "DELETE DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+    }
+    drop(ds);
+    std::fs::write(
+        root.join("reasoning-imports.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": 1, "imports": names, "publishing": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let pool = QueryPool::with_retained_capacity(16 * MIB, MIB).unwrap();
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(pool.clone()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let slots = size_of::<String>() + size_of::<sparkles_budget::MemoryLease>();
+    let blocker = pool
+        .retained_parent()
+        .reserve(MIB - pool.domain_stats().retained_reserved - slots as u64)
+        .unwrap();
+    assert_eq!(
+        ds.reasoning()
+            .run(&requests[1])
+            .unwrap()
+            .record
+            .fetched_imports,
+        [covered.as_str()]
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("reasoning-imports.json")).unwrap())
+            .unwrap();
+    let mut remaining = journal["imports"].as_array().unwrap().clone();
+    remaining.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(remaining, ["urn:left", "urn:right"]);
+    drop(blocker);
+    drop(ds);
+    let ds = Dataset::open(&root).unwrap();
+    for index in [0, 2] {
+        let iri = names[index];
+        ds.update(&format!(
+            "INSERT DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+        ))
+        .unwrap();
+        assert_refreshed(&ds, requests[index].clone(), &source, iri);
+    }
+}
+
+#[test]
+fn inherited_pending_name_can_publish_after_source_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &source, &iri);
+    let mut refused = import_warning_request(&ds);
+    refused
+        .inputs
+        .location_mapping
+        .names
+        .extend(req.inputs.location_mapping.names.clone());
+    assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+    ds.update("DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+    ds.create_branch("copy", &Default::default()).unwrap();
+    let branch = ds.branch("copy").unwrap();
+    let mut source_request = import_warning_request(&ds);
+    source_request
+        .inputs
+        .location_mapping
+        .names
+        .insert("urn:missing".into(), "x".repeat(1024));
+    source_request
+        .inputs
+        .location_mapping
+        .names
+        .extend(req.inputs.location_mapping.names.clone());
+    let record = ds.reasoning().run(&source_request).unwrap().record;
+    assert_eq!(record.fetched_imports, [iri.as_str()]);
+    let warning_bytes: usize = record.warnings.iter().map(String::len).sum();
+    assert!(warning_bytes >= 1024);
+    let before = pool.domain_stats().retained_reserved;
+    ds.reasoning().clear().unwrap();
+    assert!(
+        pool.domain_stats().retained_reserved + warning_bytes as u64 <= before,
+        "source record credit stayed pinned"
+    );
+    assert_refreshed(&branch, req, &source, &iri);
+    assert_eq!(branch.reasoning().record().unwrap().fetched_imports, [iri]);
+    branch.reasoning().clear().unwrap();
+    assert_eq!(pool.domain_stats().retained_reserved, 0);
+    assert_eq!(pool.domain_stats().work_reserved, 0);
+}
+
+#[test]
+fn delayed_materialization_cannot_replace_a_later_record_at_the_same_commit() {
+    use sparkles::reasoning::reasoner::ImportMode;
+    use sparkles::task::{Control, Progress};
+
+    let ds = Dataset::memory();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("import.ttl");
+    let req = mapped_import(&ds, &source, "urn:import");
+    ds.reasoning().run(&req).unwrap();
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, stage| {
+            if stage == "done" {
+                assert_eq!(
+                    racing.reasoning().run(&req).unwrap().record.fetched_imports,
+                    ["urn:import"]
+                );
+            }
+        }),
+        ..Control::none()
+    };
+    let mut older = ReasonRequest::default();
+    older.inputs.imports = ImportMode::None;
+    let err = ds.reasoning().run_with(&older, &ctl).unwrap_err();
+    assert!(
+        matches!(err, Error::Component(ref error) if error.code == sparkles::reasoning::run::SUPERSEDED),
+        "{err:?}"
+    );
+    assert_eq!(
+        ds.reasoning().record().unwrap().fetched_imports,
+        ["urn:import"]
+    );
+}
+
+fn without_imports() -> ReasonRequest {
+    let mut request = ReasonRequest::default();
+    request.inputs.imports = sparkles::reasoning::reasoner::ImportMode::None;
+    request
+}
+
+fn leave_import_pending(ds: &Dataset, request: &ReasonRequest) {
+    let mut refused = import_warning_request(ds);
+    refused
+        .inputs
+        .location_mapping
+        .names
+        .extend(request.inputs.location_mapping.names.clone());
+    assert!(is_server_memory(&ds.reasoning().run(&refused).unwrap_err()));
+    ds.update("DELETE DATA { <urn:o> <http://www.w3.org/2002/07/owl#imports> <urn:missing> }")
+        .unwrap();
+}
+
+#[test]
+fn overlapping_publications_keep_pending_imports_for_refresh() {
+    use sparkles::task::{Control, Progress};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let req = mapped_import(&ds, &source, "urn:import");
+    leave_import_pending(&ds, &req);
+    std::thread::scope(|threads| {
+        // A and B commit in order, then A and B publish in the same order.
+        let timeout = Duration::from_secs(10);
+        let pause = || {
+            let (ready, committed) = mpsc::channel();
+            let (resume, release) = mpsc::channel();
+            let release = Mutex::new(release);
+            let ctl = Control {
+                progress: Progress::new(move |_, phase| {
+                    if phase == "done" {
+                        ready.send(()).unwrap();
+                        release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(timeout)
+                            .expect("publication was not released");
+                    }
+                }),
+                ..Control::none()
+            };
+            (committed, resume, ctl)
+        };
+        let (a_committed, publish_a, first) = pause();
+        let (b_committed, publish_b, second) = pause();
+        let ds = &ds;
+        let req = &req;
+        let first = threads.spawn(move || ds.reasoning().run_with(req, &first));
+        a_committed
+            .recv_timeout(timeout)
+            .expect("first run did not commit");
+        let second = threads.spawn(move || ds.reasoning().run_with(&without_imports(), &second));
+        b_committed
+            .recv_timeout(timeout)
+            .expect("second run did not commit");
+        publish_a.send(()).unwrap();
+        let first = first.join().unwrap();
+        publish_b.send(()).unwrap();
+        assert_eq!(first.unwrap().record.fetched_imports, ["urn:import"]);
+        assert!(
+            second
+                .join()
+                .unwrap()
+                .unwrap()
+                .record
+                .fetched_imports
+                .is_empty()
+        );
+    });
+    drop(ds);
+    assert_refreshed(&Dataset::open(&root).unwrap(), req, &source, "urn:import");
+}
+
+#[test]
+fn materialization_keeps_the_import_record_it_observed_before_loading() {
+    use sparkles::task::{Control, Progress};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open(&root).unwrap();
+    let req = mapped_import(&ds, &source, "urn:import");
+    assert_eq!(
+        ds.reasoning().run(&req).unwrap().record.fetched_imports,
+        ["urn:import"]
+    );
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "loading triples" {
+                racing.reasoning().run(&without_imports()).unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    ds.reasoning().run_with(&req, &ctl).unwrap();
+    drop(ctl);
+    drop(ds);
+    assert_refreshed(&Dataset::open(&root).unwrap(), req, &source, "urn:import");
+}
+
+#[test]
+fn inherited_import_fits_with_both_records_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    for publish_source_first in [true, false] {
+        for clear_source_first in [true, false] {
+            let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+            let ds = memory_with_reasoning_pool(pool.clone());
+            let source = dir.path().join("import.ttl");
+            let req = mapped_import(&ds, &source, &iri);
+            leave_import_pending(&ds, &req);
+            ds.create_branch("copy", &Default::default()).unwrap();
+            let branch = ds.branch("copy").unwrap();
+            let ordered = |source_first| {
+                if source_first {
+                    [&ds, &branch]
+                } else {
+                    [&branch, &ds]
+                }
+            };
+            let [first, second] = ordered(publish_source_first);
+            assert_eq!(
+                first.reasoning().run(&req).unwrap().record.fetched_imports,
+                [iri.as_str()]
+            );
+            assert_eq!(pool.domain_stats().work_reserved, iri.len() as u64);
+            assert_refreshed(second, req, &source, &iri);
+            assert_eq!(
+                second.reasoning().record().unwrap().fetched_imports,
+                [iri.as_str()]
+            );
+            assert_eq!(pool.domain_stats().work_reserved, iri.len() as u64);
+            let [first, last] = ordered(clear_source_first);
+            first.reasoning().clear().unwrap();
+            assert_eq!(pool.domain_stats().work_reserved, 0);
+            assert_eq!(
+                last.reasoning().record().unwrap().fetched_imports,
+                [iri.as_str()]
+            );
+            last.reasoning().clear().unwrap();
+            assert_eq!(pool.domain_stats().retained_reserved, 0);
+        }
+    }
+}
+
+#[test]
+fn refused_journal_inheritance_leaves_the_branch_name_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &dir.path().join("import.ttl"), "urn:import");
+    leave_import_pending(&ds, &req);
+    let blocker = pool
+        .retained_parent()
+        .reserve((24 << 10) - pool.domain_stats().retained_reserved)
+        .unwrap();
+    assert!(is_server_memory(
+        &ds.create_branch("copy", &Default::default()).unwrap_err()
+    ));
+    assert!(
+        ds.branches()
+            .unwrap()
+            .iter()
+            .all(|branch| branch.name != "copy")
+    );
+    drop(blocker);
+    ds.create_branch("copy", &Default::default()).unwrap();
+    assert_eq!(
+        ds.branch("copy")
+            .unwrap()
+            .reasoning()
+            .run(&req)
+            .unwrap()
+            .record
+            .fetched_imports,
+        ["urn:import"]
+    );
+}
+
+#[test]
+fn clearing_reasoning_supersedes_a_committed_unpublished_run() {
+    use sparkles::task::{Control, Progress};
+    let ds = inference_fixture();
+    let racing = ds.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "done" {
+                racing.reasoning().clear().unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    let err = ds
+        .reasoning()
+        .run_with(&ReasonRequest::default(), &ctl)
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Component(ref e) if e.code == sparkles::reasoning::run::SUPERSEDED),
+        "{err:?}"
+    );
+    assert_inference_visible(&ds, false);
+}
+
+#[test]
+fn refused_import_copy_wakes_after_rollback() {
+    use sparkles::sparql::pool::GRANULE;
+    use std::sync::{Mutex, mpsc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let iri = format!("urn:import:{}", "x".repeat(16 << 10));
+    let pool = QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap();
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let req = mapped_import(&ds, &dir.path().join("import.ttl"), &iri);
+    leave_import_pending(&ds, &req);
+    ds.create_branch("copy", &Default::default()).unwrap();
+    let branch = ds.branch("copy").unwrap();
+    ds.reasoning().run(&req).unwrap();
+    let before = pool.domain_stats();
+    let head = branch.store().head_commit().seq;
+    let retained = pool
+        .retained_parent()
+        .reserve(before.retained_capacity - before.retained_reserved)
+        .unwrap();
+
+    let waiting = Arc::new(Mutex::new(None));
+    let (observed, wakes) = mpsc::channel();
+    branch.store().set_failpoint(
+        "reasoning-import-copies-claimed",
+        Some(Arc::new({
+            let pool = pool.clone();
+            let waiting = waiting.clone();
+            let branch = branch.clone();
+            move |_| {
+                // The second copy is live. Leave the waiter one byte short until
+                // rollback drops that copy's work lease.
+                let blocker = pool
+                    .work_parent()
+                    .reserve(pool.capacity() - GRANULE - pool.granted() + 1)
+                    .unwrap();
+                let branch = branch.clone();
+                let observed = observed.clone();
+                let ticket = pool.enter(
+                    GRANULE,
+                    Some(Arc::new(move || {
+                        let writable = branch
+                            .store()
+                            .try_write_with(
+                                sparkles::commit::CommitKind::Update,
+                                sparkles::guard::WriteOptions {
+                                    no_wait: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .is_ok();
+                        let _ = observed.send(writable);
+                    })),
+                );
+                *waiting.lock().unwrap() = Some((ticket, blocker));
+            }
+        })),
+    );
+    // A Rayon caller prepares on a different thread. Wake deferral must follow the writer.
+    let error = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| branch.reasoning().run(&req))
+        .unwrap_err();
+    branch
+        .store()
+        .set_failpoint("reasoning-import-copies-claimed", None);
+    assert!(is_server_memory(&error), "{error:?}");
+    assert!(
+        wakes.try_recv().expect("rollback did not wake the waiter"),
+        "rollback woke the waiter under the RDF writer"
+    );
+    drop(waiting.lock().unwrap().take());
+    drop(retained);
+    assert_eq!(branch.store().head_commit().seq, head);
+    assert!(branch.reasoning().record().is_none());
+    assert_eq!(pool.domain_stats(), before);
+    assert_eq!(ds.reasoning().record().unwrap().fetched_imports, [iri]);
+}
+
+#[test]
+fn historical_fork_inherits_from_the_listed_ancestor() {
+    use sparkles::branch::{BranchOptions, DeleteOptions};
+    use sparkles::history::At;
+    use sparkles::reasoning::rdfs::NewSchema;
+
+    let ds = Dataset::memory();
+    let from = |name: &str| BranchOptions {
+        from: name.into(),
+        ..Default::default()
+    };
+    ds.create_branch("base", &Default::default()).unwrap();
+    let base = ds.branch("base").unwrap();
+    base.update("INSERT DATA { GRAPH <urn:schema> { <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> } }").unwrap();
+    ds.create_branch("dev", &from("base")).unwrap();
+    let dev = ds.branch("dev").unwrap();
+    dev.store()
+        .set_retention(sparkles::history::Retention {
+            keep_commits: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    dev.update("INSERT DATA { <urn:first> a <urn:A> }").unwrap();
+    let first = dev.store().head_commit().seq;
+    dev.update("INSERT DATA { <urn:second> a <urn:A> }")
+        .unwrap();
+    ds.create_branch("feat", &from("dev")).unwrap();
+    ds.delete_branch_with(
+        "dev",
+        &DeleteOptions {
+            force: true,
+            reparent: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    base.reasoning()
+        .rdfs()
+        .set(NewSchema::Graph("urn:schema".into()))
+        .unwrap();
+
+    for name in ["copy", "after-reuse"] {
+        let info = ds
+            .create_branch(
+                name,
+                &BranchOptions {
+                    at: At::Commit(first),
+                    ..from("feat")
+                },
+            )
+            .unwrap();
+        assert_eq!(info.upstream.as_deref(), Some("base"));
+        let copy = ds.branch(name).unwrap();
+        assert!(copy.ask("ASK { <urn:first> a <urn:A> }").unwrap());
+        assert!(!copy.ask("ASK { <urn:second> a <urn:A> }").unwrap());
+        assert!(copy.ask("ASK { <urn:first> a <urn:B> }").unwrap());
+        if name == "copy" {
+            ds.create_branch("dev", &Default::default()).unwrap();
+        }
+    }
+}
+
+fn inference_fixture() -> Dataset {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:a> a <urn:A> . <urn:A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:B> }").unwrap();
+    ds
+}
+
+fn assert_inference_visible(ds: &Dataset, expected: bool) {
+    assert_eq!(
+        ds.ask(&format!(
+            "ASK {{ GRAPH <{}> {{ <urn:a> a <urn:B> }} }}",
+            sparkles::reasoning::INFERRED_GRAPH
+        ))
+        .unwrap(),
+        expected
+    );
+    assert_eq!(ds.ask("ASK { <urn:a> a <urn:B> }").unwrap(), expected);
+    assert_eq!(ds.reasoning().record().is_some(), expected);
+}
+
+fn run_during_clear(
+    ds: &Dataset,
+    request: &ReasonRequest,
+    clear_publishes_first: bool,
+    after_clear_commit: impl FnOnce(),
+) -> u64 {
+    use sparkles::task::{Control, Progress};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let timeout = Duration::from_secs(10);
+    let (ready, committed) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let wait = Mutex::new(wait);
+    ds.store().set_failpoint(
+        "reasoning-clear-committed",
+        Some(Arc::new(move |_| {
+            ready.send(()).unwrap();
+            wait.lock().unwrap().recv_timeout(timeout).unwrap();
+        })),
+    );
+    let removed = std::thread::scope(|threads| {
+        let (finished, cleared) = mpsc::channel();
+        let clear = threads.spawn(move || {
+            let result = ds.reasoning().clear();
+            finished.send(()).unwrap();
+            result
+        });
+        committed.recv_timeout(timeout).unwrap();
+        after_clear_commit();
+        let ctl = if clear_publishes_first {
+            let release = release.clone();
+            let cleared = Mutex::new(cleared);
+            Control {
+                progress: Progress::new(move |_, phase| {
+                    if phase == "done" {
+                        release.send(()).unwrap();
+                        cleared.lock().unwrap().recv_timeout(timeout).unwrap();
+                    }
+                }),
+                ..Control::none()
+            }
+        } else {
+            Control::none()
+        };
+        let result = ds.reasoning().run_with(request, &ctl);
+        if !clear_publishes_first {
+            release.send(()).unwrap();
+        }
+        let removed = clear.join().unwrap().unwrap();
+        result.unwrap();
+        removed
+    });
+    ds.store().set_failpoint("reasoning-clear-committed", None);
+    removed
+}
+
+#[test]
+fn delayed_clear_preserves_a_newer_materialization() {
+    for had_inferences in [false, true] {
+        for clear_before_publication in [true, false] {
+            let ds = inference_fixture();
+            if had_inferences {
+                ds.reasoning().run(&ReasonRequest::default()).unwrap();
+            }
+            let removed = run_during_clear(
+                &ds,
+                &ReasonRequest::default(),
+                clear_before_publication,
+                || {},
+            );
+            assert_eq!(removed > 0, had_inferences);
+            assert_inference_visible(&ds, true);
+            assert_eq!(
+                ds.state().closure.kept().unwrap().1,
+                ds.store().head_commit().seq
+            );
+        }
+    }
+}
+
+#[test]
+fn refused_clear_preserves_the_materialized_closure() {
+    let ds = inference_fixture();
+    ds.reasoning().run(&ReasonRequest::default()).unwrap();
+    let kept = ds.state().closure.kept().unwrap();
+    ds.set_branch_protected("main", true).unwrap();
+    assert!(ds.reasoning().clear().is_err());
+    assert_inference_visible(&ds, true);
+    assert_eq!(ds.state().closure.kept(), Some(kept));
+}
+
+#[test]
+fn delayed_clear_retires_pre_clear_imports_after_reopen() {
+    for clear_publishes_first in [true, false] {
+        for retire_head in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let source = dir.path().join("import.ttl");
+            let ds = Dataset::open_with(
+                &root,
+                DatasetOptions {
+                    pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                    closure_cache_triples: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let leave_unreferenced = |iri: &str| {
+                let request = mapped_import(&ds, &source, iri);
+                leave_import_pending(&ds, &request);
+                ds.update(&format!(
+                    "DELETE DATA {{ <urn:o> <http://www.w3.org/2002/07/owl#imports> <{iri}> }}"
+                ))
+                .unwrap();
+            };
+            leave_unreferenced("urn:old");
+            let head = mapped_import(&ds, &source, "urn:head");
+            leave_import_pending(&ds, &head);
+            let request = if retire_head { head } else { without_imports() };
+            let expected = if retire_head {
+                vec!["urn:head"]
+            } else {
+                vec![]
+            };
+            run_during_clear(&ds, &request, clear_publishes_first, || {
+                leave_unreferenced("urn:post");
+            });
+            assert_eq!(ds.reasoning().record().unwrap().fetched_imports, expected);
+            drop(ds);
+
+            let reopened = Dataset::open(&root).unwrap();
+            assert_eq!(
+                reopened.reasoning().record().unwrap().fetched_imports,
+                expected
+            );
+            let journal: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("reasoning-imports.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                journal["imports"],
+                serde_json::json!(["urn:post"]),
+                "clear first {clear_publishes_first}, retire head {retire_head}"
+            );
+            assert_eq!(journal["publishing"], serde_json::json!([]));
+            let post = mapped_import(&reopened, &source, "urn:post");
+            assert_refreshed(&reopened, post, &source, "urn:post");
+        }
+    }
+}
+
+#[test]
+fn post_commit_progress_can_wait_for_a_query_wake() {
+    use sparkles::sparql::pool::GRANULE;
+    use sparkles::task::{Control, Progress};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let pool = QueryPool::new(16 * MIB);
+    let ds = memory_with_reasoning_pool(pool.clone());
+    let (done, observed) = mpsc::channel();
+    let ctl = Control {
+        progress: Progress::new(move |_, phase| {
+            if phase == "done" {
+                let blocker = pool
+                    .work_parent()
+                    .reserve(pool.capacity() - pool.granted() - GRANULE + 1)
+                    .unwrap();
+                let (wake, signal) = mpsc::channel();
+                let mut ticket = pool.enter(
+                    GRANULE,
+                    Some(Arc::new(move || {
+                        let _ = wake.send(());
+                    })),
+                );
+                assert!(ticket.poll().is_none());
+                drop(blocker);
+                let woke = signal.recv_timeout(Duration::from_secs(2)).is_ok();
+                done.send(woke && ticket.poll().is_some()).unwrap();
+            }
+        }),
+        ..Control::none()
+    };
+    ds.reasoning().run_with(&without_imports(), &ctl).unwrap();
+    assert!(
+        observed.try_recv().expect("missing done callback"),
+        "done deferred the query wake"
+    );
+}
+
+#[test]
+fn a_refusal_during_the_intent_sync_retires_the_replacement() {
+    use sparkles::task::Control;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let source = dir.path().join("import.ttl");
+    let ds = Dataset::open_with(
+        &root,
+        DatasetOptions {
+            pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+            closure_cache_triples: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut request = mapped_import(&ds, &source, "urn:reload");
+    leave_import_pending(&ds, &request);
+    std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+    let ask = |ds: &Dataset, object| {
+        ds.ask(&format!(
+            "ASK {{ GRAPH <urn:reload> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+        ))
+        .unwrap()
+    };
+
+    // The cancellation arrives while the intent is being synced, after the write's
+    // last check of its controls before the hook. The core store tests cover the
+    // same refusal on the bulk and in-memory paths.
+    let ctl = Control::none();
+    let cancel = ctl.cancel.clone();
+    let persisted = Arc::new(AtomicUsize::new(0));
+    let seen = persisted.clone();
+    ds.store().set_failpoint(
+        "commit-intent-persisted",
+        Some(Arc::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            cancel.cancel();
+        })),
+    );
+    request.refresh_imports = true;
+    ds.reasoning().run_with(&request, &ctl).unwrap_err();
+    ds.store().set_failpoint("commit-intent-persisted", None);
+    assert_eq!(persisted.load(Ordering::SeqCst), 1);
+    assert!(ask(&ds, "first"));
+    assert!(!ask(&ds, "replacement"));
+    let journal = std::fs::read_to_string(root.join("reasoning-imports.json")).unwrap();
+    assert!(!journal.contains("\"commit\""), "{journal}");
+
+    // The writer takes the retired sequence for an unrelated commit.
+    let head = ds.store().snapshot().commit;
+    ds.update("INSERT DATA { <urn:after> <urn:p> <urn:o> }")
+        .unwrap();
+    assert_eq!(ds.store().snapshot().commit, head + 1);
+    drop(ds);
+
+    let ds = Dataset::open(&root).unwrap();
+    assert!(ask(&ds, "first"));
+    assert!(!ask(&ds, "replacement"));
+    request.refresh_imports = false;
+    assert_refreshed(&ds, request, &source, "urn:reload");
+}
+
+#[test]
+fn delayed_clear_orders_replacement_loads_of_a_pending_import() {
+    use sparkles::task::{Control, Progress};
+
+    for refuse_load in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let source = dir.path().join("import.ttl");
+        let ds = Dataset::open_with(
+            &root,
+            DatasetOptions {
+                pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let request = mapped_import(&ds, &source, "urn:reload");
+        leave_import_pending(&ds, &request);
+        let head = mapped_import(&ds, &source, "urn:head");
+        leave_import_pending(&ds, &head);
+
+        run_during_clear(&ds, &without_imports(), false, || {
+            std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+            let mut reload = request.clone();
+            reload.refresh_imports = true;
+            let mut ctl = Control::none();
+            let cancel = ctl.cancel.clone();
+            if refuse_load {
+                reload.load.write.before_publish =
+                    Some(sparkles::guard::PublishHook::new(move || {
+                        cancel.cancel();
+                        Ok(())
+                    }));
+            } else {
+                ctl.progress = Progress::new(move |_, phase| {
+                    if phase == "loading triples" {
+                        cancel.cancel();
+                    }
+                });
+            }
+            ds.reasoning().run_with(&reload, &ctl).unwrap_err();
+            assert!(ctl.cancel.is_cancelled());
+            assert_eq!(
+                ds.query("ASK { GRAPH <urn:reload> { <urn:s> <urn:p> <urn:replacement> } }")
+                    .unwrap()
+                    .boolean,
+                !refuse_load
+            );
+        });
+        drop(ds);
+        let ds = Dataset::open(&root).unwrap();
+        assert!(ds.reasoning().record().unwrap().fetched_imports.is_empty());
+        if refuse_load {
+            assert!(!root.join("reasoning-imports.json").exists());
+        } else {
+            assert_refreshed(&ds, request, &source, "urn:reload");
+            assert!(
+                !ds.query("ASK { GRAPH <urn:reload> { <urn:s> <urn:p> <urn:replacement> } }")
+                    .unwrap()
+                    .boolean
+            );
+            assert!(!root.join("reasoning-imports.json").exists());
+        }
+    }
+}
+
+#[test]
+fn interrupted_replacement_load_recovers_only_committed_provenance() {
+    use std::process::Command;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    const CHILD: &str = "SPARKLES_REPLACEMENT_LOAD_CRASH";
+    const ROOT: &str = "SPARKLES_REPLACEMENT_LOAD_CRASH_ROOT";
+    const EXIT_AT_FAILPOINT: i32 = 42;
+    const BEFORE_WAL: &str = "group-preallocating";
+    const AFTER_WAL: &str = "group-written";
+    if let Ok(point) = std::env::var(CHILD) {
+        let point = [BEFORE_WAL, AFTER_WAL]
+            .into_iter()
+            .find(|&name| name == point)
+            .unwrap();
+        let dir = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let source = dir.join("import.ttl");
+        let ds = Dataset::open_with(
+            dir.join("db"),
+            DatasetOptions {
+                pool: Some(QueryPool::with_retained_capacity(16 * MIB, 24 << 10).unwrap()),
+                closure_cache_triples: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut request = mapped_import(&ds, &source, "urn:reload");
+        leave_import_pending(&ds, &request);
+        std::fs::write(&source, "<urn:s> <urn:p> <urn:replacement> .").unwrap();
+
+        let timeout = Duration::from_secs(10);
+        let (ready, committed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        ds.store().set_failpoint(
+            "reasoning-clear-committed",
+            Some(Arc::new(move |_| {
+                ready.send(()).unwrap();
+                wait.lock().unwrap().recv_timeout(timeout).unwrap();
+            })),
+        );
+        let (finished, cleared) = mpsc::channel();
+        let clearing = ds.clone();
+        std::thread::spawn(move || {
+            clearing.reasoning().clear().unwrap();
+            finished.send(()).unwrap();
+        });
+        committed.recv_timeout(timeout).unwrap();
+        let cleared = Mutex::new(cleared);
+        ds.store().set_failpoint(
+            point,
+            Some(Arc::new(move |_| {
+                release.send(()).unwrap();
+                cleared.lock().unwrap().recv_timeout(timeout).unwrap();
+                std::process::exit(EXIT_AT_FAILPOINT);
+            })),
+        );
+        request.refresh_imports = true;
+        ds.reasoning().run(&request).unwrap();
+        panic!("replacement LOAD skipped the failpoint");
+    }
+
+    for (point, committed, reuse_sequence) in [
+        (AFTER_WAL, true, false),
+        (BEFORE_WAL, false, false),
+        (BEFORE_WAL, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "interrupted_replacement_load_recovers_only_committed_provenance",
+                "--nocapture",
+            ])
+            .env(CHILD, point)
+            .env(ROOT, dir.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(EXIT_AT_FAILPOINT), "{point}");
+        let root = dir.path().join("db");
+        if reuse_sequence {
+            use sparkles::store::Store;
+            let store = Store::open(&root, Default::default()).unwrap();
+            sparkles::sparql::update::update(
+                &store,
+                "INSERT DATA { <urn:unrelated> <urn:p> <urn:o> }",
+                &QueryOptions::default(),
+            )
+            .unwrap();
+        }
+        let ds = Dataset::open(root).unwrap();
+        let ask = |object| {
+            ds.ask(&format!(
+                "ASK {{ GRAPH <urn:reload> {{ <urn:s> <urn:p> <urn:{object}> }} }}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(ask("first"), !committed, "{point}");
+        assert_eq!(ask("replacement"), committed, "{point}");
+
+        let source = dir.path().join("import.ttl");
+        let mut request = ReasonRequest::default();
+        request.inputs.imports = sparkles::reasoning::reasoner::ImportMode::Fetch;
+        request
+            .inputs
+            .location_mapping
+            .names
+            .insert("urn:reload".into(), format!("file://{}", source.display()));
+        request.refresh_imports = true;
+        std::fs::write(source, "<urn:s> <urn:p> <urn:updated> .").unwrap();
+        let record = ds.reasoning().run(&request).unwrap().record;
+        assert_eq!(
+            record.fetched_imports.contains(&"urn:reload".into()),
+            committed,
+            "{point}"
+        );
+        assert_eq!(ask("updated"), committed, "{point}");
+        assert_eq!(ask("first"), !committed, "{point}");
+        assert!(!ask("replacement"), "{point}");
+    }
 }

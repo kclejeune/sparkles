@@ -19,6 +19,8 @@
 import { request, type FullConfig } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +44,7 @@ import {
   DATA,
   DECLARED_DATASET,
   DECLARED_KEY,
+  INGEST_QUOTE,
   MODELS,
   PASSWORD,
   PATHS_DATA,
@@ -57,6 +60,59 @@ import {
 } from './data';
 
 const UI_DIR = resolve(import.meta.dirname, '../..');
+
+/** A local OpenAI-compatible provider with a fixed extraction for the settings test. */
+function extractionProvider() {
+  return createServer(async (req, res) => {
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      const { facts, mentions } = body.response_format.json_schema.schema.properties;
+      const select = (values: string[], suffix: string) => values.find((v) => v.includes(suffix));
+      const answer = {
+        mentions: [
+          {
+            key: 'person',
+            text: 'Ana Lima',
+            type: select(mentions.items.properties.type.enum, 'Person'),
+          },
+          {
+            key: 'team',
+            text: 'payments team',
+            type: select(mentions.items.properties.type.enum, 'OrganizationalUnit'),
+          },
+        ],
+        facts: [
+          {
+            s: 'person',
+            p: select(facts.items.properties.p.enum, 'memberOf'),
+            o: 'team',
+            literal: '',
+            datatype: '',
+            lang: '',
+            quote: INGEST_QUOTE,
+            confidence: 0.9,
+          },
+        ],
+      };
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: JSON.stringify(answer) },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5 },
+        }),
+      );
+    } catch {
+      res.writeHead(400).end();
+    }
+  });
+}
 
 function binary(): string {
   const bin = process.env.SPARKLES_BIN ?? resolve(UI_DIR, '../target/debug/sparkles');
@@ -250,6 +306,7 @@ graphs = ["urn:x-arq:DefaultGraph"]
   const { child, url } = await serve(bin, join(dir, 'data'), log, ['--auth-config', authConfig]);
   // never leave the servers running, even if the runner dies without a teardown
   let open: ChildProcess | null = null;
+  const provider = extractionProvider();
   const kill = () => {
     child.kill('SIGKILL');
     open?.kill('SIGKILL');
@@ -367,7 +424,28 @@ graphs = ["urn:x-arq:DefaultGraph"]
     writeFileSync(settings, JSON.stringify(SETTINGS));
     // a model configuration with a declared key, for the server page's Models section
     const models = join(dir, 'conf', 'models.json');
-    writeFileSync(models, JSON.stringify(MODELS));
+    provider.listen(0, '127.0.0.1');
+    await once(provider, 'listening');
+    const address = provider.address();
+    if (!address || typeof address === 'string') throw new Error('no extraction provider address');
+    writeFileSync(
+      models,
+      JSON.stringify({
+        models: {
+          ...MODELS.models,
+          providers: {
+            ...MODELS.models.providers,
+            'ingest-test': {
+              kind: 'openai',
+              endpoint: `http://127.0.0.1:${address.port}/v1`,
+              structuredOutput: 'json-schema',
+              allowedModels: ['m'],
+            },
+          },
+          roles: { ...MODELS.models.roles, extract: [{ provider: 'ingest-test', model: 'm' }] },
+        },
+      }),
+    );
     const key = join(dir, 'conf', 'anthropic.key');
     writeFileSync(key, DECLARED_KEY, { mode: 0o600 });
     const openServer = await serve(
@@ -396,6 +474,7 @@ graphs = ["urn:x-arq:DefaultGraph"]
     process.off('exit', kill);
     await stopServer(child);
     if (open) await stopServer(open);
+    provider.close();
     throw new Error(`${e instanceof Error ? e.message : e} (server log: ${log})`, { cause: e });
   }
 
@@ -403,6 +482,7 @@ graphs = ["urn:x-arq:DefaultGraph"]
     process.off('exit', kill);
     await stopServer(child);
     if (open) await stopServer(open);
+    provider.close();
     if (process.env.SPARKLES_E2E_KEEP) console.log(`sparkles e2e: kept ${dir}`);
     else rmSync(dir, { recursive: true, force: true });
   };

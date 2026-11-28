@@ -4854,6 +4854,9 @@ impl Operator {
             State::View(view) => view.release(),
             _ => {}
         }
+        if let Some(reuse) = &mut self.bind_reuse {
+            reuse.release();
+        }
         if let Some(ahead) = &mut self.ahead {
             ahead.pending = None;
             ahead.at = 0;
@@ -5833,16 +5836,47 @@ impl Operator {
                     let mut report = ExprReport::default();
                     let reused = match (&mut self.bind_reuse, &node.kind) {
                         (Some(reuse), Kind::Extend(target, expr)) => {
-                            reuse.apply(ctx, &mut b.table, *target, expr)?
+                            let reused = reuse.apply(ctx, &mut b.table, *target, expr)?;
+                            if reused && let Some((hits, misses)) = reuse.counters() {
+                                let counters = self.info.counters.get_or_insert_default();
+                                counters.insert("exprCacheHits".into(), hits.into());
+                                counters.insert("exprCacheMisses".into(), misses.into());
+                            }
+                            reused
                         }
                         _ => false,
                     };
                     if !reused {
-                        b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
+                        if let (Some(reuse), Kind::Extend(target, expr)) =
+                            (&mut self.bind_reuse, &node.kind)
+                        {
+                            let reuse_ref = &*reuse;
+                            let (col, eval) = exec::compute_column_controlled(
+                                ctx,
+                                &b.table,
+                                expr,
+                                &mut report,
+                                |n| reuse_ref.allow_fallback_split(n, expr),
+                                |n| reuse_ref.want_cost_timing(n, expr),
+                            )?;
+                            ctx.check()?;
+                            b.table.vars.push(*target);
+                            b.table.cols.push(col);
+                            reuse.observe_fallback(b.table.len, eval, report.counted(), expr);
+                        } else {
+                            b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
+                        }
                     }
                     b.reconcile()?;
                     drop(scratch);
                     self.done = self.children[0].done;
+                    if self.done
+                        && let Some(reuse) = &mut self.bind_reuse
+                    {
+                        // The pull that ends the input returns before the next one
+                        // would release the operator's working sets.
+                        reuse.release();
+                    }
                     let mut out = Some(b);
                     if let Some(ahead) = &mut self.ahead {
                         let b = out.as_ref().expect("a filtered batch");

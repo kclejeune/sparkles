@@ -36,19 +36,37 @@ impl Backups<'_> {
         captured: impl FnOnce(&crate::store::BackupCapture),
     ) -> Result<BackupSummary> {
         ctl.check()?;
+        let memory = self.ds.store().root().is_none();
+        if memory {
+            self.ds.store().failpoint("reasoning-before-memory-capture");
+        }
+        let mut pending = None;
+        let mut recorded = None;
+        let mut capture_metadata = || {
+            let journal = self.ds.state().pending_imports.lock();
+            recorded = Some(self.ds.state().recorded_reasoning());
+            if memory {
+                let commit = self.ds.store().snapshot().commit;
+                pending = Some(journal.backup_snapshot(self.ds.pool(), commit)?);
+                Ok(None)
+            } else {
+                self.ds.store().capture_import_journal()
+            }
+        };
         let cap = if self.ds.store().root().is_some()
             && self.ds.store().snapshot().generation.linked().is_none()
         {
-            self.ds.store().backup_capture_with(
+            self.ds.store().backup_capture_with_metadata(
                 &opts.name,
                 &crate::guard::WriteOptions {
                     cancel: Some(ctl.cancel.flag()),
                     deadline: ctl.deadline,
                     ..Default::default()
                 },
+                &mut capture_metadata,
             )?
         } else {
-            self.ds.store().materialized_backup_capture(
+            self.ds.store().materialized_backup_capture_with_metadata(
                 &opts.name,
                 &crate::store::MemoryCaptureOptions {
                     tmp_dir: tmp.to_path_buf(),
@@ -58,11 +76,17 @@ impl Backups<'_> {
                     deadline: ctl.deadline,
                     no_wait: false,
                 },
+                &mut capture_metadata,
             )?
         };
         captured(&cap);
         let mut extra = opts.extra.clone();
-        if let Some(mut record) = self.ds.reasoning_record()
+        if let Some(pending) = pending
+            && let Some(bytes) = pending.backup_bytes()?
+        {
+            extra.push((crate::reasoning::imports::FILE.into(), bytes));
+        }
+        if let Some(mut record) = recorded.and_then(|r| r.value.clone())
             && record.commit.is_none_or(|c| c <= cap.commit.seq)
         {
             record.reasoning_format = 2;

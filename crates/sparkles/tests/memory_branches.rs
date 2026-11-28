@@ -198,15 +198,22 @@ fn failed_historical_memory_schema_load_keeps_the_raw_branch_fail_closed() {
         )
         .is_err()
     );
+    // A memory branch is published only after its guard loads, so the failed
+    // creation leaves no raw branch that could take unguarded writes.
     assert!(ds.branch("invalid").is_err());
-    let raw = ds.store().branch("invalid").unwrap();
     assert!(matches!(
-        sparkles::sparql::update::update(
-            &raw,
-            "INSERT DATA { <urn:bad> a <urn:T> }",
-            &Default::default()
-        ),
-        Err(sparkles::Error::GuardMissing(_))
+        ds.store().branch("invalid"),
+        Err(sparkles::Error::Branch(ref error)) if error.code == "no-such-branch"
     ));
-    assert_eq!(raw.snapshot().len(), 0);
+    assert!(
+        !ds.branches()
+            .unwrap()
+            .iter()
+            .any(|branch| branch.name == "invalid")
+    );
+    // The name is free again, and a branch whose schema loads is guarded.
+    ds.create_branch("invalid", &Default::default()).unwrap();
+    let fork = ds.branch("invalid").unwrap();
+    assert!(fork.update("INSERT DATA { <urn:bad> a <urn:T> }").is_err());
+    assert!(!fork.ask("ASK { <urn:bad> a <urn:T> }").unwrap());
 }

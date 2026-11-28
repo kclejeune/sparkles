@@ -60,6 +60,10 @@ fn rooted(body: &str, counting: bool, asked: &[(&str, &str)]) -> Classification 
         assert_eq!(out.stats.tier, Tier::Disjunctive);
         assert!(out.stats.clauses > 0, "Tier D took no clause");
         assert!(out.complete);
+        if counting {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_rooted_over);
+            assert!(!out.stats.dl_rooted_declined);
+        }
         let got = asked
             .iter()
             .map(|(a, b)| out.taxonomy.is_subclass(&c(a), &c(b)))
@@ -76,8 +80,12 @@ fn rooted(body: &str, counting: bool, asked: &[(&str, &str)]) -> Classification 
 
 /// Checks the subsumptions that hold and those that do not, on a consistent ontology.
 fn check(body: &str, yes: &[(&str, &str)], no: &[(&str, &str)]) {
+    check_subsumptions(body, false, yes, no);
+}
+
+fn check_subsumptions(body: &str, counting: bool, yes: &[(&str, &str)], no: &[(&str, &str)]) {
     let asked: Vec<(&str, &str)> = yes.iter().chain(no).copied().collect();
-    let out = rooted(body, false, &asked);
+    let out = rooted(body, counting, &asked);
     assert_eq!(out.consistency, Consistency::Consistent);
     for (a, b) in yes {
         assert!(
@@ -324,26 +332,17 @@ fn a_minimum_of_two_into_one_nominal_needs_counting() {
     let out = rooted(body, true, &[("A", "Nothing")]);
     assert_eq!(out.consistency, Consistency::Consistent);
     assert!(out.taxonomy.is_unsatisfiable(&c("A")));
-    // without it the minimum alone is left out and reported, and not read as an
-    // existential, while Tier D takes the rest
-    let mut k = Classifier::of(&axioms(body));
-    let out = k
-        .classify(&Limits {
-            rooted: true,
-            ..Limits::default()
-        })
-        .unwrap();
-    let left: Vec<String> = k
-        .excluded()
-        .iter()
-        .map(|e| format!("{:?}", e.axiom))
-        .collect();
+    // without it the rooted rules would leave the minimum out, which the Horn rules take,
+    // so the Horn rules take the axioms outside OWL 2 EL as in the run without the option
+    // and leave the disjunction out (roadmap item 1286)
+    let left = declined(body, true);
     assert_eq!(left.len(), 1, "{left:?}");
-    assert!(left[0].contains("MinCardinality"), "{left:?}");
-    assert!(out.stats.clauses > 0, "Tier D took no clause");
-    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(left[0].contains("ObjectUnionOf"), "{left:?}");
+    let mut k = Classifier::of(&axioms(body));
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.clauses, 0, "Tier D took a clause");
     assert!(
-        !out.taxonomy.is_subclass(&c("A"), &c("C")),
+        out.taxonomy.is_unsatisfiable(&c("A")) || !out.taxonomy.is_subclass(&c("A"), &c("C")),
         "the minimum was weakened"
     );
 }
@@ -366,7 +365,8 @@ fn minimum_fillers_are_not_coloured_across_individuals() {
 }
 
 /// An irreflexive property beside a nominal is left out and reported, and the rooted run
-/// takes the rest, as it does with a minimum above one when counting is off.
+/// takes the rest. The Horn rules take the property too, but an irreflexive property does
+/// not give the axioms to them (roadmap item 1323).
 #[test]
 fn an_irreflexive_property_beside_a_nominal_is_left_out() {
     // r(a, a) closes a loop that the rules check only on simple properties without loops
@@ -776,37 +776,19 @@ fn a_disjoint_union_of_two_members_with_one_image_is_empty() {
     assert!(out.taxonomy.is_subclass(&c("D"), &c("C")));
 }
 
-/// A rewritten axiom can equal an axiom the ontology states as it is. Here both members of
-/// the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`, which the
-/// first axiom states too. Without counting the run leaves that axiom out, and the report
-/// names both original axioms (row 1304).
+/// `≥2 r.⊤ ⊑ ⊥` states the empty class of two members whose images are one, and two
+/// replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥` (row 1304). Without
+/// counting the rooted rules would leave that Horn axiom out, so the run gives the
+/// original axioms to the Horn rules, which take them as the run without the option does
+/// (roadmap item 1286). The crate's tests check the report of such an axiom in the run
+/// without counting after the counting bound, which leaves it out.
 #[test]
-fn the_report_names_every_original_axiom_of_a_rewritten_one_left_out() {
-    let ax = axioms(
+fn a_rewritten_horn_axiom_that_needs_counting_goes_to_the_horn_rules() {
+    for body in [
         "SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
          DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
              ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
          ClassAssertion(:B :b)",
-    );
-    let find = |f: fn(&AxiomKind) -> bool| ax.iter().map(|a| a.kind.clone()).find(f).unwrap();
-    let stated = find(|k| matches!(k, AxiomKind::SubClassOf(_, ClassExpression::Class(_))));
-    let disjoint = find(|k| matches!(k, AxiomKind::DisjointClasses(_)));
-    let mut k = Classifier::of(&ax);
-    let out = k.classify(&rooted_limits()).unwrap();
-    assert_eq!(out.stats.tier, Tier::Disjunctive);
-    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
-    assert!(left.contains(&stated), "{left:#?}");
-    assert!(left.contains(&disjoint), "{left:#?}");
-    assert_eq!(left.len(), 2, "{left:#?}");
-    // the disjunction is the only axiom outside OWL 2 EL that the run takes
-    assert_eq!(out.stats.outside_el.taken, 1);
-}
-
-/// Two replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥`, and the report
-/// names both when the run leaves it out (row 1304).
-#[test]
-fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
-    let ax = axioms(
         "DisjointClasses(
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
@@ -814,21 +796,26 @@ fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              owl:Nothing)
          ClassAssertion(:B :b)",
-    );
-    let mut k = Classifier::of(&ax);
-    let out = k.classify(&rooted_limits()).unwrap();
-    assert_eq!(out.stats.tier, Tier::Disjunctive);
-    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
-    assert_eq!(left.len(), 2, "{left:#?}");
-    assert!(
-        left.iter()
-            .any(|k| matches!(k, AxiomKind::DisjointClasses(_)))
-    );
-    assert!(left.iter().any(|k| matches!(k, AxiomKind::SubClassOf(..))));
-    assert_eq!(out.stats.outside_el.taken, 1);
+    ] {
+        let left = declined(body, true);
+        assert_eq!(left.len(), 1, "{left:#?}");
+        assert!(left[0].contains("ObjectUnionOf"), "{left:#?}");
+        // the run over the rewriting refuses, and its fallback to the original axioms, in
+        // which the rooted rules leave out the universal property, gives them to the Horn
+        // rules too
+        let mut k = Classifier::of(&axioms(body));
+        let out = k.classify(&rooted_limits()).unwrap();
+        assert_eq!(out.stats.clauses, 0, "Tier D took a clause");
+        assert_eq!(out.stats.dl_contexts, 0, "Tier D ran");
+    }
 }
 
 /// A disjoint union whose rewritten axioms are left out for two rules is reported once.
+/// Its two minimums rewrite to one Horn axiom that needs counting, `≥2 r.∃U.A ⊑ ⊥`, which
+/// does not give the axioms to the Horn rules, since the disjoint union it stands for
+/// needs case analysis (roadmap item 1286). The run keeps the rewriting, whose universal
+/// restriction over the universal property only the rewriting lets the rooted rules take,
+/// so that `D ⊑ H` follows through the union.
 #[test]
 fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
     let ax = axioms(
@@ -836,13 +823,23 @@ fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
              ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
              ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))
              :D)
-         ClassAssertion(:B :b)",
+         ClassAssertion(:B :b)
+         SubClassOf(:B ObjectAllValuesFrom(owl:topObjectProperty :E))
+         SubClassOf(:E ObjectUnionOf(:F :G))
+         SubClassOf(:F :H)
+         SubClassOf(:G :H)",
     );
     let mut k = Classifier::of(&ax);
-    k.classify(&rooted_limits()).unwrap();
+    let out = k.classify(&rooted_limits()).unwrap();
     let left = k.excluded();
     assert_eq!(left.len(), 1, "{left:#?}");
     assert!(matches!(left[0].axiom, AxiomKind::DisjointUnion(..)));
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert!(out.stats.clauses > 0, "Tier D took no clause");
+    assert!(
+        out.taxonomy.is_subclass(&c("D"), &c("H")),
+        "the run did not keep the rewriting"
+    );
 }
 
 const INTERNAL: &str = "urn:sparkles:internal:";
@@ -1007,18 +1004,19 @@ fn a_minimum_of_one_over_the_universal_property_is_an_existential() {
 }
 
 #[test]
-fn a_functional_property_above_the_universal_property_is_left_out() {
+fn a_functional_property_above_the_universal_property_goes_to_the_horn_rules() {
     // p is above the transitive property that stands for the universal one, so p is not
-    // simple, and the rooted run leaves its functionality out and reports it, while it
-    // takes the equivalence and the union
+    // simple, and the rooted rules without counting would leave its functionality out,
+    // which the Horn rules take, so the run answers as the run without the option and
+    // leaves the union out (roadmap item 1286)
     let left = declined(
         "EquivalentObjectProperties(owl:topObjectProperty :p)
          FunctionalObjectProperty(:p)
          ClassAssertion(:A :a)",
-        false,
+        true,
     );
     assert_eq!(left.len(), 1, "{left:?}");
-    assert!(left[0].contains("FunctionalObjectProperty"), "{left:?}");
+    assert!(left[0].contains("ObjectUnionOf"), "{left:?}");
 }
 
 #[test]
@@ -1930,6 +1928,7 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
                 expansion,
                 rooted: true,
                 rooted_decline: false,
+                rooted_marker_repair: false,
                 ..Limits::default()
             })
             .unwrap();
@@ -2153,6 +2152,7 @@ fn without_the_marker_repair_a_rooted_run_misses_each_fixture() {
                     expansion,
                     rooted: true,
                     rooted_decline: false,
+                    rooted_marker_repair: false,
                     ..Limits::default()
                 })
                 .unwrap();
@@ -2189,6 +2189,8 @@ fn the_decline_withdraws_the_rooted_answer_on_every_path() {
                 expansion,
                 counting,
                 rooted: true,
+                rooted_decline: true,
+                rooted_marker_repair: false,
                 ..Limits::default()
             };
             let at = format!("{name}, {threads} threads {expansion:?}");
@@ -2310,6 +2312,64 @@ fn the_marker_repair_delivers_on_every_path() {
     }
 }
 
+/// A rooted run with the default limits repairs the delivery of conditional ground facts
+/// and does not withdraw its answer (roadmap item 1231): on every path that the decline's
+/// test above takes, the run claims its answer and finds `K ⊑ Ans`, which the run with the
+/// repair and the check both off misses.
+#[test]
+fn the_default_rooted_run_repairs_and_claims_on_every_path() {
+    let d = Limits::default();
+    assert!(d.rooted_marker_repair && !d.rooted_decline);
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let limits = Limits {
+                threads,
+                expansion,
+                counting,
+                rooted: true,
+                ..Limits::default()
+            };
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&limits).unwrap();
+                assert!(rooted_claim(&k, &out), "{at}, round {round}: no claim");
+                assert!(!out.stats.dl_over_budget, "{at}, round {round}");
+                assert!(out.consistent, "{at}, round {round}");
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "{at}, round {round}: the rooted run misses K ⊑ Ans"
+                );
+            }
+            let mut k = Classifier::of(&ax);
+            let sat = k.saturate(&limits).unwrap();
+            assert!(sat.consistent, "{at}: saturate");
+            assert!(!sat.stats.dl_rooted_declined, "{at}: saturate");
+            assert!(!sat.stats.dl_over_budget, "{at}: saturate");
+            // the control: without the repair and the check the rooted run misses it
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    rooted_marker_repair: false,
+                    ..limits.clone()
+                })
+                .unwrap();
+            assert!(rooted_claim(&k, &out), "{at}: control");
+            assert!(
+                !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "{at}: the control found K ⊑ Ans"
+            );
+        }
+    }
+}
+
 /// A rooted run with counting that passes its bound starts again without counting, and
 /// that run is rooted too: when it withdraws its answer, the run starts again without the
 /// rooted rules and reports both fallbacks. The bound lies between the work of the run
@@ -2323,6 +2383,8 @@ fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
         threads: 1,
         counting: true,
         rooted: true,
+        rooted_decline: true,
+        rooted_marker_repair: false,
         dl_work: Some(180),
         ..Limits::default()
     };
@@ -2735,6 +2797,7 @@ fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
                 counting: true,
                 rooted: true,
                 rooted_decline: false,
+                rooted_marker_repair: false,
                 dl_work: Some(180),
                 ..Limits::default()
             })
@@ -3875,6 +3938,10 @@ fn a_rooted_run_that_merges_equal_individuals_finishes_shoi_022() {
                     expansion,
                     rooted: true,
                     rooted_merge: true,
+                    // the merge finishes shoi-022 within the bound with item 1231's repair
+                    // off, which item 1338 follows
+                    rooted_marker_repair: false,
+                    rooted_decline: true,
                     dl_steps,
                     ..Limits::default()
                 })
@@ -4513,6 +4580,9 @@ fn a_restart_after_the_counting_fallback_keeps_counting_off_and_its_bound() {
             counting: true,
             rooted: true,
             rooted_decline: false,
+            // the bound lies between the two runs without item 1231's repair, and the
+            // merge under the repair is item 1338
+            rooted_marker_repair: false,
             rooted_merge: true,
             dl_work: Some(380),
             ..Limits::default()
@@ -4996,13 +5066,27 @@ fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
     body_b.push_str(")\n");
     let ax_b = axioms(&body_b);
     let mut fresh_b = Classifier::of(&ax_b);
-    let expected_b = fresh_b
+    // Both runs below take the modules' pass after the run, whose state counts in the peak
+    // when the run admits it (roadmap item 1277), so their peaks compare the saturations.
+    let mut expected_b = fresh_b
         .classify(&Limits {
             threads: 1,
             rooted: false,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
+    let kinds_b: Vec<&AxiomKind> = ax_b.iter().map(|a| &a.kind).collect();
+    let fresh_witness_b = expected_b.cover(
+        &kinds_b,
+        &fresh_b.excluded(),
+        None,
+        &Limits {
+            threads: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(fresh_witness_b, None);
     let fresh_desc_b = fresh_b.describe(&c("Tag")).unwrap();
 
     // Unrestricted merged baseline proves Pass 0 merges and triggers a restart.
@@ -5055,15 +5139,28 @@ fn post_merge_reduction_decline_clears_derived_aliases_and_never_leaks_hub() {
     );
 
     let mut k_b = Classifier::of(&ax_b);
-    let got_b = k_b
+    // The modules' pass of the declined run, whose state the cap would count too, runs
+    // after the capped run, since this part pins the reduction's decline.
+    let mut got_b = k_b
         .classify(&Limits {
             threads: 1,
             rooted: true,
             rooted_merge: true,
             max_memory: Some(cap_b),
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
+    let witness_b = got_b.cover(
+        &kinds_b,
+        &k_b.excluded(),
+        None,
+        &Limits {
+            threads: 1,
+            ..Limits::default()
+        },
+    );
+    assert_eq!(witness_b, None);
     assert!(!got_b.complete, "Part B Pass 1 reduction must decline");
     assert!(
         got_b.stats.peak_memory > expected_b.stats.peak_memory,
@@ -5280,6 +5377,10 @@ fn all_50_shoi_fixtures_complete_within_bound_and_match_hermit_with_rooted_eq_sp
                     rooted: true,
                     rooted_merge: true,
                     rooted_eq_split: true,
+                    // shoi-022 finishes within the bound with item 1231's repair off, which
+                    // item 1338 follows
+                    rooted_marker_repair: false,
+                    rooted_decline: true,
                     ..Limits::default()
                 })
                 .unwrap();
@@ -5763,4 +5864,222 @@ fn split_lifecycle_strict_error_invalidation_incremental_reuse_and_inclusive_bou
         assert!(r2.taxonomy.is_subclass(&c("A"), &c("D")));
         assert!(r2.taxonomy.is_subclass(&c("E"), &c("F")));
     }
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_merges_its_named_values() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ObjectPropertyAssertion(:r0 :a2 :a3)
+         ObjectPropertyAssertion(:r0 :a2 :a4)
+         ClassAssertion(:C1 :a4)
+         SubClassOf(:K ObjectHasValue(:p :a3))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_merges_a_named_and_an_anonymous_value() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ObjectPropertyAssertion(:r0 :a2 :a3)
+         ClassAssertion(:C4 :a2)
+         SubClassOf(:C4 ObjectSomeValuesFrom(:r0 :C1))
+         SubClassOf(:K ObjectHasValue(:p :a3))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_refutes_a_case_into_an_equality() {
+    check_subsumptions(
+        "SubClassOf(:C4 ObjectMinCardinality(2 :r0 owl:Thing))
+         ClassAssertion(ObjectUnionOf(ObjectOneOf(:a0) :C4) :a2)
+         ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         ClassAssertion(:C1 :a2)
+         SubClassOf(:K ObjectHasValue(:p :a0))
+         SubClassOf(ObjectSomeValuesFrom(:p :C1) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn an_at_most_restriction_at_an_individual_refutes_a_case_under_a_class() {
+    check_subsumptions(
+        "ObjectPropertyAssertion(:r5 :a3 :a2)
+         SubClassOf(:K ObjectSomeValuesFrom(:p ObjectIntersectionOf(ObjectOneOf(:a3) ObjectAllValuesFrom(:r5 ObjectUnionOf(:C4 :C5)))))
+         SubClassOf(:C4 ObjectMinCardinality(2 :r0 owl:Thing))
+         ClassAssertion(ObjectMaxCardinality(1 :r0 owl:Thing) :a2)
+         SubClassOf(:K ObjectHasValue(:t :a2))
+         SubClassOf(:L ObjectHasValue(:t :a2))
+         SubClassOf(ObjectSomeValuesFrom(:t :C5) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K"), ("L", "Ans")],
+    );
+}
+
+// A counterexample to A ⊑ B would have to be c. It would qualify for r at a
+// under that assumption, making it equal to the already qualifying B-instance b.
+#[test]
+fn a_conditional_existential_qualifies_a_named_neighbour() {
+    check_subsumptions(
+        "Declaration(Class(:D))
+         ClassAssertion(ObjectMaxCardinality(1 :r ObjectSomeValuesFrom(:s :Q)) :a)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         ClassAssertion(:B :b)
+         ObjectPropertyAssertion(:s :b :d)
+         ClassAssertion(:Q :d)
+         SubClassOf(:A ObjectSomeValuesFrom(:s :Q))
+         SubClassOf(owl:Thing ObjectUnionOf(ObjectOneOf(:c) :B))",
+        true,
+        &[("A", "B")],
+        &[("B", "A"), ("D", "B")],
+    );
+}
+
+#[test]
+fn a_ground_maximum_of_two_derives_the_disjunction_of_all_three_pairs() {
+    let body = "ClassAssertion(ObjectMaxCardinality(2 :r) :a)
+                ObjectPropertyAssertion(:r :a :b)
+                ObjectPropertyAssertion(:r :a :c)
+                ObjectPropertyAssertion(:r :a :d)
+                ClassAssertion(:C :c)
+                SubClassOf(:K ObjectHasValue(:p :b))
+                SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)";
+    let open = rooted(body, true, &[("K", "Ans")]);
+    assert_eq!(open.consistency, Consistency::Consistent);
+    assert!(!open.taxonomy.is_subclass(&c("K"), &c("Ans")));
+    check_subsumptions(
+        &format!("{body} DifferentIndividuals(:d :b) DifferentIndividuals(:d :c)"),
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn a_counted_clause_at_an_individual_preserves_its_class_disjunct() {
+    check_subsumptions(
+        "SubClassOf(ObjectMinCardinality(2 :r) :C)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         DifferentIndividuals(:b :c)
+         SubClassOf(:K ObjectHasValue(:p :a))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn conditional_maximum_at_a_named_individual_counts_a_local_successor_edge() {
+    check_subsumptions(
+        "SubClassOf(:K ObjectSomeValuesFrom(:p :W))
+         SubClassOf(:K ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:a) ObjectMaxCardinality(1 :r))))
+         ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(:C :b)
+         SubClassOf(:W ObjectUnionOf(ObjectOneOf(:a) :D))
+         SubClassOf(:W ObjectSomeValuesFrom(:r :E))
+         SubClassOf(ObjectSomeValuesFrom(:r ObjectIntersectionOf(:C :E)) :D)
+         SubClassOf(ObjectSomeValuesFrom(:p :D) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("W", "D")],
+    );
+}
+
+#[test]
+fn local_maximum_clashes_on_two_different_named_values() {
+    let out = rooted(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectHasValue(:r :c))
+         DifferentIndividuals(:b :c)",
+        true,
+        &[("A", "Nothing")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+}
+
+#[test]
+fn local_maximum_merges_named_and_anonymous_values() {
+    check_subsumptions(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:A ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("A", "Ans")],
+        &[("Ans", "A")],
+    );
+}
+
+#[test]
+fn local_maximum_moves_a_class_between_named_values() {
+    check_subsumptions(
+        "SubClassOf(:A ObjectMaxCardinality(1 :r))
+         SubClassOf(:A ObjectHasValue(:r :b))
+         SubClassOf(:A ObjectHasValue(:r :c))
+         ClassAssertion(:C :c)
+         SubClassOf(:A ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[("A", "Ans")],
+        &[("Ans", "A")],
+    );
+}
+
+#[test]
+fn local_maximum_reaches_a_conjunction_at_a_named_value() {
+    check_subsumptions(
+        "SubClassOf(:K ObjectMaxCardinality(1 :r))
+         SubClassOf(:K ObjectHasValue(:r :a))
+         SubClassOf(:K ObjectHasValue(:r :b))
+         ClassAssertion(:C :b)
+         EquivalentClasses(:Ans ObjectSomeValuesFrom(:r ObjectIntersectionOf(ObjectOneOf(:a) :C)))",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn ground_maximum_moves_atoms_between_successors_of_one_individual() {
+    check_subsumptions(
+        "ClassAssertion(ObjectIntersectionOf(ObjectSomeValuesFrom(:r :B) ObjectSomeValuesFrom(:r :C) ObjectMaxCardinality(1 :r)) :a)
+         SubClassOf(:K ObjectHasValue(:p :a))
+         SubClassOf(ObjectSomeValuesFrom(:p ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C))) :Ans)",
+        true,
+        &[("K", "Ans")],
+        &[("Ans", "K")],
+    );
+}
+
+#[test]
+fn ground_maximum_leaves_an_unqualified_value_distinct() {
+    check_subsumptions(
+        "ClassAssertion(ObjectMaxCardinality(1 :r :Q) :a)
+         ObjectPropertyAssertion(:r :a :b)
+         ObjectPropertyAssertion(:r :a :c)
+         ClassAssertion(:Q :b)
+         ClassAssertion(:C :c)
+         SubClassOf(:K ObjectHasValue(:p :b))
+         SubClassOf(ObjectSomeValuesFrom(:p :C) :Ans)",
+        true,
+        &[],
+        &[("K", "Ans")],
+    );
 }

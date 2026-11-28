@@ -1571,8 +1571,11 @@ in `recall` and the brief.
   in `mem:redactions`.
 - **Known values.** The strongest detector needs no pattern: the exact values that must
   never leave. The server knows its runtime secrets and provider keys (C19 §11.2), and
-  ingestion on the server replaces any occurrence of one of those values, matched with
-  Aho-Corasick over the text, with `[redacted:server-secret]`. The CLI does the same for
+  ingestion by a server-wide administrator or the local operator replaces occurrences
+  of those values, matched with Aho-Corasick over the text, with
+  `[redacted:server-secret]`. Dataset principals use the generic detectors so the
+  results of an ingestion or direct registration do not depend on the server secret
+  inventory. The CLI does the same for
   the values of its own environment variables whose names contain `KEY`, `SECRET`,
   `TOKEN` or `PASSWORD`, and for the values of a `knownValues` file the person names.
   Values shorter than 8 characters are skipped. Values are compared, never logged or
@@ -1584,15 +1587,38 @@ in `recall` and the brief.
   before chunking, so the rendition the facts cite is the redacted text, as it is for
   imports, and the task reports `redactions` by detector. `redaction.serverIngest:
   "redact" | "refuse" | "off"` chooses whether a match is replaced, fails the task with
-  `secret-detected` and the detector's name and offset, or is ignored; the default is
-  `redact`. In `register_source`, a match in a source sent with `original` is refused
-  rather than redacted, as today, because the kept bytes would still hold the value.
+  `secret-detected` and the detector's name and offset, or is ignored. The default is
+  `redact`. For extraction from an existing source, any required redaction stops
+  the task before model calls or writes. The source needs a new redacted rendition
+  so every citation uses the stored text's offsets. Direct `register_source` refuses
+  a match in text, title, source or graph IRI, or retained original bytes under the
+  direct registration policy.
 - **Tests.** Detector unit tests with positive and negative examples per category,
   including hashes and UUIDs that the entropy detector must leave alone; a server
   ingestion of a Markdown file holding a provider key from the server's own secrets,
   checked against a mock provider that records what it received; an import with an
   allow-listed test key left in place; `secretPatterns` from an existing `memory.json`
   read as `redaction.patterns`.
+- **Outcome (delivered for item 77).** `sparkles-memory-import::redact::Policy` now
+  combines built-in and dataset regular expressions, optional high-entropy detection
+  (excluding 40- and 64-character hex hashes and canonical UUIDs), opt-in personal data
+  detectors (`email`, `phone`, `payment-card` with Luhn verification, `iban` with
+  ISO 13616 mod-97 verification, and `ip`), exact known-value Aho-Corasick matching
+  (values of at least 8 characters, never logged or returned), and regex allow-lists.
+  `MemorySettings.redaction` (`memory.json` format 4 when present, keeping format 1 to 3
+  otherwise) configures `patterns`, `entropy`, `personal`, `allow`, `knownValues`,
+  `everywhere`, and `serverIngest` (`redact`, `refuse`, or `off`, defaulting to `redact`),
+  while `imports.secretPatterns` remains accepted and merged with `redaction.patterns`.
+  The CLI (`sparkles memory import` and `sync`, including `--redact-known-values` and
+  `known-values` in `memory.toml`), `register_source` (for `imports.base` or every graph
+  when `redaction.everywhere` is true), and server-side document, claims, and table
+  mapping ingestion all apply this policy before storage or model calls and report
+  `redactions` counts by detector when the ingestion replaces text. Task metadata
+  omits raw names and locators. Ingestion records ordinary fetch URLs as locators and
+  uses generated identities for URLs with credentials, query strings, fragments or
+  policy matches. Unit and HTTP tests verify detector behavior, server
+  secret redaction against a mock provider, `refuse` and `off` modes, allow-lists,
+  `everywhere`, CSV sample redaction, legacy `secretPatterns`, and `memory.json` format 4.
 
 ### Shared memory workflows
 

@@ -760,7 +760,36 @@ pub fn diagnose_controlled(
     typings: Option<&LiteralTypings>,
     controls: &DiagnosticControls,
 ) -> anyhow::Result<DiagnosticsReport> {
-    diagnose_impl(snap, opts, typings, controls, None)
+    Ok(diagnose_controlled_guarded(snap, opts, typings, controls)?.0)
+}
+
+/// Keeps a diagnostic report's allocation admitted across an enclosing analysis.
+#[derive(Debug)]
+pub struct DiagnosticMemory {
+    _held: crate::budget::Held,
+}
+
+/// Diagnose and return the report's credit alongside it.
+pub fn diagnose_controlled_guarded(
+    snap: Arc<Snapshot>,
+    opts: &DiagnoseOptions,
+    typings: Option<&LiteralTypings>,
+    controls: &DiagnosticControls,
+) -> anyhow::Result<(DiagnosticsReport, DiagnosticMemory)> {
+    let budget = crate::budget::Budget::with_parent(
+        controls
+            .max_memory
+            .map(|m| m.min(usize::MAX as u64) as usize),
+        controls.memory_parent.clone(),
+    );
+    let held = std::cell::RefCell::new(crate::budget::Held::new(&budget));
+    let report = diagnose_impl(snap, opts, typings, controls, None, Some(&held))?;
+    Ok((
+        report,
+        DiagnosticMemory {
+            _held: held.into_inner(),
+        },
+    ))
 }
 
 /// Diagnose a gate candidate with native default graph semantics and a report-wide
@@ -797,7 +826,7 @@ pub fn diagnose_for_gate(
         max_results,
         max_report_bytes,
     };
-    diagnose_impl(snap, opts, None, &controls, Some(&gate))
+    diagnose_impl(snap, opts, None, &controls, Some(&gate), None)
 }
 
 struct Gate<'a> {
@@ -812,6 +841,7 @@ fn diagnose_impl(
     typings: Option<&LiteralTypings>,
     controls: &DiagnosticControls,
     gate: Option<&Gate<'_>>,
+    report_held: Option<&std::cell::RefCell<crate::budget::Held>>,
 ) -> anyhow::Result<DiagnosticsReport> {
     check_control(controls.deadline, controls.cancel.as_deref())?;
     if let Some(cancellation) = gate.and_then(|gate| gate.query.cancellation.as_ref()) {
@@ -831,6 +861,38 @@ fn diagnose_impl(
     };
     let checks = select_checks(&opts.checks)
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
+    // The report's fixed part is charged like a finding. A refusal of the shared
+    // server memory fails the report, and a refusal of its own limit leaves every
+    // check with an error, so the report is incomplete rather than absent. The
+    // incomplete report builds no prefix map and keeps the caller's graph list only
+    // when a charge for that list alone is admitted, since the report's scope must
+    // name the checked graphs. A refused scope charge fails the report.
+    let mut scaffold_error = None;
+    if let Some(held) = report_held {
+        let scope = opts.graphs.iter().map(|g| g.len() * 2 + 32).sum::<usize>();
+        let names = opts
+            .prefixes
+            .iter()
+            .map(|(p, v)| p.len() + v.len() + 128)
+            .sum::<usize>();
+        let mut held = held.borrow_mut();
+        if let Err(e) = held.try_grow(4096 + scope + names) {
+            match (&e, e.core_error()) {
+                (crate::budget::BudgetFailure::Local(_), _) => scaffold_error = Some(e.to_string()),
+                (
+                    _,
+                    Some(
+                        error @ Error::BudgetExceeded(sparkles_core::Budget {
+                            kind: sparkles_core::BudgetKind::Memory,
+                            ..
+                        }),
+                    ),
+                ) => scaffold_error = Some(error.to_string()),
+                _ => return Err(e.into()),
+            }
+            held.try_grow(scope)?;
+        }
+    }
     let limit = opts.limit.clamp(1, MAX_LIMIT);
     let relative = opts
         .timeout
@@ -839,8 +901,14 @@ fn diagnose_impl(
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let mut prefixes: BTreeMap<String, String> = sparkles_core::io::standard_prefixes();
-    prefixes.extend(opts.prefixes.iter().cloned());
+    // every check of an incomplete scaffold stops before it names a term
+    let prefixes: BTreeMap<String, String> = if scaffold_error.is_some() {
+        BTreeMap::new()
+    } else {
+        let mut prefixes = sparkles_core::io::standard_prefixes();
+        prefixes.extend(opts.prefixes.iter().cloned());
+        prefixes
+    };
     let names = Names::new(&prefixes);
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
@@ -865,6 +933,12 @@ fn diagnose_impl(
             millis: 0,
             error: None,
         };
+        if let Some(error) = &scaffold_error {
+            out.status = CheckStatus::Error;
+            out.error = Some(error.clone());
+            outcomes.push(out);
+            continue;
+        }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             out.status = CheckStatus::Timeout;
             outcomes.push(out);
@@ -885,6 +959,7 @@ fn diagnose_impl(
             max_memory: controls.max_memory,
             gate_query: gate.map(|gate| gate.query),
             report_bytes: report_bytes.as_ref(),
+            report_held,
         };
         let limit = gate
             .and_then(|gate| gate.max_results)
@@ -976,6 +1051,7 @@ struct Run<'a> {
     max_memory: Option<u64>,
     gate_query: Option<&'a QueryOptions>,
     report_bytes: Option<&'a sparkles_core::validation::ReportBytes>,
+    report_held: Option<&'a std::cell::RefCell<crate::budget::Held>>,
 }
 
 /// A diagnostic row keeps the genuine decoded payload and original names. Two
@@ -1413,6 +1489,20 @@ impl Run<'_> {
     fn push_finding(&self, out: &mut Vec<Finding>, finding: Finding) -> sparkles_core::Result<()> {
         if let Some(report) = self.report_bytes {
             report.admit(finding.retained_bytes())?;
+        }
+        if let Some(held) = self.report_held {
+            held.borrow_mut()
+                .try_grow(finding.retained_bytes() as usize * 2)
+                .map_err(|e| {
+                    e.core_error().unwrap_or_else(|| {
+                        let limit = self.max_memory.unwrap_or(u64::MAX);
+                        Error::BudgetExceeded(sparkles_core::Budget {
+                            kind: sparkles_core::BudgetKind::Memory,
+                            limit,
+                            requested: limit.saturating_add(1),
+                        })
+                    })
+                })?;
         }
         out.push(finding);
         Ok(())
@@ -3271,6 +3361,7 @@ mod paging_tests {
                 max_memory: query.max_memory_bytes,
                 gate_query: Some(&query),
                 report_bytes: None,
+                report_held: None,
             };
             run.select(
                 "SELECT ?probe WHERE { BIND(1 AS ?probe) }",

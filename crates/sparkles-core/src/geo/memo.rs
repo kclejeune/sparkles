@@ -194,39 +194,47 @@ pub(crate) fn note_crs_ref(ctx: &Ctx, crs_ref: &crate::geo::crs::CrsRef) {
                 return;
             };
             let bit = 1u64 << (i % 64);
-            if ctx.geo.noted[i / 64].fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+            let noted = &ctx.geo.noted[i / 64];
+            if noted.load(Ordering::Relaxed) & bit != 0 {
                 return;
             }
-            if let Some(message) = crs::approximation(*id) {
-                ctx.warn(PlanWarning {
+            // The CRS is marked only once the plan holds its warning. A warning that the
+            // budget refuses inside optional evaluation is raised again by the ordinary
+            // evaluation that follows, and the plan keeps one copy.
+            if let Some(message) = crs::approximation(*id)
+                && !ctx.try_warn(PlanWarning {
                     code: "geo-crs-approximate",
                     message,
-                });
+                })
+            {
+                return;
             }
+            noted.fetch_or(bit, Ordering::Relaxed);
         }
         CrsRef::Unknown(iri) => {
             if !cfg!(feature = "geo-epsg") {
                 return;
             }
-            {
-                let mut seen = ctx.geo.noted_unknown.lock();
-                if seen.iter().any(|s| **s == **iri) {
-                    return;
-                }
-                if !ctx.retain_bytes(iri.len() as u64 + 64) {
-                    return;
-                }
-                seen.push(iri.clone());
+            if ctx.geo.noted_unknown.lock().iter().any(|s| **s == **iri) {
+                return;
             }
-            if let Some(why) = crs::refusal(iri) {
-                ctx.warn(PlanWarning {
+            // As above, the IRI is recorded only once the plan holds its warning.
+            if let Some(why) = crs::refusal(iri)
+                && !ctx.try_warn(PlanWarning {
                     code: "geo-crs-unsupported",
                     message: format!(
                         "{why}. Its literals are in an unknown CRS, so metric functions and \
                          mixes with other CRSs are type errors"
                     ),
-                });
+                })
+            {
+                return;
             }
+            let mut seen = ctx.geo.noted_unknown.lock();
+            if seen.iter().any(|s| **s == **iri) || !ctx.retain_bytes(iri.len() as u64 + 64) {
+                return;
+            }
+            seen.push(iri.clone());
         }
     }
 }
@@ -526,6 +534,51 @@ mod tests {
         assert!(ctx.geo.len() < 9_999, "refused geometries are not memoized");
         assert!(ctx.check().is_ok());
         drop(held);
+    }
+
+    /// Notes `crs` inside optional evaluation under a budget with room for the record
+    /// of an unknown CRS's IRI but not for its warning, then outside it with the room
+    /// restored, and checks that the plan ends with one warning `code`.
+    #[cfg(feature = "geo-epsg")]
+    fn refused_crs_warning_is_raised_again(crs: &CrsRef, code: &str) {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 1 << 20;
+        let room = crs.iri().len() as u64 + 64 + 16;
+        let held = ctx
+            .charge((1 << 20) - ctx.live_bytes_for_tests() - room)
+            .unwrap();
+        let ((), refused) = ctx.optional_eval(|| note_crs_ref(&ctx, crs));
+        assert!(refused, "the warning's bytes are refused");
+        ctx.check().unwrap();
+        assert!(ctx.warnings().is_empty());
+        drop(held);
+        for _ in 0..2 {
+            note_crs_ref(&ctx, crs);
+            ctx.check().unwrap();
+            let codes: Vec<_> = ctx.warnings().iter().map(|w| w.code).collect();
+            assert_eq!(codes, [code]);
+        }
+    }
+
+    /// Item 293 round 3: an approximate CRS whose warning the budget refuses inside
+    /// optional evaluation stays unmarked, so the ordinary evaluation that follows
+    /// raises the warning, and the plan still keeps one copy.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn a_refused_approximate_crs_warning_is_raised_again() {
+        let crs = CrsRef::Known(crate::geo::crs::lookup("EPSG:27700").unwrap());
+        refused_crs_warning_is_raised_again(&crs, "geo-crs-approximate");
+    }
+
+    /// Item 293 round 3: the same for a refused EPSG CRS, whose IRI the query records
+    /// only once the plan holds its warning.
+    #[cfg(feature = "geo-epsg")]
+    #[test]
+    fn a_refused_unsupported_crs_warning_is_raised_again() {
+        let iri: Arc<str> = "http://www.opengis.net/def/crs/EPSG/0/26717".into();
+        assert!(crate::geo::crs::lookup(&iri).is_none());
+        refused_crs_warning_is_raised_again(&CrsRef::Unknown(iri), "geo-crs-unsupported");
     }
 
     #[test]

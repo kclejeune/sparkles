@@ -459,7 +459,7 @@ pub fn start(st: &mut AppState, settings: Option<&Path>, args: &ModelArgs) -> an
     };
     if let (Some(path), Some(d)) = (settings, declared) {
         s.file = Some(path.to_path_buf());
-        s.declared.store(Arc::new(d));
+        s.replace_declared(Arc::new(d));
         s.status.lock().read_at = Some(super::now());
     }
     s.server.set_dir(&st.data_dir.clone());

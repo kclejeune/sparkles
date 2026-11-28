@@ -36,14 +36,14 @@ struct Branch {
 /// A copy of `v` with room for one entry more than a node of capacity `cap` holds, so
 /// that the insert that overflows it does not grow the allocation (a vector that grows
 /// doubles, and a leaf would keep that room after its split).
-fn with_room<T: Clone>(v: &[T], cap: usize) -> Vec<T> {
+pub(super) fn with_room<T: Clone>(v: &[T], cap: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(cap + 1);
     out.extend_from_slice(v);
     out
 }
 
 /// The entries of `v` from `at` on, moved to a vector with room as [`with_room`] gives.
-fn split_with_room<T>(v: &mut Vec<T>, at: usize, cap: usize) -> Vec<T> {
+pub(super) fn split_with_room<T>(v: &mut Vec<T>, at: usize, cap: usize) -> Vec<T> {
     let mut right = Vec::with_capacity(cap + 1);
     right.extend(v.drain(at..));
     v.shrink_to(cap + 1);

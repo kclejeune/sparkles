@@ -24,6 +24,8 @@
 pub mod blob;
 pub mod cache;
 pub mod capture;
+pub mod chunking;
+mod copy;
 pub mod create;
 #[cfg(feature = "encryption")]
 pub mod crypto;
@@ -39,15 +41,18 @@ pub mod repo;
 pub mod restore;
 pub mod seal;
 mod security;
+mod storage;
 pub mod throttle;
 pub mod types;
 pub mod verify;
 
 pub use capture::Source;
+pub use copy::{CopyOptions, CopyReport};
 pub use error::{BackupError, Code, Result};
 pub use object_store;
 pub use repo::Repository;
 pub use seal::{KeyMemory, SEALED_SECRET_PREFIX, SecretSealer};
+pub use storage::{ObjectLock, ObjectLockMode, S3WritePolicy, StorageClass};
 pub use types::*;
 
 use object_store::ObjectStore;
@@ -197,6 +202,16 @@ pub struct ListFilter {
     pub limit: Option<usize>,
     /// only those completed strictly before this RFC 3339 instant (the paging cursor)
     pub before: Option<String>,
+}
+
+/// Settings for initializing a repository with opt-in features.
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryOptions {
+    /// Enable content-defined chunking for immutable vocabulary files. A repository
+    /// keeps this setting for its lifetime.
+    pub content_defined_chunking: bool,
+    /// S3 placement and optional Object Lock for immutable backup objects.
+    pub s3_policy: Option<S3WritePolicy>,
 }
 
 /// Options of [`Repository::create`].

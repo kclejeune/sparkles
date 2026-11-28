@@ -161,6 +161,26 @@ impl InternalSpec {
     }
 }
 
+/// The original read owns its admission. An explicit caller clone is independently owned.
+#[derive(Debug, Default)]
+pub(crate) struct RowsMemory {
+    pub(crate) _lease: Option<sparkles_budget::MemoryLease>,
+}
+
+impl Clone for RowsMemory {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for RowsMemory {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RowsMemory {}
+
 /// An internal circuit's rows with their annotations
 /// ([`InternalCircuit::annotated_rows`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +189,7 @@ pub struct AnnotatedRows {
     pub columns: Vec<String>,
     /// each row's terms with its multiplicity and its annotation
     pub rows: Vec<(Vec<Option<Term>>, u64, super::prov::Annotation)>,
+    pub(crate) _memory: RowsMemory,
 }
 
 /// The changed facts per key after a commit ([`InternalCircuit::counts`]).
@@ -208,6 +229,7 @@ pub struct InternalRows {
     pub columns: Vec<String>,
     /// each row's terms with its multiplicity
     pub rows: Vec<(Vec<Option<Term>>, u64)>,
+    pub(crate) _memory: RowsMemory,
 }
 
 /// The counts of an accumulator, one entry per commit and key.

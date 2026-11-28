@@ -53,6 +53,8 @@ struct Config {
     transcripts: Vec<String>,
     /// extra redaction patterns
     redact: Vec<ConfigPattern>,
+    /// file of extra known secret values (one per line, 8+ characters)
+    known_values: Option<PathBuf>,
     /// harness roots
     claude_dir: Option<PathBuf>,
     codex_dir: Option<PathBuf>,
@@ -495,6 +497,19 @@ fn ingest_fields() -> [(&'static str, Value); 3] {
     ]
 }
 
+/// The PATCH body to turn on server-side ingestion for an assistant settings document
+/// (`GET /$/settings/{ds}/assistant`), setting only the fields of [`ingest_fields`] whose
+/// source is `default` (spec C19 §8.1).
+pub(crate) fn plan_enable_ingest(cur: &Value) -> Value {
+    let mut patch = json!({});
+    for (f, wanted) in ingest_fields() {
+        if cur["sources"][f] == "default" && cur["effective"][f] != wanted {
+            patch[f] = wanted;
+        }
+    }
+    patch
+}
+
 /// Turn on server-side ingestion: set each field of [`ingest_fields`] whose source is
 /// `default`, and leave declared, runtime and locked fields as they are. The answer
 /// lists what changed, what stayed with its source, and the providers of the effective
@@ -518,12 +533,7 @@ fn enable_ingest(conn: &Conn) -> Value {
             Ok(v) => v,
             Err(e) => return failed(e),
         };
-        let mut patch = json!({});
-        for (f, wanted) in ingest_fields() {
-            if cur["sources"][f] == "default" && cur["effective"][f] != wanted {
-                patch[f] = wanted;
-            }
-        }
+        let patch = plan_enable_ingest(&cur);
         if patch.as_object().is_some_and(|m| m.is_empty()) {
             break (cur, patch);
         }
@@ -796,9 +806,17 @@ fn adapters_of(names: &[String]) -> Result<Vec<Adapter>, CmdError> {
         .collect()
 }
 
-fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Pattern>, CmdError> {
+fn redaction_policy(
+    env: &Env,
+    settings: &Value,
+    flags: &ImportFlags,
+) -> Result<redact::Policy, CmdError> {
     let mut ps = redact::builtin();
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     let mut add = |name: &str, regex: &str, from: &str| -> Result<(), CmdError> {
+        if !seen.insert((name.to_string(), regex.to_string())) {
+            return Ok(());
+        }
         ps.push(Pattern::new(name, regex).map_err(|e| CmdError::usage(format!("{from}: {e}")))?);
         Ok(())
     };
@@ -809,6 +827,12 @@ fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Patt
     {
         if let (Some(n), Some(r)) = (p["name"].as_str(), p["regex"].as_str()) {
             add(n, r, "secretPatterns")?;
+        }
+    }
+    let red = &settings["redaction"];
+    for p in red["patterns"].as_array().into_iter().flatten() {
+        if let (Some(n), Some(r)) = (p["name"].as_str(), p["regex"].as_str()) {
+            add(n, r, "redaction.patterns")?;
         }
     }
     for p in &env.cfg.redact {
@@ -822,7 +846,54 @@ fn patterns(env: &Env, settings: &Value, flags: &ImportFlags) -> Result<Vec<Patt
                 .map_err(|e| CmdError::usage(format!("{}: {e}", f.display())))?,
         );
     }
-    Ok(ps)
+    let mut policy = redact::Policy::from_patterns(ps);
+    if let Some(ent) = red["entropy"].as_object() {
+        let d = redact::EntropyConfig::default();
+        policy.entropy = Some(redact::EntropyConfig {
+            min_length: ent
+                .get("minLength")
+                .and_then(Value::as_u64)
+                .map_or(d.min_length, |n| n as usize),
+            min_bits_per_char: ent
+                .get("minBitsPerChar")
+                .and_then(Value::as_f64)
+                .unwrap_or(d.min_bits_per_char),
+        });
+    }
+    for cat in red["personal"].as_array().into_iter().flatten() {
+        if let Some(c) = cat.as_str().and_then(redact::PersonalCategory::parse)
+            && !policy.personal.contains(&c)
+        {
+            policy.personal.push(c);
+        }
+    }
+    for expr in red["allow"].as_array().into_iter().flatten() {
+        if let Some(s) = expr.as_str() {
+            let re = regex::Regex::new(s)
+                .map_err(|e| CmdError::usage(format!("redaction.allow: {e}")))?;
+            policy.allow.push(re);
+        }
+    }
+    let use_known = red["knownValues"].as_bool().unwrap_or(true);
+    let mut known: Vec<String> = if use_known {
+        redact::env_known_values()
+    } else {
+        Vec::new()
+    };
+    for f in env
+        .cfg
+        .known_values
+        .iter()
+        .chain(flags.redact_known_values.iter())
+    {
+        let t = std::fs::read_to_string(f)
+            .map_err(|e| CmdError::usage(format!("{}: {e}", f.display())))?;
+        known.extend(redact::parse_known_values_file(&t));
+    }
+    if !known.is_empty() {
+        policy = policy.with_known_values(known, "known-value");
+    }
+    Ok(policy)
 }
 
 fn project_of(dir: Option<&Path>) -> Result<Project, CmdError> {
@@ -854,7 +925,7 @@ fn import(
     let project = project_of(flags.project.as_deref())?;
     let conn = env.connect()?;
     let (ctx, settings) = context(&conn)?;
-    let ps = patterns(env, &settings, &flags)?;
+    let policy = redaction_policy(env, &settings, &flags)?;
     let roots = env.roots();
     let mut notes: Vec<String> = Vec::new();
     // §8.10.7: the dataset allows transcripts, and the person opts the project in
@@ -887,7 +958,7 @@ fn import(
         user_scope: flags.user_scope,
         paths: flags.paths.clone(),
         instructions_only: flags.instructions_only,
-        patterns: &ps,
+        patterns: &policy.patterns,
     };
     let prefix = format!(
         "{}{}/",
@@ -913,7 +984,7 @@ fn import(
     } else {
         None
     };
-    let mut cache = Cache::load(&cache_path);
+    let mut cache = Cache::load(&cache_path)?;
     let mut opts = SyncOpts {
         branch: env.common.branch.clone(),
         dry_run: flags.dry_run,
@@ -923,15 +994,12 @@ fn import(
     };
     let mut reports;
     let mut runs = 0;
-    let mut file_graphs: std::collections::HashMap<PathBuf, String>;
     loop {
         runs += 1;
-        let scan = sparkles_memory_import::scan(&req);
-        file_graphs = scan
-            .files
-            .iter()
-            .map(|f| (f.path.clone(), f.graph.clone()))
-            .collect();
+        let scan = sparkles_memory_import::scan_with_policy(&req, &policy);
+        if !flags.dry_run && cache.invalidate_incomplete(&scan) {
+            cache.save(&cache_path)?;
+        }
         let skip = incremental && opts.only.is_none() && sync::unchanged_by_cache(&scan, &cache);
         if !skip || runs > 1 {
             reports = sync::sync(&conn, &scan, &mut cache, &opts)?;
@@ -972,8 +1040,17 @@ fn import(
             roots: &roots,
             project: &project,
             harnesses,
-            patterns: &ps,
-            file_graphs,
+            policy: &policy,
+            file_graphs: reports
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.status.as_str(),
+                        "new" | "edited" | "renamed" | "unchanged"
+                    )
+                })
+                .map(|r| (PathBuf::from(&r.path), r.graph.clone()))
+                .collect(),
             opts: transcripts::Opts {
                 tools: flags.transcript_content == "tools",
                 subagents: flags.subagents,
@@ -1226,6 +1303,10 @@ fn child_args(env: &Env, flags: &ImportFlags) -> Vec<String> {
             .as_ref()
             .map(|p| p.display().to_string()),
     );
+    if let Some(p) = &flags.redact_known_values {
+        a.push("--redact-known-values".into());
+        a.push(p.display().to_string());
+    }
     for p in &flags.paths {
         a.push("--path".into());
         a.push(p.display().to_string());
@@ -1373,13 +1454,95 @@ fn harness_filter(h: Option<&str>) -> Result<Option<Harness>, CmdError> {
     }
 }
 
-/// A project directory or key, as a key.
-fn project_key_of(p: &str) -> String {
+/// The selected identity, plus the other import identity when both are in scope.
+struct ProjectKeys {
+    primary: String,
+    other: Option<String>,
+}
+
+impl ProjectKeys {
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_str()).chain(self.other.as_deref())
+    }
+
+    fn segments(&self) -> Vec<String> {
+        self.iter()
+            .map(|key| {
+                sparkles_memory_import::ids::segment(&sparkles_memory_import::project::segment_of(
+                    key,
+                ))
+            })
+            .collect()
+    }
+
+    fn matches(&self, key: Option<&str>) -> bool {
+        self.iter().any(|k| Some(k) == key)
+    }
+}
+
+/// Resolve a directory within the graph prefix this command reads. Send only the
+/// digest of its raw key, including when an earlier per-run policy masked that key.
+fn import_project_keys(
+    conn: &Conn,
+    project: &Project,
+    policy: &redact::Policy,
+    prefix: Option<&str>,
+) -> Result<ProjectKeys, CmdError> {
+    let preferred = project.redacted_key(policy).into_owned();
+    let Some(prefix) = prefix else {
+        return Ok(ProjectKeys {
+            primary: preferred,
+            other: None,
+        });
+    };
+    let alias = project.redacted_alias();
+    let lit = sparkles_memory_import::quoted;
+    let q = format!(
+        "SELECT DISTINCT ?key WHERE {{ GRAPH ?g {{ ?g <{}> ?d ; <{MEM}project> ?p . ?p <{}> ?key \
+         FILTER NOT EXISTS {{ ?g <{PROV}invalidatedAtTime> ?t }} }} \
+         FILTER(STRSTARTS(STR(?g), {}) && (?key = {} || SHA256(STR(?key)) = {})) }}",
+        vocab::SPK_CONTENT_DIGEST,
+        vocab::RDFS_LABEL,
+        lit(prefix),
+        lit(&alias),
+        lit(alias.trim_start_matches("redacted-project."))
+    );
+    let rows = conn.select(&q)?.rows;
+    let has = |key: &str| {
+        rows.iter()
+            .any(|row| val(row, "key").as_deref() == Some(key))
+    };
+    let raw = has(&project.key);
+    let masked = has(&alias);
+    if preferred == alias || (masked && !raw) {
+        Ok(ProjectKeys {
+            primary: alias,
+            other: raw.then(|| project.key.clone()),
+        })
+    } else {
+        Ok(ProjectKeys {
+            primary: preferred,
+            other: masked.then_some(alias),
+        })
+    }
+}
+
+fn project_keys_of(
+    env: &Env,
+    conn: &Conn,
+    settings: &Value,
+    prefix: Option<&str>,
+    p: &str,
+) -> Result<ProjectKeys, CmdError> {
     let path = Path::new(p);
     if path.is_dir() {
-        Project::of(&sparkles_memory_import::project::absolute(path)).key
+        let policy = redaction_policy(env, settings, &ImportFlags::default())?;
+        import_project_keys(conn, &Project::of(path), &policy, prefix)
     } else {
-        p.to_string()
+        Ok(ProjectKeys {
+            primary: p.to_string(),
+            other: None,
+        })
     }
 }
 
@@ -1514,8 +1677,8 @@ fn structural_predicates() -> Vec<String> {
     v
 }
 
-fn base_of(conn: &Conn) -> Result<String, CmdError> {
-    conn.memory_settings()?["imports"]["base"]
+fn base_of(conn: &Conn, settings: &Value) -> Result<String, CmdError> {
+    settings["imports"]["base"]
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| {
@@ -1537,14 +1700,18 @@ fn sources(
     deleted: bool,
 ) -> Result<i32, CmdError> {
     let h = harness_filter(harness.as_deref())?;
-    let pk = project.as_deref().map(project_key_of);
     let conn = env.connect()?;
-    let base = base_of(&conn)?;
+    let settings = conn.memory_settings()?;
+    let base = base_of(&conn, &settings)?;
+    let pk = project
+        .as_deref()
+        .map(|p| project_keys_of(env, &conn, &settings, Some(&base), p))
+        .transpose()?;
     let all = list_all_sources(&conn, &base)?;
     let list: Vec<Value> = all
         .into_iter()
         .filter(|s| h.is_none_or(|h| s["harness"] == h.segment()))
-        .filter(|s| pk.as_ref().is_none_or(|k| s["project"] == k.as_str()))
+        .filter(|s| pk.as_ref().is_none_or(|k| k.matches(s["project"].as_str())))
         .filter(|s| !needs_extraction || s["needsExtraction"] == true)
         .filter(|s| !deleted || !s["deleted"].is_null())
         .collect();
@@ -1580,14 +1747,114 @@ fn sources(
     Ok(0)
 }
 
+/// Split a source or area under the selected principal and harness.
+fn status_graph_parts<'a>(
+    graph: &'a str,
+    prefix: &str,
+    h: Option<Harness>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let (harness, rest) = graph.strip_prefix(prefix)?.split_once('/')?;
+    let (project, tail) = rest.split_once('/')?;
+    h.is_none_or(|h| h.segment() == harness)
+        .then_some((harness, project, tail))
+}
+
+/// Match each stored source against the local scan of its project identity.
+fn status_files(
+    scan: &sparkles_memory_import::Scan,
+    harness: Option<Harness>,
+    listed: &std::collections::BTreeMap<String, sync::Listed>,
+    local_graph: impl Fn(&str) -> Option<String>,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (index, file) in scan.files.iter().enumerate() {
+        if harness.is_none_or(|h| h == file.harness) {
+            groups
+                .entry(file.graph.as_str())
+                .or_default()
+                .push((index, file));
+        }
+    }
+    let mut files = Vec::new();
+    let mut missing = Vec::new();
+    let mut reported = vec![false; scan.files.len()];
+    for (source, stored) in listed {
+        let Some(graph) = local_graph(source) else {
+            continue;
+        };
+        let group = groups
+            .get(graph.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let stored_path = stored
+            .file_path
+            .as_deref()
+            .filter(|p| !p.contains("[redacted:"));
+        let candidates: Vec<_> = group
+            .iter()
+            .filter(|(_, f)| {
+                stored_path.is_none_or(|p| match &f.local_path_digest {
+                    Some(digest) => *digest == sparkles_memory_import::ids::digest(p.as_bytes()),
+                    None => p == f.rel_path,
+                })
+            })
+            .collect();
+        if candidates.is_empty() {
+            // A project scan follows individual user imports, but never lists the whole user area.
+            let in_area = scan.areas.iter().any(|area| graph.starts_with(area));
+            if !in_area && group.is_empty() && !scan.refused_instruction_graphs.contains(&graph) {
+                continue;
+            }
+            if scan.absence_uncertain(&graph, stored_path) {
+                files.push(json!({"path": stored.file_path.as_deref().unwrap_or(source), "source": source, "status": "ambiguous"}));
+            } else if in_area {
+                missing.push(
+                    json!({"source": source, "path": stored.file_path, "deleted": stored.deleted}),
+                );
+            }
+            continue;
+        }
+        if stored.deleted {
+            continue;
+        }
+        let ambiguous = candidates.len() > 1
+            || stored_path.is_none_or(|p| {
+                scan.refused_local_path(&graph, p) || scan.hidden_path_collision(&graph, p)
+            });
+        for (index, file) in candidates {
+            let status = if ambiguous {
+                "ambiguous"
+            } else if stored.digest == sync::source_digest(file) {
+                "imported"
+            } else {
+                "changed"
+            };
+            files.push(json!({"path": file.path.display().to_string(), "source": source, "status": status}));
+            reported[*index] = true;
+        }
+    }
+    for (index, file) in groups.into_values().flatten() {
+        if !reported[index] {
+            files.push(json!({"path": file.path.display().to_string(), "source": file.graph, "status": "not-imported"}));
+        }
+    }
+    (files, missing)
+}
+
 fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Result<i32, CmdError> {
     let h = harness_filter(harness.as_deref())?;
     let project = project_of(project.as_deref())?;
     let conn = env.connect()?;
     let (ctx, settings) = context(&conn)?;
-    let ps = patterns(env, &settings, &ImportFlags::default())?;
+    let policy = redaction_policy(env, &settings, &ImportFlags::default())?;
+    let prefix = format!(
+        "{}{}/",
+        ctx.base,
+        sparkles_memory_import::ids::segment(&ctx.principal)
+    );
+    let keys = import_project_keys(&conn, &project, &policy, Some(&prefix))?;
     let roots = env.roots();
-    let scan = sparkles_memory_import::scan(&sparkles_memory_import::Request {
+    let req = sparkles_memory_import::Request {
         ctx: &ctx,
         roots: &roots,
         adapters: Adapter::ALL.to_vec(),
@@ -1595,43 +1862,34 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         user_scope: false,
         paths: Vec::new(),
         instructions_only: false,
-        patterns: &ps,
-    });
-    let files: Vec<_> = scan
-        .files
-        .iter()
-        .filter(|f| h.is_none_or(|h| f.harness == h))
-        .collect();
-    let prefix = format!(
-        "{}{}/",
-        ctx.base,
-        sparkles_memory_import::ids::segment(&ctx.principal)
-    );
+        patterns: &policy.patterns,
+    };
     let (listed, _) = sync::list_sources(&conn, &prefix)?;
-    let seg = project.segment();
-    let areas: Vec<String> = scan
-        .areas
-        .iter()
-        .filter(|a| a.contains(&format!("/{}/", sparkles_memory_import::ids::segment(&seg))))
-        .filter(|a| h.is_none_or(|h| a.contains(&format!("/{}/", h.segment()))))
-        .cloned()
-        .collect();
-    let mut on_disk = Vec::new();
-    for f in &files {
-        let st = match listed.get(&f.graph) {
-            Some(l) if !l.deleted && l.digest == f.digest => "imported",
-            Some(l) if !l.deleted => "changed",
-            _ => "not-imported",
-        };
-        on_disk
-            .push(json!({ "path": f.path.display().to_string(), "source": f.graph, "status": st }));
-    }
-    let mut missing = Vec::new();
-    for (g, l) in &listed {
-        if areas.iter().any(|a| g.starts_with(a.as_str())) && !files.iter().any(|f| &f.graph == g) {
-            missing.push(json!({ "source": g, "path": l.file_path, "deleted": l.deleted }));
+    let scan = sparkles_memory_import::scan_for_status(&req, &policy, keys.primary.clone());
+    let segments = keys.segments();
+    // Only the project segment of a source graph changes between the two identities.
+    let mut areas = Vec::new();
+    for area in &scan.areas {
+        if let Some((harness, project, tail)) = status_graph_parts(area, &prefix, h)
+            && project == segments[0]
+        {
+            areas.extend(
+                segments
+                    .iter()
+                    .map(|s| format!("{prefix}{harness}/{s}/{tail}")),
+            );
         }
     }
+    let (on_disk, missing) = status_files(&scan, h, &listed, |graph| {
+        let (harness, project, tail) = status_graph_parts(graph, &prefix, h)?;
+        if project == "user" {
+            return Some(graph.to_owned());
+        }
+        segments
+            .iter()
+            .any(|s| s == project)
+            .then(|| format!("{prefix}{harness}/{}/{tail}", segments[0]))
+    });
     // links to IRIs that no triple describes
     let lit = sparkles_memory_import::quoted;
     let mut unresolved = Vec::new();
@@ -1667,10 +1925,10 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         }
     }
     let (dir, key) = state_paths(&conn, &ctx.principal);
-    let cache = Cache::load(&dir.join(format!("{key}.json")));
+    let cache = Cache::load(&dir.join(format!("{key}.json")))?;
     let out = json!({
         "dataset": conn.dataset,
-        "project": project.key,
+        "project": keys.primary,
         "principal": ctx.principal,
         "files": on_disk,
         "sourcesWithoutFile": missing,
@@ -1681,7 +1939,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         "transcripts": transcript_status(env, &conn, &settings, &project, &roots, &prefix)?,
     });
     env.out(&out, || {
-        let mut t = format!("project {} ({})\n", project.key, ctx.principal);
+        let mut t = format!("project {} ({})\n", keys.primary, ctx.principal);
         for f in &on_disk {
             t.push_str(&format!(
                 "  {}: {}\n",
@@ -1783,7 +2041,7 @@ struct BriefArgs {
     write: Option<PathBuf>,
 }
 
-fn brief_request(b: &BriefArgs) -> Result<Value, CmdError> {
+fn brief_request(env: &Env, conn: &Conn, b: &BriefArgs) -> Result<Value, CmdError> {
     let mut a = json!({
         "includeUnreviewed": b.include_unreviewed,
         "maxChars": b.max_chars,
@@ -1797,11 +2055,25 @@ fn brief_request(b: &BriefArgs) -> Result<Value, CmdError> {
         a["scope"] = "session".into();
     } else {
         a["scope"] = "project".into();
-        let key = match &b.project_key {
-            Some(k) => k.clone(),
-            None => project_of(b.project.as_deref())?.key,
-        };
-        a["projectKey"] = key.into();
+        if let Some(key) = &b.project_key {
+            a["projectKey"] = key.clone().into();
+        } else {
+            let settings = conn.memory_settings()?;
+            let policy = redaction_policy(env, &settings, &ImportFlags::default())?;
+            let project = project_of(b.project.as_deref())?;
+            let keys = import_project_keys(
+                conn,
+                &project,
+                &policy,
+                settings["imports"]["base"].as_str(),
+            )?;
+            if keys.other.is_some() {
+                a["projectKey"] = project.redacted_alias().into();
+                a["includeProjectAliases"] = true.into();
+            } else {
+                a["projectKey"] = keys.primary.into();
+            }
+        }
     }
     if let Some(q) = &b.query {
         a["query"] = q.clone().into();
@@ -1823,8 +2095,8 @@ fn brief(env: &Env, b: BriefArgs) -> Result<i32, CmdError> {
             ),
         ));
     }
-    let a = brief_request(&b)?;
     let conn = env.connect()?;
+    let a = brief_request(env, &conn, &b)?;
     let j = conn.tool("memory/brief", &a)?;
     let text = j["text"].as_str().unwrap_or("").to_string();
     if let Some(w) = &b.write {
@@ -1857,8 +2129,8 @@ fn brief_hook(env: &Env, _harness: &str, mut b: BriefArgs) -> i32 {
     b.max_chars = b.max_chars.min(9500);
     b.write = None;
     let run = || -> Result<Value, CmdError> {
-        let a = brief_request(&b)?;
         let conn = env.connect()?;
+        let a = brief_request(env, &conn, &b)?;
         conn.tool("memory/brief", &a)
     };
     if let Ok(r) = run()
@@ -2121,14 +2393,18 @@ fn forget(
         ));
     }
     let conn = env.connect()?;
-    let base = base_of(&conn)?;
+    let settings = conn.memory_settings()?;
+    let base = base_of(&conn, &settings)?;
     let mut graphs: Vec<String> = sources.clone();
     if project.is_some() || h.is_some() || sessions {
-        let pk = project.as_deref().map(project_key_of);
+        let pk = project
+            .as_deref()
+            .map(|p| project_keys_of(env, &conn, &settings, Some(&base), p))
+            .transpose()?;
         for s in list_all_sources(&conn, &base)? {
             let g = s["source"].as_str().unwrap_or("").to_string();
             let ok = h.is_none_or(|h| s["harness"] == h.segment())
-                && pk.as_ref().is_none_or(|k| s["project"] == k.as_str())
+                && pk.as_ref().is_none_or(|k| k.matches(s["project"].as_str()))
                 && (!sessions || g.contains("/session"));
             if ok && !graphs.contains(&g) {
                 graphs.push(g);
@@ -2159,6 +2435,9 @@ fn forget(
             return Ok(0);
         }
     }
+    let (dir, key) = state_paths(&conn, &principal_of(&conn)?);
+    let cp = dir.join(format!("{key}.json"));
+    let mut cache = Cache::load(&cp)?;
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
     for g in &graphs {
@@ -2175,9 +2454,6 @@ fn forget(
             failed.push(json!({ "graph": g, "error": super::conn::err_json(&e) }));
         }
     }
-    let (dir, key) = state_paths(&conn, &principal_of(&conn)?);
-    let cp = dir.join(format!("{key}.json"));
-    let mut cache = Cache::load(&cp);
     cache.files.retain(|_, e| !deleted.contains(&e.graph));
     let _ = cache.save(&cp);
     let out = json!({ "deleted": deleted, "failed": failed });
@@ -2461,25 +2737,29 @@ fn item_id(graph: &str, f: &Value) -> String {
 }
 
 /// `GET /$/memory/{ds}/inbox`: the facts as items and the review branches, filtered.
-fn inbox_items(conn: &Conn, flt: &InboxFilter) -> Result<(Vec<Item>, Vec<Value>, Value), CmdError> {
+fn inbox_items(
+    env: &Env,
+    conn: &Conn,
+    flt: &InboxFilter,
+) -> Result<(Vec<Item>, Vec<Value>, Value), CmdError> {
     let j = conn.get_json(&format!(
         "/$/memory/{}/inbox?limit={}",
         enc(&conn.dataset),
         flt.limit.clamp(1, 500)
     ))?;
-    let base = conn.memory_settings()?["imports"]["base"]
-        .as_str()
-        .map(str::to_string);
+    let settings = conn.memory_settings()?;
+    let base = settings["imports"]["base"].as_str();
     let seg = |s: &str| format!("/{}/", sparkles_memory_import::ids::segment(s));
-    let project = flt.project.as_deref().map(|p| {
-        seg(&sparkles_memory_import::project::segment_of(
-            &project_key_of(p),
-        ))
-    });
+    let project = flt
+        .project
+        .as_deref()
+        .map(|p| project_keys_of(env, conn, &settings, base, p))
+        .transpose()?
+        .map(|keys| keys.segments());
     let mut items = Vec::new();
     for s in j["sessions"].as_array().into_iter().flatten() {
         let graph = strip_iri(s["graph"].as_str().unwrap_or(""));
-        let kind = if base.as_deref().is_some_and(|b| graph.starts_with(b)) {
+        let kind = if base.is_some_and(|b| graph.starts_with(b)) {
             "import"
         } else {
             "session"
@@ -2489,7 +2769,16 @@ fn inbox_items(conn: &Conn, flt: &InboxFilter) -> Result<(Vec<Item>, Vec<Value>,
                 .harness
                 .as_deref()
                 .is_some_and(|h| kind != "import" || !graph.contains(&seg(h)))
-            || project.as_deref().is_some_and(|p| !graph.contains(p))
+            || project.as_ref().is_some_and(|keys| {
+                if let Some(rest) = base.and_then(|b| graph.strip_prefix(b)) {
+                    let segment = rest.split('/').nth(2);
+                    !keys.iter().any(|k| Some(k.as_str()) == segment)
+                } else {
+                    !graph
+                        .split('/')
+                        .any(|segment| keys.iter().any(|k| k == segment))
+                }
+            })
         {
             continue;
         }
@@ -2603,7 +2892,7 @@ fn fact_refs(items: &[Item]) -> Value {
 
 fn inbox(env: &Env, flt: InboxFilter) -> Result<i32, CmdError> {
     let conn = env.connect()?;
-    let (items, branches, j) = inbox_items(&conn, &flt)?;
+    let (items, branches, j) = inbox_items(env, &conn, &flt)?;
     let out = json!({
         "dataset": conn.dataset,
         "facts": items.iter().map(item_json).collect::<Vec<_>>(),
@@ -2714,7 +3003,7 @@ fn promote(
         limit: 500,
         ..Default::default()
     };
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let mut chosen = resolve_items(&items, &ids)?;
     if all_that_pass {
         for it in &items {
@@ -2758,7 +3047,7 @@ fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, C
         limit: 500,
         ..Default::default()
     };
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let chosen = resolve_items(&items, &ids)?;
     let out = reject_items(&conn, &chosen, message.as_deref())?;
     env.out(&out, || format!("{} facts rejected", chosen.len()));
@@ -2771,7 +3060,7 @@ fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, C
 fn review(env: &Env, flt: InboxFilter, into: Option<String>) -> Result<i32, CmdError> {
     use std::io::BufRead;
     let conn = env.connect()?;
-    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let (items, _, _) = inbox_items(env, &conn, &flt)?;
     let mut promote: Vec<Item> = Vec::new();
     let mut reject: Vec<Item> = Vec::new();
     let stdin = std::io::stdin();
@@ -2958,15 +3247,18 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     }
     let h = harness_filter(a.harness.as_deref())?;
     let conn = env.connect()?;
-    let (ctx, _) = context(&conn)?;
+    let (ctx, settings) = context(&conn)?;
     let prefix = format!(
         "{}{}/",
         ctx.base,
         sparkles_memory_import::ids::segment(&ctx.principal)
     );
-    let key = match &a.project {
-        Some(p) => project_key_of(p),
-        None => project_of(None)?.key,
+    let keys = match &a.project {
+        Some(p) => project_keys_of(env, &conn, &settings, Some(&prefix), p)?,
+        None => {
+            let policy = redaction_policy(env, &settings, &ImportFlags::default())?;
+            import_project_keys(&conn, &project_of(None)?, &policy, Some(&prefix))?
+        }
     };
     let lit = sparkles_memory_import::quoted;
     let q = format!(
@@ -3016,7 +3308,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
             continue;
         }
         match val(r, "pk") {
-            Some(pk) if pk == key => {}
+            Some(pk) if keys.matches(Some(&pk)) => {}
             None if a.user_scope => {}
             _ => continue,
         }
@@ -3224,7 +3516,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     }
     let out = json!({
         "dataset": conn.dataset,
-        "project": key,
+        "project": keys.primary,
         "to": a.to,
         "out": a.out.display().to_string(),
         "files": written,
@@ -3296,5 +3588,34 @@ mod tests {
         assert!(is_instruction_file(Path::new("/p/.claude/rules/x.md")));
         assert!(!is_instruction_file(Path::new("/p/src/main.rs")));
         assert!(!is_instruction_file(Path::new("/p/README.md")));
+    }
+
+    #[test]
+    fn enable_ingest_matches_shared_fixture() {
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testsuite/settings/enable-ingest.json");
+        let text = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", fixture_path.display()));
+        let fixture: Value = serde_json::from_str(&text).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let got = plan_enable_ingest(&case["assistant"]);
+            assert_eq!(got, case["expectedPatch"], "case {name}: patch mismatch");
+            let mut eff = case["assistant"]["effective"].clone();
+            if let Some(m) = got.as_object() {
+                for (k, v) in m {
+                    eff[k] = v.clone();
+                }
+            }
+            let enabled =
+                eff["enabled"] == true && eff["ingest"] == true && eff["send"] == "documents";
+            assert_eq!(
+                enabled,
+                case["wouldEnable"].as_bool().unwrap(),
+                "case {name}: wouldEnable mismatch"
+            );
+        }
     }
 }

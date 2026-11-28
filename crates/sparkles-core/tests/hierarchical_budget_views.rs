@@ -299,6 +299,59 @@ fn query_and_view_cannot_overshoot_shared_pool_together() {
 }
 
 #[test]
+fn standalone_circuit_uses_its_pool_without_an_explicit_parent() {
+    use sparkles_core::incr::circuit::Circuit;
+    use sparkles_core::incr::compile::compile;
+    use sparkles_core::task::Control;
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "pooled", 2000, 32);
+    let query = sparql::parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }", None, &[]).unwrap();
+    let pool = QueryPool::new(4 * MB);
+
+    let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+    circuit.set_pool(Some(pool.clone()), None);
+    let occupied = pool.work_parent().reserve(pool.capacity() - KB).unwrap();
+    let err = circuit
+        .build(store.snapshot(), &Control::none())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory
+    ));
+    drop(circuit);
+    assert_eq!(pool.granted(), occupied.bytes());
+    drop(occupied);
+    assert_eq!(pool.granted(), 0);
+
+    let mut circuit = Circuit::new(compile(&query, None).unwrap(), None);
+    circuit.set_pool(Some(pool.clone()), None);
+    circuit.build(store.snapshot(), &Control::none()).unwrap();
+    assert!(pool.granted() > 0);
+    let occupied = pool
+        .work_parent()
+        .reserve(pool.capacity() - pool.granted())
+        .unwrap();
+    let error = circuit.encode(&store.snapshot()).unwrap_err();
+    assert!(matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory));
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(occupied);
+    let control = Control::none();
+    control.cancel.cancel();
+    assert!(matches!(
+        circuit.build(store.snapshot(), &control),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(
+        pool.granted(),
+        0,
+        "a cancelled build leaves the circuit alive"
+    );
+    drop(circuit);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
 fn window_and_path_views_enforce_pool_cap_mid_pass() {
     let store = Store::in_memory(StoreOptions::default());
     let mut nt = String::new();
@@ -658,12 +711,11 @@ fn reentrant_pool_waker_never_deadlocks_during_view_lifecycle() {
     let view_granted = pool.granted();
     assert!(view_granted > 0);
 
-    // QueryPool::enter rounds waiter requests up to GRANULE (4 MiB). Reserve
-    // `capacity - 4 MiB` so the 4 MiB waiter does not fit while the view holds credit,
-    // and wakes synchronously the instant the view releases its credit.
+    // One byte must be enough to make the queued grant eligible. This also
+    // exercises drops of individual publications while the cell still lives.
     let filler = pool
         .work_parent()
-        .reserve(pool.capacity() - 4 * MB)
+        .reserve(pool.capacity() - 4 * MB - view_granted + 1)
         .unwrap();
     let woke = Arc::new(AtomicUsize::new(0));
     let woke_cb = woke.clone();
@@ -706,7 +758,7 @@ fn reentrant_pool_waker_never_deadlocks_during_view_lifecycle() {
     assert!(g2 > 0);
     let filler2 = pool
         .work_parent()
-        .reserve(pool.capacity() - 4 * MB)
+        .reserve(pool.capacity() - 4 * MB - g2 + 1)
         .unwrap();
     let woke2 = Arc::new(AtomicUsize::new(0));
     let woke2_cb = woke2.clone();
@@ -948,6 +1000,8 @@ fn slot_history_evicts_under_pressure_and_active_state_takes_priority() {
     );
 
     rt.close(&store);
+    assert_eq!(pool.granted(), past_ok.lease.as_ref().unwrap().bytes());
+    drop(past_ok);
     assert_eq!(pool.granted(), 0);
 }
 
@@ -1117,33 +1171,45 @@ fn service_view_read_lazy_parent_and_unpooled_fallback_uses_runtime_pool() {
     let baseline = pool.granted();
     assert!(baseline > 0);
 
-    // 1. Ready-cache hit must NEVER invoke the lazy `memory_parent` supplier.
+    // A shared streaming open must not promote the requesting query's ledger.
+    // Decoding owned rows from that same version uses the reader's allowance.
     let snap = store.snapshot();
     let calls = AtomicUsize::new(0);
     let supplier = || {
         calls.fetch_add(1, Ordering::SeqCst);
         Ok(pool.work_parent())
     };
-    let rows = rt
-        .read(&ViewRead {
-            name: "v",
-            at: snap.commit,
-            snap: Some(&snap),
-            allow_stale: false,
-            caller: None,
-            deadline: None,
-            aggregate_errors: Some(AggregateErrors::Jena),
-            memory_parent: Some(&supplier),
-            memory_pool: Some(&pool),
-            max_memory_bytes: None,
-        })
+    let read = || ViewRead {
+        name: "v",
+        at: snap.commit,
+        snap: Some(&snap),
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+        aggregate_errors: Some(AggregateErrors::Jena),
+        memory_parent: Some(&supplier),
+        memory_pool: Some(&pool),
+        max_memory_bytes: None,
+    };
+    let opened = rt
+        .open_view(
+            &sparkles_core::sparql::viewsvc::ViewOpen { read: read() },
+            &|| Ok(()),
+            &mut |_| Ok(()),
+        )
         .unwrap();
+    assert!(matches!(
+        &opened,
+        sparkles_core::sparql::viewsvc::OpenedView::Shared(_)
+    ));
+    drop(opened);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let rows = rt.read(&read()).unwrap();
     assert_eq!(rows.rows.len(), 300);
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "Ready view read must not call memory_parent supplier or promote Ctx ledger"
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(pool.granted() > baseline);
+    drop(rows);
+    assert_eq!(pool.granted(), baseline);
 
     // 2. Fallback (`evaluate_under`) invokes the lazy supplier once and keeps its
     //    decoded rows leased until `rows2` drops.
@@ -1162,7 +1228,7 @@ fn service_view_read_lazy_parent_and_unpooled_fallback_uses_runtime_pool() {
         })
         .unwrap();
     assert_eq!(rows2.rows.len(), 300);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(
         pool.granted() > baseline,
         "fallback ViewRows must keep its decoded rows leased until dropped"
@@ -2369,4 +2435,255 @@ fn unpooled_streaming_rebuild_enforces_combined_outer_and_child_memory_limit() {
 
     rt.close(&store);
     assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn owned_and_published_view_rows_hold_distinct_credit() {
+    use sparkles_core::sparql::viewsvc::{OpenedView, ViewOpen, ViewRead, ViewRows, ViewSource};
+
+    #[derive(Debug)]
+    struct EagerViews(Arc<Runtime>);
+    impl ViewSource for EagerViews {
+        fn read_view(&self, read: &ViewRead<'_>) -> Result<ViewRows> {
+            self.0.read(read)
+        }
+    }
+
+    let store = Store::in_memory(StoreOptions::default());
+    load_rows(&store, "owned", 128, 64);
+    let pool = QueryPool::new(8 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    rt.put(
+        &store,
+        "items",
+        ViewDef::table("SELECT ?s ?o WHERE { ?s <urn:p> ?o }"),
+    )
+    .unwrap();
+    rt.round(&store);
+    let old = store.snapshot();
+    upd(&store, "INSERT DATA { <urn:later> <urn:p> <urn:later> }");
+    rt.round(&store);
+    let head = store.snapshot();
+    assert_eq!(rt.get(&store, "items").unwrap().state, ViewState::Current);
+
+    let read = |at| ViewRead {
+        name: "items",
+        at,
+        snap: None,
+        allow_stale: false,
+        caller: None,
+        deadline: None,
+        aggregate_errors: None,
+        memory_parent: None,
+        memory_pool: Some(&pool),
+        max_memory_bytes: None,
+    };
+    let baseline = pool.granted();
+    let sibling = pool
+        .work_parent()
+        .reserve(pool.capacity() - baseline)
+        .unwrap();
+    for at in [old.commit, head.commit] {
+        let error = rt
+            .read(&read(at))
+            .err()
+            .expect("owned read must be admitted");
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory),
+            "{error:?}"
+        );
+        assert_eq!(pool.granted(), pool.capacity());
+    }
+    let query = r#"PREFIX view: <urn:x-sparkles:view#>
+        SELECT ?s WHERE { SERVICE view:read { [] view:name "items" ; view:bind ?s . } }"#;
+    let outcome = sparql::query(
+        head.clone(),
+        query,
+        &QueryOptions {
+            views: Some(Arc::new(EagerViews(rt.clone()))),
+            no_cache: true,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory));
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(sibling);
+    assert_eq!(pool.granted(), baseline);
+    let older = rt.read(&read(old.commit)).unwrap();
+    assert_eq!(older.rows.len(), 128);
+    assert!(pool.granted() > baseline);
+    drop(older);
+    assert_eq!(pool.granted(), baseline);
+    let current = rt.read(&read(head.commit)).unwrap();
+    assert_eq!(current.rows.len(), 129);
+    assert!(pool.granted() > baseline);
+    drop(current);
+    assert_eq!(pool.granted(), baseline);
+
+    let version = rt
+        .open_view(
+            &ViewOpen {
+                read: read(head.commit),
+            },
+            &|| Ok(()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    let OpenedView::Shared(version) = version else {
+        panic!("a current view opens by reference");
+    };
+    rt.delete("items").unwrap();
+    assert!(pool.granted() > 0);
+    assert_eq!(version.table.len(), 129);
+    drop(version);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn refused_named_view_attachment_restores_the_live_only_circuit() {
+    use sparkles_core::sparql::viewsvc::{OpenedView, ViewOpen, ViewRead};
+    let store = Store::in_memory(StoreOptions::default());
+    // The duplicate row table must exceed the live allocator's spare granules.
+    load_rows(&store, "attach", 60_000, 16);
+    let pool = QueryPool::new(128 * MB);
+    let rt = Runtime::open_with_pool(
+        None,
+        store.dataset_id(),
+        RuntimeOptions::default(),
+        Some(pool.clone()),
+    );
+    rt.set_host(Arc::new(OpenHost));
+    let query = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let live = rt
+        .live(
+            &store,
+            query,
+            None,
+            &LiveOptions {
+                max_memory_bytes: Some(64 * MB),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let baseline = pool.granted();
+    let sibling = pool
+        .work_parent()
+        .reserve(pool.capacity() - baseline)
+        .unwrap();
+    let attachment = rt.put(&store, "items", ViewDef::table(query));
+    assert!(
+        matches!(
+            &attachment,
+            Err(Error::BudgetExceeded(budget)) if budget.kind == BudgetKind::ServerMemory
+        ),
+        "{attachment:?}"
+    );
+    assert!(rt.definitions().is_empty());
+    assert_eq!(pool.granted(), pool.capacity());
+    drop(sibling);
+
+    rt.put(&store, "items", ViewDef::table(query)).unwrap();
+    assert_eq!(rt.stats(&store).circuits, 1);
+    let open = ViewOpen {
+        read: ViewRead {
+            name: "items",
+            at: store.snapshot().commit,
+            snap: None,
+            allow_stale: false,
+            caller: None,
+            deadline: None,
+            aggregate_errors: None,
+            memory_parent: None,
+            memory_pool: None,
+            max_memory_bytes: None,
+        },
+    };
+    let OpenedView::Shared(version) = rt.open_view(&open, &|| Ok(()), &mut |_| Ok(())).unwrap()
+    else {
+        panic!("the ready circuit should publish its version");
+    };
+    rt.delete("items").unwrap();
+    drop(live);
+    rt.round(&store);
+    assert_eq!(rt.stats(&store).circuits, 0);
+    assert!(pool.granted() > 0);
+    drop(version);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn idle_runtime_checkpoints_return_named_and_internal_scratch() {
+    use std::sync::atomic::AtomicU64;
+
+    for internal in [false, true] {
+        let store = Store::in_memory(Default::default());
+        load_rows(&store, "checkpoint_scratch", 4_000, 256);
+        let root = tempfile::tempdir().unwrap();
+        let pool = QueryPool::new(64 * MB);
+        let runtime = Runtime::open_with_pool(
+            Some(root.path().to_path_buf()),
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        runtime.set_host(Arc::new(OpenHost));
+        let query = "SELECT DISTINCT ?s ?o WHERE { ?s <urn:p> ?o }";
+        let handle = if internal {
+            Some(
+                runtime
+                    .attach_internal(
+                        &store,
+                        InternalSpec::rows("items", query),
+                        InternalAccess::everything(),
+                    )
+                    .unwrap(),
+            )
+        } else {
+            runtime.put(&store, "items", ViewDef::table(query)).unwrap();
+            runtime.round(&store);
+            None
+        };
+        let before = pool.granted();
+        let peak = Arc::new(AtomicU64::new(0));
+        let stage = if internal {
+            "internal-checkpoint-written"
+        } else {
+            "view-checkpoint-written"
+        };
+        store.set_failpoint(
+            stage,
+            Some(Arc::new(|_| panic!("injected checkpoint unwind"))),
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.checkpoint(&store);
+        }));
+        assert!(caught.is_err());
+        assert!(pool.granted() <= before + sparkles_budget::LIVE_STEP);
+        store.set_failpoint(
+            stage,
+            Some(Arc::new({
+                let pool = pool.clone();
+                let peak = peak.clone();
+                move |_| peak.store(pool.granted(), Ordering::Relaxed)
+            })),
+        );
+        runtime.checkpoint(&store);
+        assert!(
+            peak.load(Ordering::Relaxed) > before + MB,
+            "checkpoint should use substantial scratch"
+        );
+        assert!(
+            pool.granted() <= before + sparkles_budget::LIVE_STEP,
+            "checkpoint retained scratch (internal={internal})"
+        );
+        store.set_failpoint(stage, None);
+        drop(handle);
+    }
 }

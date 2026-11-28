@@ -409,7 +409,7 @@ struct Norm<'a, 'b> {
 }
 
 /// The largest minimum that becomes that many existential restrictions.
-const MAX_MIN: u32 = 64;
+pub(super) const MAX_MIN: u32 = 64;
 
 /// Whether a class expression in a positive (`pos`) or negative position needs counting: a
 /// maximum above zero in a positive position or a minimum above one in a negative one, and

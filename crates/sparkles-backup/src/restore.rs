@@ -10,7 +10,7 @@
 use crate::blob::Hasher;
 use crate::error::Result;
 use crate::layout::blob_key;
-use crate::lock::{self};
+use crate::lock::{self, LockGuard};
 use crate::manifest;
 use crate::{
     BackupError, BackupVerify, Code, Ctl, Identity, LockKind, LockOperation, Manifest, Repository,
@@ -170,7 +170,7 @@ impl Repository {
         })?;
         let r = match lock::acquire(self, LockKind::Shared, op, &o.ctl).await {
             Ok(lock) => {
-                let r = self.restore_locked(name, tmp, o, t0).await;
+                let r = self.restore_locked(name, tmp, o, t0, &lock).await;
                 let _ = lock.release().await;
                 r
             }
@@ -189,12 +189,13 @@ impl Repository {
         tmp: &Path,
         o: &RestoreOptions,
         t0: Instant,
+        lock: &LockGuard,
     ) -> std::result::Result<RestoreReport, Failure> {
         let security = self.security().await?;
         let (m, _, _) = manifest::fetch_with_security(self, name, None, &security).await?;
-        manifest::validate(
+        manifest::validate_for_repo(
             &m,
-            self.marker.piece_bytes,
+            &self.marker,
             sparkles_core::formats::READABLE_INDEX_FORMATS,
         )?;
         // definitions of an unknown kind that are not required are left out
@@ -208,7 +209,7 @@ impl Repository {
             &format!("restoring {name}"),
         )?;
         o.ctl.report(0.02, "downloading");
-        self.download(&m, tmp, &o.ctl, &security).await?;
+        self.download(&m, tmp, &o.ctl, &security, lock).await?;
         o.ctl.check()?;
 
         let source = ForkedFrom {
@@ -333,6 +334,7 @@ impl Repository {
             )
             .into());
         }
+        lock.check_live().await?;
         o.ctl.report(1.0, "restored");
         Ok(RestoreReport {
             backup: m.summary(&self.config.name),
@@ -354,6 +356,7 @@ impl Repository {
         dir: &Path,
         ctl: &Ctl,
         security: &crate::security::Security,
+        lock: &LockGuard,
     ) -> std::result::Result<(), Failure> {
         // Every path was validated against its closed root, generation, history
         // or definition grammar before this unpublished directory is populated.
@@ -396,8 +399,11 @@ impl Repository {
                 off += b.size;
             }
         }
-        futures::stream::iter(jobs)
-            .map(|(i, id, size, off, path)| {
+        let concurrency = self.config.concurrency();
+        let downloaded = lock
+            .read_batches(jobs, concurrency, ctl)
+            .err_into::<Failure>()
+            .map_ok(|(i, id, size, off, path)| {
                 let (files, done) = (files.clone(), done.clone());
                 async move {
                     let plain = self.fetch_blob(&id, size, &path, ctl, security).await?;
@@ -412,9 +418,12 @@ impl Repository {
                     Ok::<(), Failure>(())
                 }
             })
-            .buffer_unordered(self.config.concurrency())
+            .try_buffer_unordered(concurrency)
             .try_collect::<()>()
-            .await?;
+            .await;
+        ctl.check()?;
+        lock.check_live().await?;
+        downloaded?;
 
         let (m, dir) = (m.clone(), dir.to_path_buf());
         blocking(move || {
@@ -501,7 +510,7 @@ impl Repository {
 
     /// Download blob `id` of `size` plaintext bytes (of the file `path`) and check it,
     /// fetching it again up to [`BLOB_RETRIES`] times when it does not verify.
-    async fn fetch_blob(
+    pub(crate) async fn fetch_blob(
         &self,
         id: &str,
         size: u64,
@@ -531,7 +540,10 @@ impl Repository {
                 Err(e) => return Err(BackupError::from(e).into()),
             };
             let result = if got.meta.size > cap {
-                Err(format!("stored size {} is too large", got.meta.size))
+                Err(BackupError::internal(format!(
+                    "stored size {} is too large",
+                    got.meta.size
+                )))
             } else {
                 let mut stream = got.into_stream();
                 let mut buf = Vec::with_capacity(size.min(cap) as usize);
@@ -551,13 +563,16 @@ impl Repository {
                     }
                 }
                 if too_big {
-                    Err("stored size is too large".to_string())
+                    Err(BackupError::internal("stored size is too large"))
                 } else {
-                    security.decode(&buf, id, size).map_err(|e| e.to_string())
+                    security.decode(&buf, id, size)
                 }
             };
             match result {
                 Ok(plain) => return Ok(plain),
+                Err(error) if error.code() == Code::IncompatibleFormat => {
+                    return Err(error.with("blob", id).with("path", path).into());
+                }
                 Err(why) if attempt < BLOB_RETRIES => {
                     attempt += 1;
                     tracing::warn!(

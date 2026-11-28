@@ -170,10 +170,22 @@ async fn branch_path_rewrite_refusals_of_kept_reads_are_never_cached() {
         assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
         assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
     }
+    // an empty branch in the selector also returns no-store on kept routes
+    for uri in [
+        "/$@/ontology/ont/axioms?classification=kept",
+        "/$@/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&classification=kept",
+        "/$@/ontology/ont/classification",
+    ] {
+        let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());
+        assert_eq!(r.json()["code"], "invalid-branch", "{uri}");
+        assert_eq!(r.headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
     // an asserted read through the alias keeps its existing caching
     for uri in [
         "/$@main/ontology/ont/axioms?branch=other",
         "/$@main/ontology/ont/entity?iri=http%3A%2F%2Fex%2FA&branch=other",
+        "/$@/ontology/ont/axioms",
     ] {
         let r = as_user(&app, "oread", "GET", uri, &json!(null)).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.text());

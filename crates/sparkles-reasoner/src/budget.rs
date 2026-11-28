@@ -25,6 +25,7 @@
 
 use parking_lot::Mutex;
 use sparkles_budget::{DomainId, MemoryLease, ParentHandle, ParentRefused, Scope};
+use sparkles_core::sparql::pool::{QueryPool, ReleaseWakes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -178,7 +179,32 @@ struct Backing {
     domain: DomainId,
     reserved: AtomicUsize,
     lease: Mutex<MemoryLease>,
+    /// The release-wake deferral open where the run began. A rayon worker does not
+    /// inherit the root thread's deferral, so every parent release goes through it,
+    /// whichever thread runs it. Query wake callbacks then wait for the run's scope
+    /// to leave its writer lock and permit. A [retained](Budget::retained) budget has
+    /// none and defers into the releasing thread's deferral.
+    wakes: Option<ReleaseWakes>,
 }
+
+impl Backing {
+    fn release(wakes: Option<&ReleaseWakes>, retired: impl Sized) {
+        match wakes {
+            Some(wakes) => wakes.run(move || drop(retired)),
+            None => drop(retired),
+        }
+    }
+}
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        if let Some(backing) = self.parent.take() {
+            let wakes = backing.wakes.clone();
+            Backing::release(wakes.as_ref(), backing);
+        }
+    }
+}
+
 const PARENT_STEP: usize = 64 << 10;
 const PARENT_SLACK: usize = 1 << 20;
 
@@ -199,6 +225,21 @@ impl Budget {
     }
 
     pub fn with_parent(limit: Option<usize>, parent: Option<ParentHandle>) -> Arc<Budget> {
+        Self::backed(limit, parent, QueryPool::capture_release_wakes)
+    }
+
+    /// A budget that outlives the run creating it, such as a cache's. Another run can
+    /// release it while the creating run is still open or after it closes, so its
+    /// releases defer into the deferral of the thread that releases them.
+    pub fn retained(limit: Option<usize>, parent: Option<ParentHandle>) -> Arc<Budget> {
+        Self::backed(limit, parent, || None)
+    }
+
+    fn backed(
+        limit: Option<usize>,
+        parent: Option<ParentHandle>,
+        wakes: impl FnOnce() -> Option<ReleaseWakes>,
+    ) -> Arc<Budget> {
         Arc::new(Budget {
             limit: limit.unwrap_or(usize::MAX),
             step: limit.map_or(MAX_STEP, |l| (l >> STEP_SHIFT).min(MAX_STEP)),
@@ -210,6 +251,7 @@ impl Budget {
                 // a backend and cannot refuse or allocate reservation credit.
                 lease: Mutex::new(parent.reserve(0).expect("zero reservation")),
                 reserved: AtomicUsize::new(0),
+                wakes: wakes(),
                 parent,
             }),
         })
@@ -230,6 +272,27 @@ impl Budget {
     pub fn parent(&self) -> Option<ParentHandle> {
         self.parent.as_ref().map(|p| p.parent.clone())
     }
+    /// Back a query's checked preparation by this run's live allowance. Its ledger
+    /// has no independent grant, so the preparation belongs to the unpooled domain.
+    pub fn query_parent(self: &Arc<Self>) -> ParentHandle {
+        let take = self.clone();
+        let give = self.clone();
+        sparkles_budget::MemoryDomain::unpooled().parent(
+            move |bytes| {
+                take.try_charge(usize::try_from(bytes).map_err(|_| ParentRefused::Overflow)?)
+                    .map_err(|err| match err {
+                        BudgetFailure::Local(err) => ParentRefused::Limit {
+                            limit: err.limit as u64,
+                            requested: (take.used() as u64).saturating_add(bytes),
+                            scope: Scope::Local,
+                        },
+                        BudgetFailure::Parent { refusal, .. } => refusal,
+                    })
+            },
+            move |bytes| give.release(bytes as usize),
+        )
+    }
+
     pub fn domain(&self) -> DomainId {
         self.parent.as_ref().map_or_else(
             || sparkles_budget::MemoryDomain::unpooled().id(),
@@ -356,7 +419,7 @@ impl Budget {
             .split(u64::try_from(cur - final_keep).expect("backed credit fits u64"))
             .expect("split only owned parent credit");
         drop(lease);
-        drop(retired);
+        Backing::release(parent.wakes.as_ref(), retired);
     }
     pub fn check(&self) -> Result<(), BudgetFailure> {
         if self.used() > self.limit {
@@ -369,6 +432,61 @@ impl Budget {
             return Err(self.exceeded());
         }
         Ok(())
+    }
+}
+
+/// Work that the facade prepares before commit and may retain after the run.
+pub struct PreparationMemory<'a> {
+    budget: &'a Budget,
+    detached: usize,
+}
+
+impl<'a> PreparationMemory<'a> {
+    pub(crate) fn new(budget: &'a Budget) -> Self {
+        Self {
+            budget,
+            detached: 0,
+        }
+    }
+
+    /// Charge the live request before allocation. Split the exact parent bytes
+    /// so the result can outlive the run without retaining its remaining grant.
+    pub fn reserve(&mut self, bytes: usize) -> Result<Option<MemoryLease>, ParentRefused> {
+        self.budget
+            .try_charge(bytes)
+            .map_err(|failure| match failure {
+                BudgetFailure::Local(error) => ParentRefused::Limit {
+                    limit: error.limit as u64,
+                    requested: (self.budget.used() as u64).saturating_add(bytes as u64),
+                    scope: Scope::Local,
+                },
+                BudgetFailure::Parent { refusal, .. } => refusal,
+            })?;
+        self.detached += bytes;
+        Ok(self.budget.parent.as_ref().map(|backing| {
+            backing
+                .lease
+                .lock()
+                .split(bytes as u64)
+                .expect("admitted preparation")
+        }))
+    }
+}
+
+impl Drop for PreparationMemory<'_> {
+    fn drop(&mut self) {
+        if self.detached == 0 {
+            return;
+        }
+        // Until the report is complete, used and reserved include the exact
+        // leases handed to the facade. The remaining backing covers the rest.
+        if let Some(backing) = &self.budget.parent {
+            let _guard = backing.lease.lock();
+            backing.reserved.fetch_sub(self.detached, Ordering::SeqCst);
+            self.budget.used.fetch_sub(self.detached, Ordering::SeqCst);
+        } else {
+            self.budget.release(self.detached);
+        }
     }
 }
 
@@ -440,6 +558,27 @@ impl Held {
     pub fn into_bytes(mut self) -> usize {
         self.budget.release(std::mem::take(&mut self.credit));
         std::mem::take(&mut self.bytes)
+    }
+
+    /// Finish a private budget once its work is gone. Detach only the credit
+    /// for the published payload and return the remaining parent reservation.
+    pub fn into_parent_lease(mut self, bytes: usize) -> Option<MemoryLease> {
+        assert!(bytes <= self.bytes);
+        let budget = Arc::get_mut(&mut self.budget).expect("exclusive finishing budget");
+        debug_assert_eq!(budget.used(), self.bytes + self.credit);
+        self.bytes = 0;
+        self.credit = 0;
+        let backing = budget.parent.take()?;
+        let wakes = backing.wakes.clone();
+        let mut lease = backing.lease.into_inner();
+        let published = (bytes != 0).then(|| {
+            lease
+                .split(u64::try_from(bytes).expect("backed credit fits u64"))
+                .expect("published bytes are already backed")
+        });
+        // the remaining reservation goes back through the run's deferral
+        Backing::release(wakes.as_ref(), (lease, backing.parent));
+        published
     }
 
     pub fn bytes(&self) -> usize {

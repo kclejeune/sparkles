@@ -512,7 +512,7 @@ fn class_support(
     )?;
     let copy = dataset
         .store()
-        .copy_view_to_memory(
+        .copy_view_to_memory_with_parent(
             &view,
             crate::store::StoreOptions {
                 max_memory_bytes: options
@@ -523,6 +523,7 @@ fn class_support(
                 ..Default::default()
             },
             &control.write_options(),
+            pool.as_ref().map(|p| p.work_parent()),
             |quad| Ok(graphs.contains(&quad[3])),
         )
         .map_err(|error| control.error(error))?;
@@ -1098,7 +1099,7 @@ pub fn diagnose(
                 .or_else(|| state.pool.as_ref().map(|p| p.work_parent())),
         },
     )
-    .map_err(|error| control.error(error))?;
+    .map_err(|error| control.error(analysis::share_error(error)))?;
     let program = if options.inferences && (analysis.program.is_some() || record.is_some()) {
         analysis::program(dataset, &analysis)?
     } else {

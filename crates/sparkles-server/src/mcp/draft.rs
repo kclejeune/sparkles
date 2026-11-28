@@ -111,7 +111,7 @@ impl Tools<'_> {
                 graph,
                 inferred_graph: Some(INFERRED_GRAPH.to_string()),
                 // drafts leave inferences out unless asked, as write-time validation does
-                include_inferred: a.reasoning == Some(true) && ds.reasoning.read().is_some(),
+                include_inferred: a.reasoning == Some(true) && ds.read_reasoning().is_some(),
                 deadline: Some(self.call.arrived + timeout),
                 cancel: Some(self.call.cancel.clone()),
                 max_entries: self.server.state.schema_max_entries,

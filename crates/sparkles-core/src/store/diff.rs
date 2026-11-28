@@ -243,13 +243,19 @@ fn graph_id(g: &Generation, name: &GraphName) -> Option<Id> {
 /// Turns one generation's ids into vocabulary keys, remembering the ones it has seen.
 pub(super) struct Keys<'a> {
     generation: &'a Generation,
+    admission: Option<DiffAdmission<'a>>,
     seen: FxHashMap<Id, Arc<[u8]>>,
 }
 
 impl<'a> Keys<'a> {
     pub(super) fn new(generation: &'a Generation) -> Keys<'a> {
-        Keys {
+        Self::with_admission(generation, None)
+    }
+
+    fn with_admission(generation: &'a Generation, admission: Option<DiffAdmission<'a>>) -> Self {
+        Self {
             generation,
+            admission,
             seen: FxHashMap::default(),
         }
     }
@@ -259,15 +265,34 @@ impl<'a> Keys<'a> {
             return Ok(k.clone());
         }
         let g = self.generation;
-        let key: Vec<u8> = match id.tag() {
-            Tag::Vocab => g.vocab.get(id.payload()).ok_or_else(|| dangling(id))?,
-            Tag::Delta => g.dvocab.get(id.payload()).ok_or_else(|| dangling(id))?,
-            Tag::BNode => {
+        if let Some(admit) = self.admission {
+            admit(160)?;
+        }
+        let key: Vec<u8> = match (id.tag(), self.admission) {
+            (Tag::Vocab, Some(admit)) => g
+                .vocab
+                .get_with_checked(
+                    id.payload(),
+                    |scratch| admit(scratch as u64),
+                    |key| {
+                        admit(key.len() as u64 * 2)?;
+                        Ok::<_, Error>(key.to_vec())
+                    },
+                )?
+                .ok_or_else(|| dangling(id))??,
+            (Tag::Delta, Some(admit)) => g.dvocab.with(|v| {
+                let key = v.get(id.payload()).ok_or_else(|| dangling(id))?;
+                admit(key.len() as u64 * 2)?;
+                Ok::<_, Error>(key.to_vec())
+            })?,
+            (Tag::Vocab, None) => g.vocab.get(id.payload()).ok_or_else(|| dangling(id))?,
+            (Tag::Delta, None) => g.dvocab.get(id.payload()).ok_or_else(|| dangling(id))?,
+            (Tag::BNode, _) => {
                 let mut k = vec![b'_'];
                 k.extend_from_slice(&id.payload().to_be_bytes());
                 k
             }
-            Tag::Special if id == Id::DEFAULT_GRAPH => Vec::new(),
+            (Tag::Special, _) if id == Id::DEFAULT_GRAPH => Vec::new(),
             _ => {
                 let l = crate::id::inline_to_literal(id).ok_or_else(|| dangling(id))?;
                 let mut k = Vec::new();
@@ -300,7 +325,10 @@ fn dangling(id: Id) -> Error {
 }
 
 /// The net changes found so far: each effective change toggles its quad.
+type DiffAdmission<'a> = &'a dyn Fn(u64) -> Result<()>;
+
 struct Net<'o> {
+    admission: Option<DiffAdmission<'o>>,
     map: FxHashMap<QuadKey, bool>,
     opts: &'o DiffOptions,
     /// whether each graph (by key) is readable, under `opts.graphs`
@@ -354,6 +382,10 @@ pub(crate) fn visible_key(
 }
 
 impl Net<'_> {
+    fn grow(&self, bytes: usize) -> Result<()> {
+        self.admission.map_or(Ok(()), |admit| admit(bytes as u64))
+    }
+
     fn toggle(&mut self, k: QuadKey, added: bool) -> Result<()> {
         if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_everything())
             && !visible_key(a, &mut self.readable, &k)
@@ -365,6 +397,9 @@ impl Net<'_> {
             && !t.contains(&*k[3])
         {
             return Ok(());
+        }
+        if self.admission.is_some() && !self.map.contains_key(&k) {
+            self.grow(256 + k.iter().map(|key| key.len()).sum::<usize>())?;
         }
         match self.map.entry(k) {
             Entry::Occupied(e) => {
@@ -517,8 +552,8 @@ fn compare_states(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
             prefix_b = Vec::new();
         }
     }
-    let mut keys_a = Keys::new(ga);
-    let mut keys_b = Keys::new(gb);
+    let mut keys_a = Keys::with_admission(ga, net.admission);
+    let mut keys_b = Keys::with_admission(gb, net.admission);
     // a's quads in b's ids, as GSPO keys; quads with a term b does not know are removed
     let mut map: FxHashMap<Id, Option<Id>> = FxHashMap::default();
     let mut sorted: Vec<Key> = Vec::new();
@@ -527,6 +562,7 @@ fn compare_states(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
     let mut err: Option<Error> = None;
     a.scan(Perm::Gspo, &prefix_a, |c| {
         let mut visit = |k: &Key| -> Result<()> {
+            net.grow(256)?;
             read += 1;
             if read & 0xFFFF == 0 {
                 opts.check()?;
@@ -539,8 +575,12 @@ fn compare_states(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
                     let m = match map.get(&id) {
                         Some(m) => *m,
                         None => {
-                            let key = a.key(id).ok_or_else(|| dangling(id))?;
-                            let m = b.lookup_key(&key);
+                            let m = if net.admission.is_some() {
+                                b.lookup_key(&keys_a.key(id)?)
+                            } else {
+                                let key = a.key(id).ok_or_else(|| dangling(id))?;
+                                b.lookup_key(&key)
+                            };
                             if map.len() >= 1 << 22 {
                                 map.clear();
                             }
@@ -636,6 +676,7 @@ pub(super) fn compare_changes(
     o: &DiffOptions,
 ) -> Result<Vec<(DiffOp, Quad)>> {
     let mut net = Net {
+        admission: None,
         map: FxHashMap::default(),
         opts: o,
         readable: FxHashMap::default(),
@@ -663,7 +704,7 @@ fn compare_deltas(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
         },
         None => None,
     };
-    let mut keys = Keys::new(&a.generation);
+    let mut keys = Keys::with_admission(&a.generation, net.admission);
     let mut seen: rustc_hash::FxHashSet<Key> = Default::default();
     let mut read = 0u64;
     let sets = [
@@ -675,9 +716,11 @@ fn compare_deltas(a: &Snapshot, b: &Snapshot, net: &mut Net<'_>) -> Result<u64> 
     for set in sets {
         for k in set.iter() {
             read += 1;
-            if !seen.insert(*k) {
+            if seen.contains(k) {
                 continue;
             }
+            net.grow(128)?;
+            seen.insert(*k);
             let q = Perm::Spo.to_quad(k);
             if gid.is_some_and(|g| q[3] != g) {
                 continue;
@@ -758,6 +801,7 @@ impl Store {
             ..to.clone()
         };
         let mut net = Net {
+            admission: None,
             map: FxHashMap::default(),
             opts: o,
             readable: FxHashMap::default(),
@@ -789,12 +833,24 @@ impl Store {
     /// between the two commits; across a bulk commit, a gap in the retained history, or
     /// in an in-memory store it compares the two states.
     pub fn diff(&self, from: &At, to: &At, o: &DiffOptions) -> Result<Diff> {
+        self.diff_with_admission(from, to, o, None)
+    }
+
+    /// Run a diff with a caller that admits the staging it keeps alive.
+    pub fn diff_with_admission(
+        &self,
+        from: &At,
+        to: &At,
+        o: &DiffOptions,
+        admission: Option<DiffAdmission<'_>>,
+    ) -> Result<Diff> {
         let head = self.head_commit();
         let rf = self.resolve_with(from, head)?;
         let rt = self.resolve_with(to, head)?;
         let (a, b) = (rf.commit.seq, rt.commit.seq);
         let (lo, hi) = (a.min(b), a.max(b));
         let mut net = Net {
+            admission,
             map: FxHashMap::default(),
             opts: o,
             readable: FxHashMap::default(),
@@ -924,6 +980,34 @@ impl Store {
         graphs: &[Id],
         o: &DiffOptions,
     ) -> Result<Option<Vec<IdChange>>> {
+        self.changed_ids_with_admission(after, to, graphs, o, None)
+    }
+
+    /// Read changed IDs while the caller admits the log staging.
+    pub fn changed_ids_with_admission(
+        &self,
+        after: u64,
+        to: &Snapshot,
+        graphs: &[Id],
+        o: &DiffOptions,
+        admission: Option<DiffAdmission<'_>>,
+    ) -> Result<Option<Vec<IdChange>>> {
+        self.changed_ids_metered(after, to, graphs, o, admission, &|_| {})
+    }
+
+    /// Read changed IDs with admission for simultaneous allocations and return
+    /// temporary table credit as each backing is freed. The caller owns the
+    /// remaining vector credit and releases it on error or after consuming the result.
+    #[doc(hidden)]
+    pub fn changed_ids_metered(
+        &self,
+        after: u64,
+        to: &Snapshot,
+        graphs: &[Id],
+        o: &DiffOptions,
+        admission: Option<DiffAdmission<'_>>,
+        release: &dyn Fn(u64),
+    ) -> Result<Option<Vec<IdChange>>> {
         if self.history.is_none() || after > to.commit {
             return Ok(None);
         }
@@ -957,26 +1041,50 @@ impl Store {
         if !Arc::ptr_eq(&generation, &to.generation) {
             return Ok(None);
         }
-        let mut net: FxHashMap<[Id; 4], bool> = FxHashMap::default();
+        let mut net: hashbrown::HashMap<[Id; 4], bool, rustc_hash::FxBuildHasher> =
+            hashbrown::HashMap::default();
+        let mut table_bytes = 0;
+        let mut table_capacity = 0;
         walk_wal(&mut cursor, after, to.commit, o, &mut |op, q| {
-            if !graphs.contains(&q[3]) {
+            if !graphs.contains(&q[3]) || net.remove(&q).is_some() {
                 return Ok(());
             }
-            match net.entry(q) {
-                Entry::Occupied(e) => {
-                    e.remove();
+            if let Some(admit) = admission
+                && net.len() == net.capacity()
+            {
+                use sparkles_budget::sizes::{table_bytes_for, table_grown};
+                // Hashbrown reports live entries plus remaining insertion growth.
+                // Keep the full backing capacity separately because deletes can
+                // leave tombstones and reduce the reported capacity.
+                let wanted = net.len() + 1;
+                // Hashbrown clears tombstones in place when the live entries plus
+                // this insert fit in half the allocated table.
+                if wanted <= table_capacity / 2 {
+                    net.reserve(1);
+                } else {
+                    let capacity = table_grown(table_capacity, table_capacity, 1);
+                    let needed = table_bytes_for::<IdChange>(capacity);
+                    admit(needed as u64)?;
+                    net.reserve(1);
+                    debug_assert_eq!(net.capacity(), capacity);
+                    release(table_bytes as u64);
+                    table_capacity = capacity;
+                    table_bytes = needed;
                 }
-                Entry::Vacant(e) => {
-                    e.insert(op == WAL_INSERT);
-                    if net.len() & 0xFFFF == 0 {
-                        o.over(net.len() as u64)?;
-                    }
-                }
+            }
+            net.insert(q, op == WAL_INSERT);
+            if net.len() & 0xFFFF == 0 {
+                o.over(net.len() as u64)?;
             }
             Ok(())
         })?;
         o.over(net.len() as u64)?;
-        let mut changes: Vec<IdChange> = net.into_iter().collect();
+        if let Some(admit) = admission {
+            admit((net.len() as u64).saturating_mul(size_of::<IdChange>() as u64))?;
+        }
+        let mut changes = Vec::with_capacity(net.len());
+        changes.extend(net);
+        release(table_bytes as u64);
         changes.sort_unstable_by_key(|(q, added)| (*added, [q[3].0, q[0].0, q[1].0, q[2].0]));
         Ok(Some(changes))
     }
@@ -1040,6 +1148,7 @@ impl Store {
             &mut check,
             None,
             &mut |_, add, k| {
+                net.grow(160 + k.iter().map(|key| key.len()).sum::<usize>())?;
                 found.push((k.clone(), add));
                 if found.len() & 0xFFFF == 0 {
                     o.over(found.len() as u64)?;
@@ -1176,6 +1285,9 @@ impl Store {
                 return Ok(());
             }
             let added = op == WAL_INSERT;
+            if net.admission.is_some() && !local.contains_key(&q) {
+                net.grow(160)?;
+            }
             match local.entry(q) {
                 Entry::Occupied(e) => {
                     e.remove();
@@ -1189,7 +1301,7 @@ impl Store {
             }
             Ok(())
         })?;
-        let mut keys = Keys::new(&generation);
+        let mut keys = Keys::with_admission(&generation, net.admission);
         for (q, added) in local {
             net.toggle(keys.quad(&q)?, added)?;
         }

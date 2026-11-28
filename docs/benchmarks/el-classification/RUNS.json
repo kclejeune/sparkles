@@ -160,7 +160,7 @@
      },
      "ended": "2026-11-02T20:50:54Z",
      "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224\u2026, pins.tsv sha256 4d470f93\u2026), Temurin 17.0.20+8",
      "started": "2026-11-02T17:11:55Z"
     },
     "settings": {
@@ -262,7 +262,7 @@
      "binary": "crates/sparkles-owl/examples/el_classify.rs",
      "binary_sha256": "21ea154f772d48d70c60026e67bd5c8db20845f73d3cb3ee9472634efc7c7c06",
      "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on wally, copied to the benchmark host",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d…, pins.tsv sha256 4d470f93…), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d\u2026, pins.tsv sha256 4d470f93\u2026), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
      "data": {
       "chebi_lite": {
        "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
@@ -1601,6 +1601,115 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 1269 on forge: nine rounds of the base, the allocation-free profile check and the tip on ore_ont_13482, GO and ChEBI lite on one and four threads, the separate atlas rounds with the layout probe, the laptop's instruction counts and stage probe, and the taxonomy and exclusion sweep."
+  },
+  {
+   "run_id": "sha256-b8c1354645d8d6d2096e590b944adfa2065e47bd09c7b21479319a28f038fb5b",
+   "path": "runs/2026-11-28-rooted-atmost-boat/record.json",
+   "sha256": "b8c1354645d8d6d2096e590b944adfa2065e47bd09c7b21479319a28f038fb5b",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "rooted-atmost-agreement",
+    "scale": "3,000 generated at-most and 3,000 qualified at-most inputs",
+    "manifest": null,
+    "settings": null,
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": "Boat bx_9cw43z44",
+     "source": {
+      "base": "05e2278eda08247c44a01f37fa6048ac7ba3597e",
+      "base_binary_sha256": "e8420ab0299f8003323a81fc46be1609b6bd9d07d14025f06d745b67d08dad91",
+      "repair_binary_sha256": "de54eb9b1ec04a4cccc050aafc2499837dd881bfee2e3707bca1b0a7f406e3ab",
+      "repair_sources_sha256": {
+       "crates/sparkles-owl/src/classify/dl_root.rs": "60c4fc3298ce61d53d1c01271f199a2ae5100a7c132883d9f125db7e9660a92f",
+       "crates/sparkles-owl/src/classify/dl_root/count.rs": "2b17317fe413744a73ff308ded246c71446e99815dc504c2e994133da18a6fd0",
+       "crates/sparkles-owl/src/classify/dl_rules.rs": "cf0eef4c6c9f05b705721fc09d77763e71507d84f7844e41bde8b8b0c5e5eced"
+      }
+     },
+     "method": "Rust 1.99.1, Mr. Boxington 1.29.1, mbx build --release -j 1 -p sparkles-owl --example el_classify. Ran el_classify with --rooted --counting, default bounds, cautious and eager expansion on one and four threads. HermiT 1.4.5.519 checked consistency, unsatisfiable named classes and the named subsumption closure. The clean base and repaired example ran on the same worker against the same HermiT references. No timings were compared."
+    }
+   },
+   "metadata_note": "Generated rooted-counting agreement and inference counters on the two at-most sets."
+  },
+  {
+   "run_id": "sha256-2a3f2f009173fb1e09c0963b29dd75e8e9c28acb2aab87c029c2b622b7c46b43",
+   "path": "runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json",
+   "sha256": "2a3f2f009173fb1e09c0963b29dd75e8e9c28acb2aab87c029c2b622b7c46b43",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "33 generated DL corpus sets (18,916 input files, 18,870 usable HermiT 1.4.5 references, 36,360 usable rows across 1c and 4e) plus separate 4-worker --no-dl-steps correctness runs on 6 sets and Classifier runs on 9 sets",
+    "manifest": {
+     "arms": {
+      "flip-def": "new default (rooted_marker_repair=true mode 129, rooted_decline=false) on patched flip build; retained output dir out/flip-def",
+      "flip-old": "previous default (rooted_marker_repair=false, rooted_decline=true) on patched flip build; retained output dir out/flip-old",
+      "flip-r0": "both repair and decline off (SPARKLES_ROOTED_MARKER_REPAIR=0, SPARKLES_ROOTED_MARKER_DECLINE=0) on patched flip build; retained output dir out/flip-r0",
+      "m1247-def": "new default with side-table MTab on patched m1247 build; retained output dir out/m1247-def",
+      "m1247-old": "previous default with side-table MTab on patched m1247 build; retained output dir out/m1247-old",
+      "m1247-r0": "both repair and decline off with side-table MTab on patched m1247 build; retained output dir out/m1247-r0"
+     },
+     "correctness_runs": {
+      "flip_four_worker_no_steps": [
+       "out/flip-nds1",
+       "out/flip-nds2",
+       "out/flip-nds3"
+      ],
+      "m1247_four_worker_no_steps": [
+       "out/m1247-nds1",
+       "out/m1247-nds2"
+      ],
+      "classifier_handle_sets": [
+       "out/flip-owned",
+       "out/flip-owned-old",
+       "out/flip-owned-r0"
+      ],
+      "classifier_forest_copies": "out/ownf holds copies of the three forest files from out/flip-owned, out/flip-owned-old and out/flip-owned-r0"
+     },
+     "builds": {
+      "flip": "patched checkout over tree edfabf58; subsequent flipfix.patch pinned tests after the corpus run and corresponds to committed revision 748a4a4f",
+      "m1247": "patched checkout over tree 507cc20b (m1247.patch); subsequent formatting and test fixes (final.patch) correspond to committed revision 629fc9d7",
+      "verified_followup": "4d50167b (tree 61796eb7) changes slot-admission locking, OnceLock::set race cleanup, post-saturation live_record_bytes recount, tests and docs; verified by targeted sparkles-owl (1,586 tests) and handles::ontology (214 tests) suites on boat:bx_azx7qhs7 with mbx 1.29.1 and rustc 1.99.1 without re-running the generated corpus"
+     },
+     "retained_evidence_sha256": {
+      "corpora.tgz": "eafedef559d03f1d9f7f99a38a4510f7276107b2d279b20b9a87a311f7e2cfdf",
+      "dl1231-logs.tgz": "fefc263eac3da7f4076dfe84a457ea67921f6cbaf18d14d9198f1b496eed4be1",
+      "final.patch": "bfe2acea8adac6c320089420e5991f2889646084796744c27bcf5bcc3e010b89",
+      "flip.patch": "dbce1e4b974b66a1235bf52ce3157c4806f7a23de31d439edd688dfd53700447",
+      "flipfix.patch": "e2ba639995ddf6f7e2f6080ec769798283d80b600d03aab8ce3a4ba41b910dc0",
+      "m1247.patch": "8deea5b4461e6c61bba73673d11c3affc0c14c097fdbfe3de63f6bf6bbea99b0",
+      "out-base.tgz": "64e97aa1c48edf57a69009207ec42fede3d9770deb37b100f6db7f3882c9139e",
+      "out-flip.tgz": "17feb35128adff3514a7ea894eff8d00a7d2038fa349644473ea586e5bc72850",
+      "out-m1247.tgz": "c479f0060e572d72d0e2fcc942395e0758aa897a7348ff2ccde1c4b7579ad841",
+      "out-own.tgz": "69ab81802436118e5fbb9896b2973b6f2e3ae43f3a702defde2000c79c3482dd",
+      "r1-fix-logs/boat-logs.tgz": "963f4718309fb740d03d2faa9e351f22f80d154be6cf24a47feb793c345da40d",
+      "scripts/check2.py": "595a63e041794db3ed7d81c4c5f153d32a20f041b00ff53506307decd7228554",
+      "scripts/mem.py": "3055fdecf8688019745f7b79f2d61ddc51a1b311c24294ca6ec39323e73eae22"
+     },
+     "commits": {
+      "base": "f60157c0",
+      "flip": "748a4a4f",
+      "side_table": "629fc9d7",
+      "r1_fix": "4d50167b"
+     }
+    },
+    "settings": {
+     "configurations": {
+      "1c": "1 thread, cautious strategy, default fixed rooted steps",
+      "4e": "4 threads requested, eager strategy, default fixed rooted steps (saturates on 1 worker under default rooted steps)",
+      "4w_no_steps": "4 threads with --no-dl-steps (4 concurrent saturation workers sharing MTab), repeated runs on 6 sets (av, ps, fxall and 3 others)",
+      "classifier_api": "Classifier handle runs on 9 sets including forest (976/994 claimed, 18 over bound with and without repair)"
+     },
+     "oracle": "HermiT 1.4.5"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "boat:bx_azx7qhs7",
+      "note": "Boat overflow worker; records HermiT agreement and conclusion/memory accounting results (with the single one-conclusion p3 variance noted below), while wall-clock timing of the shared side-table mutex on 4 concurrent workers remains open for Intel host atlas"
+     },
+     "kind": "corpus-agreement-and-accounting"
+    }
+   },
+   "metadata_note": "Manual generated-corpus agreement and accounting record for items 1231 and 1247 on boat:bx_azx7qhs7."
   }
  ]
 }

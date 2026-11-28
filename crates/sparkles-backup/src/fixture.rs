@@ -69,6 +69,8 @@ pub async fn repo_with(store: Arc<dyn ObjectStore>, f: impl FnOnce(&mut RepoConf
         requests: Default::default(),
         conditional: std::sync::atomic::AtomicU8::new(crate::repo::COND_UNKNOWN),
         key_options: Default::default(),
+        #[cfg(feature = "s3")]
+        s3_controls: None,
         #[cfg(feature = "encryption")]
         native_root: None,
     }
@@ -204,6 +206,7 @@ pub async fn put_backup(repo: &Repository, root: &Path, name: &str) -> Manifest 
             size: data.len() as u64,
             sha256: blob::blob_id(&data),
             blobs,
+            chunker: None,
             definition: None,
         });
     }
@@ -335,6 +338,9 @@ impl ObjectStore for Flaky {
         location: &Key,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.head {
+            return self.inner.get_opts(location, options).await;
+        }
         self.gets.fetch_add(1, SeqCst);
         let r = self.inner.get_opts(location, options).await?;
         let hit = self.target.lock().unwrap().as_ref() == Some(location);

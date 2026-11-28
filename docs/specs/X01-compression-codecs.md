@@ -297,7 +297,8 @@ Only measured numbers go into `docs/BENCHMARKS.md`.
   `docstore_compression: zstd`. Changing `docstoreCompression` to `lz4` rebuilds the
   index, and queries return the same hits.
 - **A8.** In a build without the `zstd` feature, a `.zst` load fails with
-  `Unsupported: built without zstd`. With `zstd-decode-pure` it loads.
+  `Unsupported: built without zstd`. The optional portable decoder remains unbuilt as
+  recorded in [Remaining codec decisions](#remaining-codec-decisions).
 - **A9 (Phase 2).** A generation built with `--block-codec zstd:3` gives the same
   answers as LZ4 on the W3C suite and the benchmark queries, and `sparkles check`
   passes. A pinned old LZ4 generation and a new zstd generation can both be read.
@@ -614,15 +615,23 @@ The later X11 Outcome owns the adopted FSST option and the measured rejection of
 encoded IRIs and alternative block codecs. Those rejected choices are not an open
 requirement under completed item 16.
 
-Roadmap item 343 includes an explicit checkpoint for the optional pure-Rust zstd
-decoder. Compare its platform/dependency benefit, accepted input support and cost
-with the native decoder before adopting it, or record the decision to retain the
-current clean feature-disabled refusal. A decision to drop a retained requirement
-needs maintainer approval and an Outcome entry, rather than an implicit completion
-claim. Item 61 owns the equivalent decision for reserved repository-zstd encoding,
-with raw/LZ4 compatibility and restore/transfer measurements in F05.
+Item 343 retains the native zstd decoder and the explicit refusal in builds without
+the `zstd` feature. The native feature covers both reading and writing. A second
+decoder would remove the native build dependency for reading alone and require
+separate validation of input compatibility and resource limits. Builds without
+zstd continue to use gzip as the default for compressed dumps and backups. The
+codec tests cover round-trips when zstd is enabled and refusal when it is disabled.
+Section 3's optional `zstd-decode-pure` remains unbuilt, so a build without the native
+feature cannot read zstd. Dropping a retained requirement needs maintainer approval
+and an Outcome entry.
 
-Completion of the accepted compression contract requires those decisions, the
-adopted options' round-trip and feature-matrix tests, and the named X11 settings
-work. It does not require turning every optional or measured rejected codec into a
-production feature.
+Item 61 retains the reserved repository zstd tag as a clean refusal. Current
+repository writes and copies use raw or LZ4. Adding zstd needs comparative evidence
+for transfer size, CPU and restore time under the F05 workload. Dropping the reserved
+option requires maintainer approval and an Outcome entry. The
+[F05 Outcome](F05-snapshot-repositories/OUTCOME.md#roadmap-follow-ups-2026-10-12)
+records the repository decision.
+
+The accepted compression contract includes the adopted codecs' round-trip and
+feature-matrix tests and the [X11 settings](X11-index-compression-and-predicate-patterns.md#dataset-local-settings).
+The remaining repository decision belongs to item 61.

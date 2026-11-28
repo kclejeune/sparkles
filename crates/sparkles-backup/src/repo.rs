@@ -67,6 +67,8 @@ pub struct Repository {
     /// [`COND_NO`] (the connection test, or a create answered `NotImplemented`)
     pub(crate) conditional: AtomicU8,
     pub(crate) key_options: crate::security::KeyOptions,
+    #[cfg(feature = "s3")]
+    pub(crate) s3_controls: Option<crate::storage::Controls>,
     /// Canonical native backend root and its opened directory identity. Custom
     /// stores never receive a path-based marker publication capability.
     #[cfg(feature = "encryption")]
@@ -578,7 +580,10 @@ fn fs_store(_: &RepoConfig) -> Result<Arc<dyn ObjectStore>> {
 }
 
 #[cfg(feature = "s3")]
-fn s3_store(cfg: &RepoConfig, outbound: Option<&OutboundPolicy>) -> Result<Arc<dyn ObjectStore>> {
+fn s3_builder(
+    cfg: &RepoConfig,
+    outbound: Option<&OutboundPolicy>,
+) -> Result<object_store::aws::AmazonS3Builder> {
     use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut};
     let mut b = match &cfg.credentials {
         Credentials::Default => AmazonS3Builder::from_env(),
@@ -677,10 +682,15 @@ fn s3_store(cfg: &RepoConfig, outbound: Option<&OutboundPolicy>) -> Result<Arc<d
         }
         (None, _) => {}
     }
-    let s3 = b
+    Ok(b)
+}
+
+#[cfg(feature = "s3")]
+fn s3_store(cfg: &RepoConfig, outbound: Option<&OutboundPolicy>) -> Result<Arc<dyn ObjectStore>> {
+    let store = s3_builder(cfg, outbound)?
         .build()
         .map_err(|e| invalid("s3", crate::error::redact_urls(&e.to_string())))?;
-    Ok(prefixed(Arc::new(s3), cfg.prefix.as_deref()))
+    Ok(prefixed(Arc::new(store), cfg.prefix.as_deref()))
 }
 
 #[cfg(not(feature = "s3"))]
@@ -771,7 +781,16 @@ impl Repository {
     /// configurations never write (an empty location is then `409 not-a-repository`).
     /// Does not run the connection test.
     pub async fn open(cfg: &RepoConfig, env: &OpenEnv) -> Result<Repository> {
-        Self::open_with_keys(cfg, env, crate::security::KeyOptions::None).await
+        Self::open_with_options(cfg, env, &crate::RepositoryOptions::default()).await
+    }
+
+    /// Open a repository with opt-in initialization settings.
+    pub async fn open_with_options(
+        cfg: &RepoConfig,
+        env: &OpenEnv,
+        options: &crate::RepositoryOptions,
+    ) -> Result<Repository> {
+        Self::open_with_keys(cfg, env, options, crate::security::KeyOptions::None).await
     }
 
     /// Open or initialize a repository with explicit resolved local key inputs.
@@ -782,10 +801,23 @@ impl Repository {
         env: &OpenEnv,
         options: &crate::crypto::EncryptionOptions,
     ) -> Result<Repository> {
+        Self::open_encrypted_with_options(cfg, env, options, &crate::RepositoryOptions::default())
+            .await
+    }
+
+    /// Open an encrypted repository with opt-in initialization settings.
+    #[cfg(feature = "encryption")]
+    pub async fn open_encrypted_with_options(
+        cfg: &RepoConfig,
+        env: &OpenEnv,
+        options: &crate::crypto::EncryptionOptions,
+        repository_options: &crate::RepositoryOptions,
+    ) -> Result<Repository> {
         options.check(false)?;
         Self::open_with_keys(
             cfg,
             env,
+            repository_options,
             crate::security::KeyOptions::Local(Arc::new(crate::crypto::KeyState::new(
                 options.clone(),
             ))),
@@ -796,9 +828,28 @@ impl Repository {
     async fn open_with_keys(
         cfg: &RepoConfig,
         env: &OpenEnv,
+        repository_options: &crate::RepositoryOptions,
         key_options: crate::security::KeyOptions,
     ) -> Result<Repository> {
         cfg.validate(&env.forbid_under)?;
+        let check_policy = |policy: &crate::S3WritePolicy| {
+            if !policy.valid() {
+                return Err(invalid(
+                    "s3Policy",
+                    "expected a storage class or a positive Object Lock retention period",
+                ));
+            }
+            if !cfg!(feature = "s3") || cfg.kind != RepoType::S3 || env.store.is_some() {
+                return Err(invalid("s3Policy", "requires a native S3 backend"));
+            }
+            if !cfg.conditional_writes && !cfg.readonly {
+                return Err(invalid("s3Policy", "requires conditional writes"));
+            }
+            Ok(())
+        };
+        if let Some(policy) = &repository_options.s3_policy {
+            check_policy(policy)?;
+        }
         #[cfg(feature = "encryption")]
         let native_root = if cfg!(feature = "fs") && env.store.is_none() && cfg.kind == RepoType::Fs
         {
@@ -821,11 +872,25 @@ impl Repository {
         } else {
             None
         };
+        #[cfg(feature = "s3")]
+        let mut s3_controls = None;
         let (inner, attempts) = match &env.store {
             Some(s) => (
                 limited(s.clone(), cfg.concurrency()),
                 instrumented::LOCAL_ATTEMPTS,
             ),
+            #[cfg(feature = "s3")]
+            None if cfg.kind == RepoType::S3 => {
+                if let Some(policy) = &env.outbound {
+                    check_destination(cfg, policy)?;
+                }
+                let builder = s3_builder(cfg, env.outbound.as_ref())?;
+                let (store, controls) = crate::storage::Controls::build(builder, cfg.concurrency())
+                    .map_err(|e| invalid("s3", e.message()))?;
+                s3_controls = Some(controls);
+                let store = prefixed(Arc::new(store), cfg.prefix.as_deref());
+                (limited(store, cfg.concurrency()), 1)
+            }
             None => {
                 #[cfg(feature = "encryption")]
                 let pinned = {
@@ -862,14 +927,15 @@ impl Repository {
                     env,
                     options,
                     native_root.as_ref(),
+                    repository_options,
                 )
                 .await?
             } else {
-                attach_or_init(&store, cfg, env).await?
+                attach_or_init(&store, cfg, env, repository_options).await?
             }
             #[cfg(not(feature = "encryption"))]
             {
-                attach_or_init(&store, cfg, env).await?
+                attach_or_init(&store, cfg, env, repository_options).await?
             }
         };
         #[cfg(feature = "encryption")]
@@ -880,6 +946,23 @@ impl Repository {
             && matches!(key_options, crate::security::KeyOptions::None)
         {
             return Err(crate::crypto::slots::required());
+        }
+        if repository_options.content_defined_chunking && marker.chunking.is_none() {
+            return Err(invalid(
+                "contentDefinedChunking",
+                "an existing repository keeps its chunking settings",
+            ));
+        }
+        if let Some(policy) = &marker.s3_policy {
+            check_policy(policy)?;
+        }
+        if let Some(requested) = &repository_options.s3_policy
+            && marker.s3_policy.as_ref() != Some(requested)
+        {
+            return Err(invalid(
+                "s3Policy",
+                "an existing repository keeps its storage policy",
+            ));
         }
         let cache_dir = env
             .cache_dir
@@ -900,6 +983,8 @@ impl Repository {
                 COND_NO
             }),
             key_options,
+            #[cfg(feature = "s3")]
+            s3_controls,
             #[cfg(feature = "encryption")]
             native_root,
         })
@@ -949,15 +1034,59 @@ impl Repository {
         !self.config.conditional_writes || self.conditional.load(Ordering::Relaxed) == COND_NO
     }
 
+    pub(crate) async fn publish_manifest(
+        &self,
+        manifest: &Manifest,
+        payload: PutPayload,
+        ctl: &Ctl,
+        guard: &crate::lock::LockGuard,
+    ) -> Result<Option<PutResult>> {
+        #[cfg(feature = "s3")]
+        let until = self.publish_retention_deadline(guard).await?;
+        #[cfg(not(feature = "s3"))]
+        let until = None;
+        #[cfg(feature = "s3")]
+        if let Some(until) = until {
+            self.retain_manifest_blobs(manifest, ctl, until).await?;
+        }
+        guard.check_live().await?;
+        ctl.check()?;
+        self.create_object_until(&layout::manifest_key(&manifest.name), payload, until)
+            .await
+    }
+
     /// Create `key` unless it exists: `Ok(Some(put result))` if this call created it,
     /// `Ok(None)` if it already existed. A conditional create (`PutMode::Create`); for
     /// single-writer repositories (and a backend that answers `NotImplemented`, which is
     /// then remembered) a `HEAD` followed by an overwrite.
-    pub(crate) async fn create_object(
+    pub(crate) async fn create_object_until(
         &self,
         key: &Key,
         payload: PutPayload,
+        until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Option<PutResult>> {
+        #[cfg(not(feature = "s3"))]
+        let _ = until;
+        #[cfg(feature = "s3")]
+        if let Some(policy) = &self.marker.s3_policy {
+            let mut options = PutOptions::from(PutMode::Create);
+            crate::storage::WriteHeaders::apply(
+                policy,
+                layout::blob_id_of(key).is_some(),
+                until,
+                &payload,
+                &mut options,
+            );
+            return match self.store.put_opts(key, payload, options).await {
+                Ok(put) => Ok(Some(put)),
+                Err(error) if is_already_exists(&error) => {
+                    // A conditional conflict can also mean the key disappeared.
+                    self.store.head(key).await?;
+                    Ok(None)
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
         if !self.single_writer() {
             match self
                 .store
@@ -1310,6 +1439,24 @@ impl Repository {
         .await?;
         let key = layout::manifest_key(name);
         let r = async {
+            #[cfg(feature = "s3")]
+            if self.has_object_lock() {
+                return match self
+                    .delete_locked_object(&key, false, &mut Default::default(), Some(&guard))
+                    .await?
+                {
+                    crate::storage::DeleteOutcome::Deleted => {
+                        self.cache.remove(name);
+                        Ok(true)
+                    }
+                    crate::storage::DeleteOutcome::Missing => Ok(false),
+                    crate::storage::DeleteOutcome::Retained => Err(BackupError::new(
+                        Code::ObjectRetained,
+                        format!("backup {name:?} is protected by S3 Object Lock"),
+                    )),
+                    crate::storage::DeleteOutcome::Eligible => unreachable!("not a dry run"),
+                };
+            }
             match self.store.head(&key).await {
                 Ok(_) => {}
                 Err(e) if is_not_found(&e) => return Ok(false),
@@ -1382,6 +1529,7 @@ async fn attach_or_init(
     store: &Arc<dyn ObjectStore>,
     cfg: &RepoConfig,
     env: &OpenEnv,
+    options: &crate::RepositoryOptions,
 ) -> Result<Marker> {
     let key = layout::marker_key();
     let read = |r: object_store::Result<object_store::GetResult>| async move {
@@ -1409,7 +1557,8 @@ async fn attach_or_init(
     if cfg.readonly || !env.init {
         return Err(not_repo("it is empty"));
     }
-    let marker = Marker::new(Uuid::new_v4(), crate::now_rfc3339());
+    let mut marker = Marker::new(Uuid::new_v4(), crate::now_rfc3339());
+    marker.configure(options);
     let body = PutPayload::from(marker.to_bytes());
     let created = if cfg.conditional_writes {
         match store

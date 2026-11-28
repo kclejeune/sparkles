@@ -2016,7 +2016,14 @@ fn batch(src: &Source, c: Claims, control: &Control) -> Result<Batch, Failed> {
             Some(i) => *i,
             None => {
                 let i = spans.len();
-                let quote: String = chars[a..b].iter().collect();
+                let span = chars.get(a..b).ok_or_else(|| {
+                    failed(
+                        "span-mismatch",
+                        422,
+                        "the claim span falls outside its rendition",
+                    )
+                })?;
+                let quote: String = span.iter().collect();
                 input.passages.push(PassageInput {
                     version: RecordVersion::V1,
                     key: key(format!("p{i}")),
@@ -2413,7 +2420,7 @@ fn extract_and_link(
     branch: Option<&str>,
     revision_digest: &Sha256Digest,
 ) -> Result<(super::extract::Extraction, Linked), Failed> {
-    let mut linker = super::extract::Linker::new();
+    let mut linker = super::extract::Linker::new(None);
     let mut check = |r: &mut Run, ex: &super::extract::Extraction| -> Result<(), Failed> {
         linker.update(r, ex, branch)?;
         claims_of(
@@ -2438,11 +2445,10 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     let t = target(r, req)?;
     let (models, pairs) = models_and_pairs(r, &t.main, req)?;
     let principal = crate::evidence::principal_iri(ctx.principal);
-    let name = req.name.clone().or_else(|| {
-        req.url
-            .as_deref()
-            .map(|u| super::pipeline::base_name(u).to_string())
-    });
+    let name = req
+        .name
+        .clone()
+        .or_else(|| req.url.as_deref().and_then(super::pipeline::url_name));
     let format = Format::detect(req.media_type.as_deref(), name.as_deref(), &req.bytes)?;
     if matches!(format, Format::Csv | Format::Tsv) || format.is_spreadsheet() {
         return Err(Refusal::new(
@@ -2455,7 +2461,7 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     // 1. conversion
     ctx.progress.status(Status::Converting, 0.05, None);
     r.check()?;
-    let converted = convert::convert(
+    let mut converted = convert::convert(
         &req.bytes,
         format,
         &convert::Options {
@@ -2468,18 +2474,24 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         },
     )?;
     r.check()?;
-    // the text exactly as the registration normalizes it, so spans agree with it
-    let text = crate::mcp::memory::ingest::normalize(&converted.text);
-    let title = req
+    // The text exactly as registration normalizes it, so the spans agree with it.
+    converted.text = crate::mcp::memory::ingest::normalize(&converted.text);
+    let raw_title = req
         .title
         .clone()
         .or_else(|| converted.title.clone())
-        .or_else(|| name.clone());
-    let iri = req.iri.clone().or_else(|| {
-        req.url
-            .clone()
-            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-    });
+        .or(name);
+    let redaction = super::pipeline::Redaction::new(r, &t.main);
+    let (title, redactions) = redaction.document(r, &mut converted, raw_title.as_deref())?;
+    let text = &converted.text;
+    for locator in [&req.iri, &req.graph, &req.source_graph, &req.proposal_graph]
+        .into_iter()
+        .flatten()
+    {
+        redaction.check_locator(r, locator)?;
+    }
+    let locator = redaction.fetched_locator(r, req.url.as_deref())?;
+    let iri = req.iri.as_ref().or(locator.as_ref());
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     // 2. the registration, planned without writing it
     ctx.progress.status(Status::Registering, 0.1, None);
@@ -2487,7 +2499,7 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     if let Some(g) = &req.graph {
         reg.insert("graph".into(), g.clone().into());
     }
-    if let Some(i) = &iri {
+    if let Some(i) = iri {
         reg.insert("iri".into(), i.clone().into());
     }
     if let Some(t) = &title {
@@ -2533,6 +2545,9 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         "profile": profile,
         "factGuard": "not-run",
     });
+    if !redactions.is_empty() {
+        out["redactions"] = json!(redactions);
+    }
     if t.branch != sparkles::branch::MAIN {
         out["branch"] = t.branch.clone().into();
     }
@@ -2545,15 +2560,15 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         return Ok(out);
     }
     // 4. the estimate, the extraction and linking
-    let chunks = crate::mcp::memory::ingest::chunk_bounds(&text, false);
+    let chunks = crate::mcp::memory::ingest::chunk_bounds(text, false);
     let branch = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let vocab = Vocabulary::read_on(r, &profile, branch)?;
-    estimate(r, req, models, &pairs, &vocab, &text, &chunks, &t)?;
+    estimate(r, req, models, &pairs, &vocab, text, &chunks, &t)?;
     let (ex, linked) = extract_and_link(
         r,
         (models, &pairs),
         &vocab,
-        (&text, &chunks),
+        (text, &chunks),
         branch,
         &revision_digest,
     )?;
@@ -2569,15 +2584,11 @@ pub(super) fn run(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         source_key: sk.clone(),
         revision_digest,
         revision_link: RevisionLink::New { previous: None },
-        locator: req
-            .url
-            .as_deref()
-            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-            .and_then(|u| NamedNode::new(u).ok()),
+        locator: locator.and_then(|u| NamedNode::new(u).ok()),
         rendition_key: rendition.clone(),
         media_type: &converted.media_type,
         format: format.name(),
-        text: &text,
+        text,
     };
     let rev_template = revision_template(&src);
     let c = claims_of(
@@ -2699,6 +2710,8 @@ pub(super) fn run_source(r: &mut Run, req: &Request, source: &str) -> Result<Val
     let principal = crate::evidence::principal_iri(ctx.principal);
     let on = (t.branch != sparkles::branch::MAIN).then_some(t.branch.as_str());
     let read = super::pipeline::read_source(r, source, on)?;
+    let redaction = super::pipeline::Redaction::new(r, &t.main);
+    redaction.check_existing(r, &read.text)?;
     let profile = req.profile.clone().unwrap_or_else(|| "default".into());
     let rendition_digest = sha(read.text.as_bytes())?;
     let source_iri = expand_iri(read.found["source"].as_str().unwrap_or(""), &read.prefixes);

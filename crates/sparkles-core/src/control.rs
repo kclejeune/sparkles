@@ -312,7 +312,7 @@ pub struct ControlState {
     pub seq: u64,
     /// the business commit the last frame follows
     pub follows: u64,
-    entries: imbl::OrdMap<Box<[u8]>, Arc<[u8]>>,
+    entries: crate::store::pmap::PMap<Box<[u8]>, Arc<[u8]>>,
     bytes: u64,
 }
 
@@ -332,9 +332,11 @@ impl ControlState {
         &'a self,
         prefix: &'a [u8],
     ) -> impl Iterator<Item = (&'a Box<[u8]>, &'a Arc<[u8]>)> + 'a {
-        let start: Box<[u8]> = prefix.into();
         self.entries
-            .range(start..)
+            .range::<[u8], _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
             .take_while(move |(k, _)| k.starts_with(prefix))
     }
 

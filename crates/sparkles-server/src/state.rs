@@ -857,6 +857,8 @@ impl AppState {
         store_opts: StoreOptions,
         default_timeout: std::time::Duration,
     ) -> AppState {
+        let settings = crate::settings::Settings::in_dir(data_dir);
+        settings.configure_index_settings(&catalog, &store_opts.build);
         AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
@@ -926,7 +928,7 @@ impl AppState {
             volatile: Default::default(),
             models: Default::default(),
             local_models: None,
-            settings: crate::settings::Settings::in_dir(data_dir),
+            settings,
             asks: Default::default(),
             notifier: Default::default(),
             watches: Default::default(),

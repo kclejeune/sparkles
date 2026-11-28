@@ -117,8 +117,18 @@ impl Query {
         buffer
     }
 
-    /// Formats using the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html).
-    fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
+    /// Writes the [SPARQL S-Expression syntax](https://jena.apache.org/documentation/notes/sse.html)
+    /// without first allocating a complete string.
+    pub fn fmt_sse(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        self.fmt_sse_impl(f, false)
+    }
+
+    /// Write SSE without ASK's synthetic result projection.
+    pub fn fmt_sse_without_ask_projection(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        self.fmt_sse_impl(f, true)
+    }
+
+    fn fmt_sse_impl(&self, f: &mut impl fmt::Write, omit_ask_projection: bool) -> fmt::Result {
         match self {
             Self::Select {
                 dataset,
@@ -225,7 +235,13 @@ impl Query {
                     dataset.fmt_sse(f)?;
                     f.write_str(" ")?;
                 }
-                pattern.fmt_sse(f)?;
+                if let GraphPattern::Project { inner, .. } = pattern
+                    && omit_ask_projection
+                {
+                    inner.fmt_sse(f)?;
+                } else {
+                    pattern.fmt_sse(f)?;
+                }
                 if dataset.is_some() {
                     f.write_str(")")?;
                 }

@@ -380,6 +380,7 @@ pub struct ExplainWorkspace {
     limit: Option<usize>,
     retained: Cell<usize>,
     scratch: Cell<usize>,
+    memory: std::cell::RefCell<Option<sparkles_budget::MemoryLease>>,
 }
 
 /// Scoped hold of retained decoded bytes on an [`ExplainWorkspace`], automatically
@@ -452,10 +453,20 @@ impl Drop for WorkspaceHold<'_> {
 
 impl ExplainWorkspace {
     pub fn for_answer_limit(max_memory: Option<usize>) -> Self {
+        Self::with_memory_parent(max_memory, None)
+    }
+
+    fn with_memory_parent(
+        max_memory: Option<usize>,
+        parent: Option<sparkles_budget::ParentHandle>,
+    ) -> Self {
         Self {
             limit: max_memory.map(|limit| limit.saturating_mul(2).saturating_add(256)),
             retained: Cell::new(0),
             scratch: Cell::new(0),
+            memory: std::cell::RefCell::new(
+                parent.map(|p| p.reserve(0).expect("zero reservation")),
+            ),
         }
     }
 
@@ -471,6 +482,11 @@ impl ExplainWorkspace {
             return Err(explain::budget(format!(
                 "{what} needs {total} bytes, over its workspace memory limit of {limit}"
             )));
+        }
+        if let Some(memory) = &mut *self.memory.borrow_mut() {
+            memory
+                .try_grow((total as u64).saturating_sub(memory.bytes()))
+                .map_err(crate::access::preparation::parent_error)?;
         }
         Ok(())
     }

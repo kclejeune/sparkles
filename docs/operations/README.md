@@ -52,6 +52,28 @@ Sparkles runs as a single binary packaged for NixOS, Home Manager, Docker, and K
 * **Restore and verification.** Restores create a new dataset or swap in place (returning `503` with `Retry-After` during the swap), enforce dataset-id rules, verify integrity before publishing, and support three verification levels. Backups and persistent clones preserve view definitions captured under the writer lock; restored views start suspended until an operator resumes and revalidates their principal and query, and unsafe, duplicate, unknown, or corrupt definition entries abort restore before publication.
 * **Lifecycle policies and shared repositories.** Cron and `every` schedules run in IANA time zones with catch-up, retention pruning, two-phase garbage collection, and offline catalog execution. Lease locks rely on storage-server timestamps so multiple servers and CLIs can share one repository. Manage repositories, backups, and policies through `/$/repositories`, `/$/backups/{ds}`, `/$/backup-policies`, `sparkles repo|backup`, and the web UI Backups page, with `sparkles_backup_*` metrics and audit events.
 
+The Rust repository library supports verified copy with `Repository::copy_to`.
+`Repository::open_with_options` can initialize a repository with FastCDC vocabulary
+chunking, an S3 blob storage class or S3 Object Lock. Encrypted repositories use
+`Repository::open_encrypted_with_options` for the same settings. The repository marker
+preserves the settings on reopen. Existing repositories keep their original layout.
+When a copy selects backups by dataset or completion time without explicit names, an
+unreadable source manifest stops the scan because its selection fields are unknown.
+Supply explicit backup names to copy around a damaged manifest.
+
+S3 Object Lock requires a versioned bucket with Object Lock enabled. Writers need
+permission to set and inspect retention and legal holds, and garbage collectors need
+permission to delete object versions as they expire. Deny unversioned deletes for the
+protected blob and manifest prefixes to prevent delete markers. Enforce conditional
+creates on those keys to prevent newer versions from shadowing protected objects.
+Keep the repository's control and lease keys outside bucket-wide default retention
+and use lifecycle rules for their expired noncurrent versions. Protected backups use
+the S3 clock at publication to set retention on the manifest and extend its blobs.
+Archive selection leaves manifests and control files in the backend's default storage
+class. Copy retries compare published manifests and check blob presence and stored size
+with HEAD. Reuse of archived destination blobs also uses HEAD. Thaw blobs in S3 before
+restoring them, copying their data out of an archive, or running full data verification.
+
 ### Upgrades and on-disk formats
 
 * **Format registry and migration.** A central registry in `sparkles-core` tracks read and write versions for every file kind, exposed at `GET /$/server` ([X12](../specs/X12-release-engineering.md), [USAGE.md](../USAGE.md#upgrading-databases)). Unreadable newer formats fail cleanly with upgrade instructions while healthy datasets keep serving. Generation indexes support multi-version reading so format upgrades take effect on compaction and older backups remain restorable. `sparkles migrate` inspects stopped-server file versions and upgrades on a verified copy before swapping in while preserving dataset UUIDs and history. Fixtures in `testsuite/formats/` test backward compatibility across open, query, write, compact, and restore.

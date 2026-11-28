@@ -3,6 +3,36 @@
 This report is a manual import of the retained run records. Read the
 [methodology](README.md) with each result.
 
+## Rooted at-most agreement
+
+The release classifier on Boat `bx_9cw43z44` classified 3,000 generated ontologies in
+each set with rooted counting. Each input ran on one and four threads with cautious
+and eager expansion. HermiT 1.4.5.519 checked consistency, unsatisfiable classes and
+the subsumptions between named classes for every complete answer. The baseline is
+commit `05e2278e`. The [run record](runs/2026-11-28-rooted-atmost-boat/record.json)
+identifies the build and the [raw results](runs/2026-11-28-rooted-atmost-boat/agreement.tar.gz)
+include the generators and HermiT references.
+
+| Generated set | Baseline complete | Baseline disagreements | Ground counting complete | Ground counting disagreements |
+|---|---:|---:|---:|---:|
+| At-most | 10,222 | 312 | 10,128 | 0 |
+| Qualified at-most | 10,894 | 256 | 10,710 | 0 |
+
+All 568 formerly incorrect answers finished and agreed with HermiT. The existing
+work bound excluded 118 formerly correct answers on the first set and 184 on the
+second. The first set gained 24 other complete answers. Both versions rejected 377
+inputs where duplicate union operands collapse to one. Replacing each such union
+with its operand produced 1,448 complete answers in 1,508 runs, all agreeing
+with HermiT. Roadmap item 1319 tracks the parser rejections.
+
+On inputs and configurations completed by both versions, total derived conclusions
+changed by -9.1% and +2.9% on the two sets. The median ratios were
+1.000 and 1.001, the 95th percentiles were 1.24 and 1.19, and the maxima
+were 7.58 and 5.52. Of 20,814 jointly completed configurations, 72 more than doubled
+their conclusions. Total DL work increased by 7.2% and 17.5%. A maximum of two with
+three neighbours can introduce three alternative equalities into subsequent inferences.
+Item 1232 tracks the cost of repeated products.
+
 ## Agreement
 
 <a id="agreement"></a>
@@ -2175,7 +2205,62 @@ took 4 ms on `ore_ont_13482` on the laptop, so a reused stack can save less than
 and the sort and deduplication of the told subsumptions took 10 ms, of which per-key
 sorts could save only part.
 
+### Default marker repair and side-table state (items 1231 and 1247)
+
+Manual report from the generated-corpus runs on Boat worker `bx_azx7qhs7`, cataloged in the
+[marker-default and side-table record](runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json).
+The corpus arms ran on two patched measurement builds: `flip` (over tree `edfabf58`, before
+test pins corresponding to commit `748a4a4f`) and `m1247` (over tree `507cc20b`, before
+formatting and test fixes corresponding to commit `629fc9d7`). Both builds were compared
+against the previous default (repair off, decline check on) and against both repair and
+decline off. The later revision `4d50167b` updates slot-admission locking, `OnceLock::set`
+race cleanup, the post-saturation `live_record_bytes` recount, tests and documentation, and
+passed the targeted `sparkles-owl` (1,586 tests) and `handles::ontology` (214 tests) suites
+on `bx_azx7qhs7` without re-running the generated corpus.
+
+The corpus covers 33 generated sets holding 18,916 input files, of which 18,870 have a
+usable HermiT 1.4.5 reference. Each file ran in two configurations: one thread with the
+cautious strategy (`1c`) and four threads requested with the eager strategy (`4e`), where
+the default fixed rooted steps saturate on one worker. The parser rejects the same 690
+files in `fz` and `gen` in both configurations across every arm (1,380 rows), leaving
+36,360 usable rows (18,180 per configuration).
+
+- **Claims and HermiT agreement (item 1231).** The new default claims 34,810 rows against
+  32,674 for the previous default (losing 3 claims, all to the rooted work bound) and
+  reduces HermiT disagreements from 1,456 with both repair and decline off to the 2 rows of
+  `s2-g2-150` common to every setting, losing 9 claims against the both-off arm (6 in item
+  1251's family).
+- **Work and peak estimated memory against the both-off arm.** Over common claims against
+  repair and decline both off, the new default derives 6.9% more conclusions overall (3 to
+  13% on the larger sets, 1.61 times on `av`, 1.96 times on the order-of-arrival fixtures
+  and 34.6 times on item 1251's family) and uses 4.9% more peak estimated memory overall
+  (2.1 to 4.8% on the larger sets, 1.20 times on `av`, 1.26 times on the fixtures and 4.4
+  times on item 1251's family). Because the previous default runs the decline check, peak
+  estimated memory against the previous default differs: on `g6` (4,000 common claims) the
+  new default uses 1.0396 times the both-off peak and 0.9904 times the previous default's
+  peak, and on `p3` (2,400 common claims) the ratios are 1.0349 and 0.9897.
+- **Side-table state parity and memory (item 1247).** Across all 36,360 usable rows in all
+  three arms (new default, previous default and both off), the patched `m1247` side-table
+  build matches the patched `flip` build on claims, HermiT agreement and completeness, and
+  matches derived conclusion counts apart from one `p3` row (`p201109.ofn` in `4e`, 46 on
+  patched `flip` against 47 on patched `m1247`). Peak
+  estimated memory with repair off drops by multiples of 8 bytes (at most 1,488 bytes) and
+  with repair on rises by a median of 0.03% (at most 512 bytes for the table and its slots).
+- **Concurrent four-worker correctness and open Intel timing.** Separate repeated runs with
+  `--no-dl-steps` on four threads, which saturate with four concurrent workers sharing the
+  side table, on six sets (`av`, `ps`, fixtures and three others) and `Classifier` runs on
+  nine sets produced zero HermiT disagreements. Same-host Intel wall-clock timing of the
+  shared side-table mutex on four concurrent workers remains open for `atlas` alongside the
+  unified rooted-DL benchmark sweep of item 823.
+
 ## Records
+
+The [marker-default and side-table record](runs/2026-11-28-dl-marker-default-boat-4d50167b/record.json)
+catalogs the six generated-corpus arms on `boat:bx_azx7qhs7`, the relationship between the
+patched measurement builds (`flip` over `edfabf58` and `m1247` over `507cc20b`) and the
+committed revisions (`748a4a4f`, `629fc9d7` and `4d50167b`), the 1c and 4e denominators, the
+baseline-specific memory ratios, and the separate four-worker `--no-dl-steps` and
+`Classifier` correctness runs.
 
 The [record of item 712's reduced automata](runs/2026-11-21-dl-automata-atlas-fd47b7ae/record.json)
 holds every process of the twelve rounds on `atlas` with its report, the analysis, the hash
@@ -2320,3 +2405,8 @@ The [reference reasoner agreement record](runs/2026-11-02-reasoners-agreement-91
 holds Whelk's and Konclude's output lines and comparisons on the range test ontologies,
 GO, ChEBI lite and the ORE 2015 sample, the ROBOT runs and their checks, and the trace of
 Konclude's extra GO subsumptions. Its times also come from a loaded laptop.
+
+The [F24 outcome](../../specs/F24-owl-classification/SPEC.md#outcome) records the
+conclusion counts and HermiT agreement checks for item 1250's ground-body cut across 104
+generated input files with the selection off. Those figures are synthetic conclusion
+counts rather than benchmark-host timings.

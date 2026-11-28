@@ -1,0 +1,16 @@
++ cd /home/user/lanes/store1152/.artifacts/lanes/store1152-drop-imbl/bench
++ mbx build --release -j 1
++ grep -E 'error|Finished'
+    Finished `release` profile [optimized] target(s) in 3.69s
++ lscpu
++ grep -E 'Model name|^CPU\(s\)'
+CPU(s):                                  8
+Model name:                              AMD Ryzen 9 9950X 16-Core Processor
++ uptime
+ 02:52:48 up 2 days, 22:47,  2 users,  load average: 0.39, 0.65, 0.61
++ sha256sum target/release/pmap-bench
+1564e07f22c1e33d7b98df7b218fc18435ee71235d8786efd545a1575792b50e  target/release/pmap-bench
++ ROUNDS=8
++ taskset -c 3 target/release/pmap-bench
++ uptime
+ 02:53:20 up 2 days, 22:47,  2 users,  load average: 0.63, 0.69, 0.62

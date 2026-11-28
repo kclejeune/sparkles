@@ -383,3 +383,165 @@ fn redaction_digest_and_renames() {
     assert_eq!(after.rel_path, "infra/staging-db.md");
     assert_eq!(after.digest, before.digest);
 }
+
+#[test]
+fn filenames_and_relative_paths_are_redacted_in_published_metadata() {
+    use sparkles_memory_import::scan_with_policy;
+    let f = fixture();
+    let c = ctx();
+    let hidden = "synthetic-file-key-9876";
+    let path = f.repo.join(format!("docs/{hidden}.md"));
+    write(&path, "# Safe body");
+    let request = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::Generic],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: vec![path.clone()],
+        instructions_only: false,
+        patterns: &[],
+    };
+    let policy = redact::Policy::default().with_known_values([hidden], "known-value");
+    let scan = scan_with_policy(&request, &policy);
+    let file = scan.files.iter().find(|file| file.path == path).unwrap();
+    assert_eq!(file.title, "[redacted:known-value].md");
+    assert!(file.rel_path.contains("[redacted:known-value]"));
+    assert!(!file.graph.contains(hidden));
+    assert!(
+        file.facts
+            .iter()
+            .all(|fact| !format!("{fact:?}").contains(hidden))
+    );
+}
+
+#[test]
+fn project_keys_are_redacted_in_remote_and_local_graphs_and_labels() {
+    let f = fixture();
+    let c = ctx();
+    let dir = f._dir.path().join("private-local");
+    let remote = f._dir.path().join("remote");
+    write(
+        &remote.join(".git/config"),
+        "[remote \"origin\"]\nurl = https://example.org/private-remote/repo.git\n",
+    );
+    let patterns = [redact::Pattern::new("private-project", "private-(local|remote)").unwrap()];
+    for root in [dir, remote] {
+        let path = root.join("AGENTS.md");
+        write(&path, "# Safe instructions");
+        let req = Request {
+            ctx: &c,
+            roots: &f.roots,
+            adapters: vec![Adapter::Generic],
+            project: Some(Project::of(&root)),
+            user_scope: false,
+            paths: vec![path],
+            instructions_only: false,
+            patterns: &patterns,
+        };
+        let scan = scan(&req);
+        let file = scan.files.first().unwrap();
+        assert!(file.graph.contains("/redacted-project."), "{}", file.graph);
+        assert!(scan.areas.iter().all(|area| !area.contains("private-")));
+        assert!(file.facts.iter().any(|fact| {
+            fact.p == RDFS_LABEL && matches!(&fact.o, Obj::Literal { value, .. } if value.starts_with("redacted-project."))
+        }));
+        assert!(!format!("{:?}", file.facts).contains("private-"));
+    }
+}
+
+#[test]
+fn index_links_use_published_memory_keys_and_redacted_quotes() {
+    let f = fixture();
+    let c = ctx();
+    let named = f.memdir.join("named.md");
+    let unnamed = f.memdir.join("private-file.md");
+    write(
+        &named,
+        "---\nname: \"Notes private-name\"\n---\nA safe body.\n",
+    );
+    write(&unnamed, "A body without a Markdown heading.\n");
+    write(
+        &f.memdir.join("MEMORY.md"),
+        "- [First](named.md) — first detail\n- [Second](private-file.md) — second detail\n",
+    );
+    let patterns = [redact::Pattern::new("metadata", "private-(file|name)").unwrap()];
+    let req = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::ClaudeCode],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: Vec::new(),
+        instructions_only: false,
+        patterns: &patterns,
+    };
+    let scan = scan(&req);
+    let ix = scan
+        .files
+        .iter()
+        .find(|f| f.kind == FileKind::Index)
+        .unwrap();
+    for (path, expected) in [(&named, "first detail"), (&unnamed, "second detail")] {
+        let file = scan.files.iter().find(|f| &f.path == path).unwrap();
+        let entity = file.entity.as_deref().unwrap();
+        if path == &unnamed {
+            assert!(has(
+                file,
+                entity,
+                RDFS_LABEL,
+                &Obj::lit("[redacted:metadata]")
+            ));
+        }
+        assert!(has(ix, entity, &mem("indexText"), &Obj::lit(expected)));
+        assert!(!format!("{:?}", file.facts).contains("private-"));
+    }
+    assert!(!format!("{:?}", ix.facts).contains("private-"));
+    assert!(ix.facts.iter().any(|fact| {
+        fact.quote
+            .as_deref()
+            .is_some_and(|q| q.contains("[redacted:metadata].md"))
+    }));
+}
+
+#[test]
+fn repeated_instruction_imports_record_one_refusal_at_the_published_path() {
+    let f = fixture();
+    let c = ctx();
+    let path = f.repo.join("private-note.md");
+    write(
+        &f.repo.join("CLAUDE.md"),
+        "@private-note.md\n@private-note.md\n",
+    );
+    write(&path, "Original text.");
+    let patterns = [
+        redact::Pattern::new("filename", "^private-note").unwrap(),
+        redact::Pattern::new("budget", "budget-marker").unwrap(),
+    ];
+    let request = Request {
+        ctx: &c,
+        roots: &f.roots,
+        adapters: vec![Adapter::ClaudeCode],
+        project: Some(Project::of(&f.repo)),
+        user_scope: false,
+        paths: Vec::new(),
+        instructions_only: true,
+        patterns: &patterns,
+    };
+    let first = scan(&request);
+    let original = first.files.iter().find(|file| file.path == path).unwrap();
+    assert_eq!(original.rel_path, "[redacted:filename].md");
+
+    write(&path, &"budget-marker ".repeat(32_769));
+    let second = scan(&request);
+    assert_eq!(
+        second
+            .skipped
+            .iter()
+            .filter(|s| s.path == path && s.reason == "redaction-too-large")
+            .count(),
+        1
+    );
+    assert!(second.has_refused_path(&original.graph, &original.rel_path));
+    assert!(!second.has_refused_path(&original.graph, "private-note.md"));
+}

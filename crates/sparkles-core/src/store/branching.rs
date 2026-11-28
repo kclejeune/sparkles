@@ -37,8 +37,9 @@ pub const BRANCH_FILE: &str = "branch.json";
 pub const MERGES_FILE: &str = "merges.bin";
 
 /// Configuration files a new branch copies from its upstream.
-const COPIED_FILES: [&str; 16] = [
+const COPIED_FILES: [&str; 17] = [
     "reasoning.json",
+    "reasoning-imports.json",
     "rdfs.json",
     "rdfs-schema.nt",
     crate::guard::config::CONFIG_FILE,
@@ -1033,7 +1034,10 @@ impl BranchSet {
     // Resolve against the caller's locked table so rename checks exactly the entry
     // and upstream whose metadata it is about to publish.
     fn upstream_in(&self, t: &TableFile, id: uuid::Uuid) -> Option<uuid::Uuid> {
-        let mut cur = self.start_of(t, id)?.branch_id;
+        self.nearest_listed_in(t, self.start_of(t, id)?.branch_id)
+    }
+
+    fn nearest_listed_in(&self, t: &TableFile, mut cur: uuid::Uuid) -> Option<uuid::Uuid> {
         for _ in 0..1024 {
             if cur == self.dataset_id || t.by_id(cur).is_some() {
                 return Some(cur);
@@ -2244,6 +2248,19 @@ impl Store {
     /// [`StoreOptions::max_branch_depth`] log segments, the branch's index is built
     /// instead.
     pub fn create_branch(&self, name: &str, o: &BranchOptions) -> Result<BranchInfo> {
+        self.create_branch_with_memory_init(name, o, |_, _| Ok(|| {}))
+    }
+
+    /// Prepare a facade handle for a memory branch before publishing the store.
+    /// The initializer receives the nearest listed upstream and the private new store.
+    /// Its infallible completion publishes the handle once the table contains it.
+    #[doc(hidden)]
+    pub fn create_branch_with_memory_init<F: FnOnce()>(
+        &self,
+        name: &str,
+        o: &BranchOptions,
+        prepare: impl FnOnce(&Store, Arc<Store>) -> Result<F>,
+    ) -> Result<BranchInfo> {
         let _family = self.shared_family(&Default::default())?;
         branch::check_name(name)?;
         if o.note.as_ref().is_some_and(|n| n.len() > 1024) {
@@ -2252,7 +2269,7 @@ impl Store {
         let set = self.owned_set()?.clone();
         let _fork = set.forks.read();
         if set.memory {
-            return self.create_memory_branch(name, o, &set);
+            return self.create_memory_branch(name, o, &set, prepare);
         }
         let root = set.root.clone();
         {
@@ -2396,11 +2413,12 @@ impl Store {
         self.branch_info(name)
     }
 
-    fn create_memory_branch(
+    fn create_memory_branch<F: FnOnce()>(
         &self,
         name: &str,
         o: &BranchOptions,
         set: &Arc<BranchSet>,
+        prepare: impl FnOnce(&Store, Arc<Store>) -> Result<F>,
     ) -> Result<BranchInfo> {
         let source = self.branch(&o.from)?;
         let preparation = super::managed_history::administrative_preparation()?;
@@ -2434,12 +2452,16 @@ impl Store {
         // held while the store and its indexes are built, so readers of the table do
         // not wait for text, spatial or vector builds. No branch is published until
         // all fallible initialization has completed.
-        let (ordinal, next) = {
+        let (ordinal, next, facade_source) = {
             let mut t = set.table.lock();
             admit(&t, true)?;
+            // Match BranchInfo::upstream even when a retired store owns the snapshot.
+            let facade_source = set
+                .nearest_listed_in(&t, owner_id)
+                .unwrap_or(self.dataset_id);
             let ordinal = t.next_ordinal as u16;
             t.next_ordinal += 1;
-            (ordinal, t.next_ordinal)
+            (ordinal, t.next_ordinal, facade_source)
         };
         self.failpoint("memory-ordinal-reserved");
         self.branching
@@ -2514,6 +2536,13 @@ impl Store {
         if let (Some(src), Some(dst)) = (&up.mem_history, &store.mem_history) {
             dst.lock().retention = src.lock().retention;
         }
+        let store = Arc::new(store);
+        let facade_upstream = if facade_source == owner_id {
+            up
+        } else {
+            self.branch_by_id(facade_source)?
+        };
+        let publish = prepare(&facade_upstream, store.clone())?;
         let mut t = set.table.lock();
         // another creation may have taken the name or the last slot meanwhile
         admit(&t, false)?;
@@ -2530,7 +2559,6 @@ impl Store {
             base_hold: Some(from),
             scratch: None,
         });
-        let store = Arc::new(store);
         let mut bases = set.memory_bases.lock();
         bases.insert((owner_id, root.seq), (resolved.commit, snap));
         bases.insert((id, root.seq), (root, store.snapshot()));
@@ -2538,6 +2566,7 @@ impl Store {
         set.register_opening(&store);
         set.stores.lock().insert(id, store.clone());
         drop(t);
+        publish();
         self.branching
             .next_ordinal
             .fetch_max(next as u64, Ordering::Relaxed);
@@ -2843,7 +2872,7 @@ impl Store {
             ));
         }
         self.check_branch_writer(&set, e.id)?;
-        if !o.force && !set.broken.lock().contains(&e.id) {
+        let checked = if !o.force && !set.broken.lock().contains(&e.id) {
             let store = set.open_store(e.id)?;
             let head = store.head_commit().seq;
             if head > e.from.seq {
@@ -2869,7 +2898,11 @@ impl Store {
                     ));
                 }
             }
-        }
+            Some((store, head))
+        } else {
+            None
+        };
+        self.failpoint("branch-delete-head-checked");
         let retire = !children.is_empty();
         // The source holds that name the branch go first, durably, when the caller
         // releases them. A failure after that leaves the branch without its holds. The
@@ -2877,9 +2910,31 @@ impl Store {
         // history lock while an acquisition holds the holds' lock.
         // Released with the holds' lock, before any cleanup below takes a writer.
         let publishing = self.family.holds.publishing.write();
+        // The ancestry check can take the upstream writer. Recheck the source head
+        // under its writer here, with no upstream writer held. Never wait for it
+        // while excluding hold publications: a writer can itself publish a hold.
+        let mut writer = match &checked {
+            Some((store, head)) => {
+                let writer = store.writer.try_lock().ok_or(Error::WriterBusy)?;
+                if writer.head.seq != *head || store.group.as_ref().is_some_and(|g| !g.idle()) {
+                    return Err(branch::conflict(
+                        "unmerged",
+                        format!("branch {name} advanced during deletion; check its head and retry"),
+                    ));
+                }
+                Some(writer)
+            }
+            None => None,
+        };
         let mut holds = self.family.holds.state.lock();
         // the commit point: the table without the name
         let mut t = set.table.lock();
+        if t.by_name(name).is_none_or(|entry| entry.id != e.id) {
+            return Err(branch::conflict(
+                "branch-changed",
+                format!("branch {name} changed during deletion; check it and retry"),
+            ));
+        }
         let records = match &*holds {
             crate::holds::HoldsState::Ready(r) => r,
             crate::holds::HoldsState::Unavailable(reason) => {
@@ -2929,6 +2984,13 @@ impl Store {
         let pruned = next.prune_retired();
         set.save(&next)?;
         *t = next;
+        if let Some(writer) = writer.as_mut()
+            && !retire
+        {
+            // A caller may still hold this store or be waiting on its writer.
+            // Refuse writes after the branch's storage has been dropped from the table.
+            writer.poisoned = true;
+        }
         drop(t);
         drop(holds);
         drop(publishing);
@@ -2940,6 +3002,8 @@ impl Store {
                 s.branching.protected.store(true, Ordering::Relaxed);
             }
         }
+        drop(writer);
+        drop(checked);
         let mut gone: Vec<uuid::Uuid> = pruned;
         if !retire {
             gone.insert(0, e.id);

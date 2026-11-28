@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+sparkles-budget.workspace = true
 oxiri.workspace = true
 oxrdf.workspace = true
 serde_json.workspace = true

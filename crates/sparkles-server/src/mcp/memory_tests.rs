@@ -1416,10 +1416,11 @@ async fn link_evidence_review_does_not_certify_rdfs_expanded_inventory() {
     )
     .unwrap();
     // MCP enables its query reasoning defaults when materialization is configured.
-    *ds.reasoning.write() = Some(sparkles::reasoning::ReasoningRecord {
+    ds.set_reasoning(Some(sparkles::reasoning::ReasoningRecord {
         profile: "rdfs".into(),
         ..Default::default()
-    });
+    }))
+    .unwrap();
     let mut c = Client::start(server);
     let answer = c.text("sparql_query", json!({"query":r#"ASK { <urn:item> <http://www.w3.org/2000/01/rdf-schema#label> "Berlin"@de }"#})).await;
     assert!(

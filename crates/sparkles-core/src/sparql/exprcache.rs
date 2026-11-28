@@ -46,7 +46,7 @@ const DECODE_PIECE: usize = 4096;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
-pub struct Report(Vec<Entry>, Vec<Decided>);
+pub struct Report(Vec<Entry>, Vec<Decided>, Option<(usize, usize)>);
 
 /// Comparisons with constants that the ids of a column decided (see `rangemask`).
 #[derive(Debug)]
@@ -69,6 +69,13 @@ impl Report {
     pub fn extend(&mut self, other: Report) {
         self.0.extend(other.0);
         self.1.extend(other.1);
+        self.2 = other.2.or(self.2);
+    }
+
+    /// The rows and exact distinct input keys of the last batch whose keys a cursor's
+    /// per-batch distinct pass counted, accepted or not.
+    pub(super) fn counted(&self) -> Option<(usize, usize)> {
+        self.2
     }
 
     /// Record that the ids of a column decided the comparisons `exprs` on `rows` rows,
@@ -705,6 +712,7 @@ fn distinct(
         u
     };
     uniq.shrink_to_fit();
+    report.2 = Some((n, uniq.len()));
     if !always && uniq.len() > n / 4 * 3 {
         return reject(report, format!("{} distinct of {n} rows", uniq.len()));
     }
@@ -1198,6 +1206,7 @@ fn cursor_key_distinct(
         slot[row as usize] = (uniq.len() - 1) as u32;
     }
     ctx.check()?;
+    report.2 = Some((n, uniq.len()));
     if !always && uniq.len() > n / 4 * 3 {
         report.push(
             ctx,
@@ -1856,6 +1865,33 @@ mod tests {
 
     fn ids(v: &[i64]) -> Vec<Id> {
         v.iter().map(|&i| Id::from_i64(i).unwrap()).collect()
+    }
+
+    /// The cursor's key pass reports the exact distinct count of a batch whether or not
+    /// the batch is sorted on the key, since BIND reuse admits from that count.
+    #[test]
+    fn the_cursor_key_pass_counts_sorted_and_unsorted_batches() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let ctx = Ctx::new(store.snapshot());
+        let v = ctx.var("k");
+        let e = Expr::Var(v);
+        let mut t = Table::new(vec![v]);
+        t.cols[0] = ids(&(0..4096)
+            .map(|i| 5000 + (i % 3) * 100_000)
+            .collect::<Vec<_>>());
+        t.len = 4096;
+        let mut report = Report::default();
+        cursor_key_distinct(&ctx, &t, &[&e], v, false, &mut report).unwrap();
+        assert_eq!(report.counted(), Some((4096, 3)));
+        t.cols[0].sort_unstable();
+        t.sorted = vec![v];
+        let mut report = Report::default();
+        cursor_key_distinct(&ctx, &t, &[&e], v, false, &mut report).unwrap();
+        assert_eq!(
+            report.counted(),
+            Some((4096, 3)),
+            "the sorted path counts too"
+        );
     }
 
     /// The parallel mapping of a dense range of integers, over several pieces, finds the

@@ -57,7 +57,7 @@ impl Runtime {
         let compiled = compile(&q, mode.as_deref())?;
         let history = Arc::new(Mutex::new(HistoryBuf::default()));
         let mut circuit = Circuit::new(compiled, access);
-        circuit.set_pool(self.pool.clone(), self.circuit_parent());
+        circuit.set_runtime_pool(self.pool.clone(), self.circuit_parent());
         circuit.set_local_limit(max_memory_bytes);
         circuit.set_reclaim_external(Some(Slot::history_reclaim_hook(&history)));
         circuit.inference = inference;
@@ -108,6 +108,17 @@ impl Runtime {
         name: &str,
         retired: &mut Vec<MemoryLease>,
     ) -> Result<()> {
+        self.attach_persisting(store, reg, name, retired, |_| Ok(()))
+    }
+
+    pub(super) fn attach_persisting(
+        &self,
+        store: &Store,
+        reg: &mut Registry,
+        name: &str,
+        retired: &mut Vec<MemoryLease>,
+        persist: impl FnOnce(&ViewDef) -> Result<()>,
+    ) -> Result<()> {
         let host = self.host()?;
         let Some(entry) = reg.views.get(name) else {
             return Ok(());
@@ -118,6 +129,7 @@ impl Runtime {
         // checked again on every attach, since a change of the host's epoch or a
         // rebuild clears the error
         if let Some(e) = unsupported(&entry.def) {
+            persist(&entry.def)?;
             let entry = reg.views.get_mut(name).expect("checked above");
             entry.error = Some(e);
             return Ok(());
@@ -127,22 +139,37 @@ impl Runtime {
         let q = self.parse(host.as_ref(), &text)?;
         let access = host.access(def.principal.as_deref())?;
         let (cell, new) = self.cell_for(reg, q, &text, access.clone(), Some(def.memory_bytes))?;
-        {
+        let attached = {
             let mut st = cell.state.lock();
             let was_empty = st.view_limits.is_empty();
-            st.view_limits.insert(name.to_string(), def.memory_bytes);
+            let previous = st.view_limits.insert(name.to_string(), def.memory_bytes);
             st.recompute_local_limit();
-            if was_empty {
+            let result = if was_empty {
                 st.circuit
-                    .set_version_pool(Some(self.published_views.clone()));
+                    .attach_version_pool(self.published_views.clone(), || persist(&def))
+            } else {
+                persist(&def)
+            };
+            if result.is_err() {
+                if let Some(previous) = previous {
+                    st.view_limits.insert(name.to_string(), previous);
+                } else {
+                    st.view_limits.remove(name);
+                }
+                st.recompute_local_limit();
+            } else if was_empty {
                 let mut info = cell.info.lock();
                 info.bytes = st.circuit.bytes();
-                info.published_bytes = st
-                    .circuit
-                    .version
-                    .as_ref()
-                    .map_or(0, |v| v.published_bytes());
+                info.published_bytes = st.circuit.published_bytes();
             }
+            retired.extend(st.circuit.drain_retired());
+            result
+        };
+        if let Err(error) = attached {
+            if new {
+                reg.cells.remove(&cell.key);
+            }
+            return Err(error);
         }
         if new {
             self.ensure_subscription(store);
@@ -230,9 +257,12 @@ impl Runtime {
                     && h.fingerprint == st.fingerprint(cell.key, snap_ev.as_deref())
                     && commit_ok
                 {
-                    match st.circuit.decode_with_input_charged(body, &snap) {
+                    match st
+                        .circuit
+                        .decode_with_input_charged(body, &snap)
+                        .and_then(|()| st.circuit.set_applied(h.commit))
+                    {
                         Ok(()) => {
-                            st.circuit.set_applied(h.commit);
                             st.circuit
                                 .set_evidence_stamp(crate::incr::live::EvidenceStamp {
                                     managed_gen: snap_gen,
@@ -245,11 +275,7 @@ impl Runtime {
                             info.applied = h.commit;
                             info.rows = st.circuit.result.total().max(0) as u64;
                             info.bytes = st.circuit.bytes();
-                            info.published_bytes = st
-                                .circuit
-                                .version
-                                .as_ref()
-                                .map_or(0, |v| v.published_bytes());
+                            info.published_bytes = st.circuit.published_bytes();
                             tracing::info!(
                                 target: "sparkles::incr::runtime",
                                 "view {name}: loaded its state at commit {}; {} commits to apply",
@@ -298,7 +324,7 @@ impl Runtime {
                 for (name, e) in reg.views.iter_mut() {
                     e.error = None;
                     if let Some(c) = e.cell.take() {
-                        c.release_view(name);
+                        c.release_view(name, &mut deferred.retired);
                         deferred.cells.push(c);
                     }
                 }
@@ -2128,8 +2154,9 @@ mod switch_tests {
         }
     }
 
-    #[test]
-    fn eager_view_fallback_observes_cancellation_during_evaluation() {
+    /// A runtime with view `v` under the Sparkles reading of aggregate errors, which a
+    /// read under the Jena reading evaluates as an eager fallback rebuild.
+    fn eager_fallback_fixture() -> (Store, Arc<Runtime>) {
         use crate::sparql::AggregateErrors;
 
         let store = Store::in_memory(StoreOptions::default());
@@ -2151,16 +2178,57 @@ mod switch_tests {
         )
         .unwrap();
         rt.round(&store);
+        (store, rt)
+    }
 
+    #[test]
+    fn eager_view_fallback_observes_cancellation_during_evaluation() {
+        use crate::incr::runtime::FallbackEvent;
+        use crate::sparql::AggregateErrors;
+        use std::{cell::Cell, rc::Rc};
+
+        let (store, rt) = eager_fallback_fixture();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let flag = cancelled.clone();
-        let parent = sparkles_budget::MemoryDomain::unpooled().parent(
-            move |_| {
-                flag.store(true, Ordering::Release);
-                Ok(())
-            },
-            |_| {},
-        );
+        let evaluating = Arc::new(AtomicBool::new(false));
+        let staged = Arc::new(AtomicU64::new(0));
+        let triggered = Arc::new(AtomicU64::new(0));
+        let parent = {
+            let (flag, evaluating, staged, triggered) = (
+                cancelled.clone(),
+                evaluating.clone(),
+                staged.clone(),
+                triggered.clone(),
+            );
+            sparkles_budget::MemoryDomain::unpooled().parent(
+                move |_| {
+                    // Staging reservations succeed without cancelling. The first
+                    // reservation after evaluation starts sets the flag.
+                    if evaluating.load(Ordering::Acquire) {
+                        triggered.fetch_add(1, Ordering::Relaxed);
+                        flag.store(true, Ordering::Release);
+                    } else {
+                        staged.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                },
+                |_| {},
+            )
+        };
+        let built = Rc::new(Cell::new(false));
+        let _hook = {
+            let (flag, evaluating, built) = (cancelled.clone(), evaluating.clone(), built.clone());
+            crate::incr::runtime::set_fallback_hook(move |event| match event {
+                FallbackEvent::Evaluating => {
+                    assert!(
+                        !flag.load(Ordering::Acquire),
+                        "staging must not cancel the fallback"
+                    );
+                    evaluating.store(true, Ordering::Release);
+                }
+                FallbackEvent::Built => built.set(true),
+                FallbackEvent::Decoded(_) => {}
+            })
+        };
         let snap = store.snapshot();
         let r = ViewRead {
             name: "v",
@@ -2178,10 +2246,105 @@ mod switch_tests {
             crate::task::Cancellation::from_flags([cancelled.clone()])
         });
         assert!(
-            cancelled.load(Ordering::Acquire),
-            "fallback did not begin allocating"
+            staged.load(Ordering::Relaxed) > 0,
+            "the rebuild's staging did not reach the parent before evaluation"
+        );
+        assert!(
+            evaluating.load(Ordering::Acquire),
+            "the fallback did not start evaluating"
+        );
+        assert!(
+            triggered.load(Ordering::Relaxed) > 0,
+            "no parent reservation ran during evaluation"
+        );
+        assert!(
+            !built.get(),
+            "the evaluation pass returned without observing cancellation"
         );
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn eager_view_fallback_frees_rows_before_credit_on_late_cancellation() {
+        use crate::incr::runtime::FallbackEvent;
+        use crate::sparql::AggregateErrors;
+        use crate::test_alloc::FreeWatch;
+        use std::rc::Rc;
+
+        let (store, rt) = eager_fallback_fixture();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let live_releases = Arc::new(AtomicU64::new(0));
+        let freed_releases = Arc::new(AtomicU64::new(0));
+        let foreign = Arc::new(AtomicBool::new(false));
+        let test_thread = std::thread::current().id();
+        let parent = {
+            let (live, freed, foreign) = (
+                live_releases.clone(),
+                freed_releases.clone(),
+                foreign.clone(),
+            );
+            sparkles_budget::MemoryDomain::unpooled().parent(
+                |_| Ok(()),
+                move |bytes| {
+                    if bytes == 0 {
+                        return;
+                    }
+                    if std::thread::current().id() != test_thread {
+                        foreign.store(true, Ordering::Relaxed);
+                    } else if FreeWatch::live() {
+                        live.fetch_add(1, Ordering::Relaxed);
+                    } else if FreeWatch::freed() {
+                        freed.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+            )
+        };
+        let watch = Rc::new(FreeWatch::new());
+        let decoded = Rc::new(std::cell::Cell::new(0usize));
+        let _hook = {
+            let (flag, watch, decoded) = (cancelled.clone(), watch.clone(), decoded.clone());
+            crate::incr::runtime::set_fallback_hook(move |event| {
+                if let FallbackEvent::Decoded(rows) = event {
+                    // Watch the decoded rows' buffer and cancel before the final check.
+                    decoded.set(rows.len());
+                    watch.arm(rows.as_ptr().cast());
+                    flag.store(true, Ordering::Release);
+                }
+            })
+        };
+        let snap = store.snapshot();
+        let result = rt.read_controlled(
+            &ViewRead {
+                name: "v",
+                at: snap.commit,
+                snap: Some(&snap),
+                allow_stale: true,
+                caller: None,
+                deadline: Some(Instant::now() + Duration::from_secs(5)),
+                aggregate_errors: Some(AggregateErrors::Jena),
+                memory_parent: Some(&|| Ok(parent.clone())),
+                memory_pool: None,
+                max_memory_bytes: None,
+            },
+            &|| Ok(()),
+            &|| crate::task::Cancellation::from_flags([cancelled.clone()]),
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(decoded.get(), 1, "the fallback did not decode its row");
+        assert!(FreeWatch::freed(), "the decoded rows were not freed");
+        assert!(
+            !foreign.load(Ordering::Relaxed),
+            "parent credit returned on another thread"
+        );
+        assert_eq!(
+            live_releases.load(Ordering::Relaxed),
+            0,
+            "parent credit returned while the decoded rows were still allocated"
+        );
+        assert!(
+            freed_releases.load(Ordering::Relaxed) > 0,
+            "no parent credit returned after the decoded rows were freed"
+        );
     }
 
     #[test]
@@ -2208,11 +2371,20 @@ mod switch_tests {
         let installed = Arc::new(AtomicU64::new(0));
         let admitted = installed.clone();
         let row_bytes = crate::incr::zset::row_bytes(1);
-        // Inline integer VALUES needs no budget reservation before result installation.
-        // Refuse rounded credit so each installed row reaches the parent separately.
+        // Inline integer VALUES needs no budget reservation before result installation
+        // beyond the read's exact admission of the fallback's staging, which follows the
+        // refusal of its rounded chunk. Refuse rounded credit so each installed row
+        // reaches the parent separately.
+        let staged = AtomicBool::new(false);
         let parent = sparkles_budget::MemoryDomain::unpooled().parent(
             move |bytes| {
                 if bytes > row_bytes {
+                    if !bytes.is_multiple_of(sparkles_budget::LIVE_STEP)
+                        && admitted.load(Ordering::Relaxed) == 0
+                        && !staged.swap(true, Ordering::Relaxed)
+                    {
+                        return Ok(());
+                    }
                     return Err(sparkles_budget::ParentRefused::Overflow);
                 }
                 assert_eq!(bytes, row_bytes);

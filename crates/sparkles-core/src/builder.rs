@@ -235,7 +235,8 @@ pub const FEATURE_FSST_VOCAB: &str = "fsst-vocab";
 pub const KNOWN_FEATURES: &[&str] = &[FEATURE_FSST_VOCAB];
 
 /// How the base vocabulary stores the suffixes of its front-coded keys (spec X11 §4.1).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VocabCodec {
     /// as they are
     #[default]
@@ -846,7 +847,7 @@ impl Builder {
                 self.phase_done("predicate patterns");
                 info
             }
-            None => crate::patterns::PatternInfo::skipped("turned off for this build"),
+            None => crate::patterns::PatternInfo::skipped(crate::patterns::DISABLED_FOR_BUILD),
         };
         let reifiers = if rdf_reifies.is_some() {
             self.interrupted()?;

@@ -6,6 +6,7 @@
 // shape, so the helpers take the kind's URL rather than a dataset.
 
 import { ApiError, errorMessage, json } from './api';
+import { assistantSettings, type AssistantSettings } from './ask-api';
 
 const enc = encodeURIComponent;
 
@@ -54,7 +55,7 @@ export type DatasetKind = (typeof DATASET_KINDS)[number];
 export const datasetKindUrl = (ds: string, kind: string) => `/$/settings/${enc(ds)}/${enc(kind)}`;
 
 /** The headers of a write: JSON, and `If-Match` when the caller read an ETag. */
-function writeInit(method: string, etag?: string | null, body?: unknown): RequestInit {
+function writeInit(method: string, etag?: string | null, body?: unknown) {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (etag) headers['If-Match'] = etag;
@@ -881,4 +882,271 @@ export function writeFailure(e: unknown): WriteFailure {
 export function conflicts(path: string, fields: readonly string[]): boolean {
   const p = parsePath(path);
   return fields.map(parsePath).some((f) => startsWith(f, p) || startsWith(p, f));
+}
+
+// --- assistant server ingestion (spec C19 §8.1 / item 77) ------------------------------
+
+export type IngestFieldName = 'enabled' | 'ingest' | 'send';
+
+/** The assistant fields that server-side ingestion needs (spec C19 §8.1). */
+export const INGEST_FIELDS: ReadonlyArray<readonly [IngestFieldName, unknown]> = [
+  ['enabled', true],
+  ['ingest', true],
+  ['send', 'documents'],
+];
+
+export type IngestFieldPlan = {
+  field: IngestFieldName;
+  wanted: unknown;
+  current: unknown;
+  source: FieldSource;
+};
+
+export type EnableIngestPlan = {
+  /** Fields whose source is `default` and whose value differs from the wanted value. */
+  patch: JsonObject;
+  changed: IngestFieldPlan[];
+  unchanged: IngestFieldPlan[];
+  /** Non-default fields that still prevent server ingestion after applying `patch`. */
+  blockers: IngestFieldPlan[];
+  /** Whether applying `patch` leaves enabled=true, ingest=true and send='documents'. */
+  wouldEnable: boolean;
+};
+
+/**
+ * Compute the C19 §8.1 PATCH for turning on server-side ingestion: set only fields of
+ * `INGEST_FIELDS` whose source is `default`, leaving declared, runtime and locked fields
+ * untouched.
+ */
+export function planEnableIngest(
+  k: Pick<SettingsKind, 'effective' | 'sources' | 'locked'>,
+): EnableIngestPlan {
+  const patch: JsonObject = {};
+  const changed: IngestFieldPlan[] = [];
+  const unchanged: IngestFieldPlan[] = [];
+  const blockers: IngestFieldPlan[] = [];
+  for (const [field, wanted] of INGEST_FIELDS) {
+    const current = k.effective?.[field];
+    const source: FieldSource = k.locked?.includes(field)
+      ? 'locked'
+      : (k.sources?.[field] ?? 'default');
+    const item: IngestFieldPlan = { field, wanted, current, source };
+    if (source === 'default' && current !== wanted) {
+      patch[field] = wanted;
+      changed.push(item);
+    } else {
+      unchanged.push(item);
+      if (current !== wanted) blockers.push(item);
+    }
+  }
+  return {
+    patch,
+    changed,
+    unchanged,
+    blockers,
+    wouldEnable: blockers.length === 0,
+  };
+}
+
+export type ExtractProviderView = {
+  provider: string;
+  model: string;
+  send: string;
+  receivesDocuments: boolean;
+};
+
+export type IngestAvailability = {
+  on: boolean;
+  modelsConfigured: boolean;
+  providers: ExtractProviderView[];
+  activeProviders: ExtractProviderView[];
+  modelRevision?: string;
+  /** Providers and send levels after applying the enable patch. */
+  enableProviders: ExtractProviderView[];
+  plan: EnableIngestPlan | null;
+  /** The first setting field keeping server ingestion off, when applicable. */
+  blockingField?: {
+    field: IngestFieldName | 'sendByProvider';
+    source?: FieldSource;
+    value?: unknown;
+  };
+  /** Human-readable explanation when server ingestion is off. */
+  reason?: string;
+  /** Whether applying `plan.patch` can turn server ingestion on directly. */
+  canEnableDirectly: boolean;
+  /** Whether the `ingest` field itself is locked by server configuration. */
+  ingestLocked: boolean;
+};
+
+function sendOfProvider(
+  effective: JsonObject | undefined,
+  provider: string,
+  overrideSend?: string,
+): string {
+  const base = overrideSend ?? (typeof effective?.send === 'string' ? effective.send : 'schema');
+  const byProv = effective?.sendByProvider;
+  if (isObject(byProv) && Object.keys(byProv).length > 0 && typeof byProv[provider] === 'string') {
+    const specific = byProv[provider] as string;
+    const rank = (s: string) => (s === 'documents' ? 2 : s === 'rows' ? 1 : 0);
+    return rank(specific) < rank(base) ? specific : base;
+  }
+  return base;
+}
+
+/** Describe the current server-side ingestion state for a dataset. */
+export function describeIngestState(
+  kind: SettingsKind | null,
+  assistant?: AssistantSettings | null,
+): IngestAvailability {
+  const effective = kind?.effective ?? assistant;
+  const status = assistant?.status;
+  const plan = kind ? planEnableIngest(kind) : null;
+  const modelsConfigured = status?.models ?? false;
+  const rawPairs = status?.extract ?? [];
+  const providersAt = (overrideSend?: string): ExtractProviderView[] =>
+    rawPairs.map(({ provider, model }) => {
+      const send = sendOfProvider(effective ?? undefined, provider, overrideSend);
+      return { provider, model, send, receivesDocuments: send === 'documents' };
+    });
+  const providers = providersAt();
+  const activeProviders = providers.filter((p) => p.receivesDocuments);
+  const afterSend = plan?.patch.send ?? effective?.send;
+  const enableProviders = providersAt(typeof afterSend === 'string' ? afterSend : undefined);
+  const ingestLocked = kind ? fieldInfo(kind, 'ingest').locked : false;
+  const fieldsOn =
+    effective?.enabled === true && effective.ingest === true && effective.send === 'documents';
+  const on = status?.ingest === true;
+
+  if (on) {
+    return {
+      on: true,
+      modelsConfigured,
+      providers,
+      activeProviders,
+      modelRevision: status?.modelRevision,
+      enableProviders,
+      plan,
+      canEnableDirectly: false,
+      ingestLocked,
+    };
+  }
+
+  let blockingField: IngestAvailability['blockingField'];
+  let reason: string;
+  if (!modelsConfigured) {
+    reason = 'the server has no model configuration';
+  } else if (rawPairs.length === 0) {
+    reason = 'no provider and model are configured in the extract role';
+  } else if (plan && plan.blockers.length > 0) {
+    const b = plan.blockers[0];
+    blockingField = { field: b.field, source: b.source, value: b.current };
+    reason = `${b.field} is ${valueText(b.current)} (${sourceReason(b.source)})`;
+  } else if (!fieldsOn) {
+    const first = plan?.changed[0];
+    if (first) {
+      blockingField = { field: first.field, source: first.source, value: first.current };
+      reason = `${first.field} is ${valueText(first.current)} (default)`;
+    } else {
+      reason = 'assistant ingestion is not enabled for this dataset';
+    }
+  } else {
+    blockingField = { field: 'sendByProvider' };
+    reason = 'sendByProvider limits every extract provider below documents';
+  }
+
+  const wouldHaveActiveProvider =
+    modelsConfigured && enableProviders.some((p) => p.receivesDocuments);
+  const canEnableDirectly =
+    plan != null &&
+    plan.wouldEnable &&
+    !!status?.modelRevision &&
+    Object.keys(plan.patch).length > 0 &&
+    wouldHaveActiveProvider;
+
+  return {
+    on: false,
+    modelsConfigured,
+    providers,
+    activeProviders,
+    modelRevision: status?.modelRevision,
+    enableProviders,
+    plan,
+    blockingField,
+    reason,
+    canEnableDirectly,
+    ingestLocked,
+  };
+}
+
+export function sourceReason(source: FieldSource): string {
+  switch (source) {
+    case 'locked':
+      return "locked in the server's settings file";
+    case 'declared':
+      return "declared in the server's settings file";
+    case 'runtime':
+      return 'set at runtime';
+    default:
+      return 'default';
+  }
+}
+
+function ingestConfirmation(s: IngestAvailability): string {
+  const fields = INGEST_FIELDS.map(([field]) => {
+    const f =
+      s.plan?.changed.find((f) => f.field === field) ??
+      s.plan?.unchanged.find((f) => f.field === field);
+    return [field, f?.current, f?.source];
+  });
+  const recipients = s.enableProviders
+    .filter((p) => p.receivesDocuments)
+    .map((p) => [p.provider, p.model]);
+  return JSON.stringify({ fields, recipients, modelRevision: s.modelRevision });
+}
+
+/** Apply the approved enable patch and retry a stale write only for the same plan. */
+export async function enableIngest(ds: string, confirmed: IngestAvailability) {
+  const url = datasetKindUrl(ds, 'assistant');
+  const confirmation = ingestConfirmation(confirmed);
+  for (let attempt = 0; ; attempt++) {
+    const [kind, assistant] = await Promise.all([readKind(url), assistantSettings(ds)]);
+    const current = describeIngestState(kind, assistant);
+    if (
+      !current.canEnableDirectly ||
+      !current.plan ||
+      ingestConfirmation(current) !== confirmation ||
+      JSON.stringify(current.enableProviders) !== JSON.stringify(confirmed.enableProviders)
+    ) {
+      return { kind, assistant, changed: false };
+    }
+    const init = writeInit('PATCH', kind.etag, current.plan.patch);
+    try {
+      const next = await json<SettingsKind>(url, {
+        ...init,
+        headers: { ...init.headers, 'If-Ingest-Confirmation': enc(confirmation) },
+      });
+      return { kind: next, assistant, changed: true };
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 412 && attempt < 2) continue;
+      throw e;
+    }
+  }
+}
+
+/**
+ * Disable server-side ingestion for `ds` by setting `ingest: false` with `If-Match`,
+ * retrying up to three times on `412`.
+ */
+export async function disableIngest(ds: string): Promise<SettingsKind> {
+  const url = datasetKindUrl(ds, 'assistant');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = await readKind(url);
+    try {
+      return await patchKind(url, { ingest: false }, cur.etag);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 412 && attempt < 2) continue;
+      throw e;
+    }
+  }
+  return readKind(url);
 }

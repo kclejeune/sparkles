@@ -506,10 +506,10 @@ pub const SPILL: FileKind = FileKind {
 pub const BACKUP_LAYOUT: FileKind = FileKind {
     id: "backup-layout",
     files: "sparkles-repo.json of a backup repository",
-    marker: "`format`",
+    marker: "`format`; default repositories still write 1",
     class: Class::Archive,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[1, 2],
 };
 
 /// The blobs of a backup repository.
@@ -566,6 +566,7 @@ pub const BACKUP_MANIFEST_FEATURES: &[&str] = &[
     "evidence-configuration-history/1",
     "evidence-configuration-history/2",
     "control/1",
+    "fastcdc-2016/1",
 ];
 
 /// A kind of dataset-managed definition that backups and clones carry beside the data,
@@ -809,6 +810,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("describe.json", 1),
     ds("aggregate-errors.json", 1),
     ds("compaction.json", 1),
+    ds(crate::store::INDEX_SETTINGS_FILE, 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),
     ds("history.json", 2),
@@ -820,6 +822,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("validation.json", 3),
     ds("validation-status.json", 1),
     ds("text.json", 1),
+    ds("reasoning-imports.json", 2),
     named(ds("reasoning.json", 2), "reasoningFormat"),
     named(ds("query-reasoning.json", 1), "queryReasoningFormat"),
     named(ds("rdfs.json", 1), "rdfsFormat"),
@@ -827,7 +830,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("graphql.json", 1),
     named(ds("restore.json", 1), "restoreFormat"),
     ds("assistant.json", 1),
-    ds("memory.json", 3),
+    ds("memory.json", 4),
     ds("ingest.json", 1),
     ds("asks.json", 3),
     ds("query-suggestions.json", 1),
@@ -1097,15 +1100,20 @@ fn settings_max_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
 /// this build writes, except that a file whose content an older release reads keeps
 /// that older version, so only a file that uses a newer feature is refused by older
 /// releases. `memory.json` is format 2 when it holds `scratchBranches` with `ttl` only,
-/// and format 3 when `scratchBranches` holds `maxPerPrincipal` or `notifyBefore`.
+/// format 3 when `scratchBranches` holds `maxPerPrincipal` or `notifyBefore`, and
+/// format 4 when it holds `redaction`.
 fn settings_stamp_format(s: &SettingsFile, v: &serde_json::Value) -> u32 {
     if s.name == "memory.json" {
+        if v.get("redaction").is_some() {
+            return 4;
+        }
         let Some(sb) = v.get("scratchBranches") else {
             return 1;
         };
         if sb.get("maxPerPrincipal").is_none() && sb.get("notifyBefore").is_none() {
             return 2;
         }
+        return 3;
     }
     settings_max_format(s, v)
 }
@@ -1554,7 +1562,7 @@ mod tests {
     #[test]
     fn memory_format_two_needs_scratch_branches() {
         use serde_json::json;
-        assert_eq!(settings_file("memory.json").unwrap().writes, 3);
+        assert_eq!(settings_file("memory.json").unwrap().writes, 4);
         let mut plain = json!({"agentGraphs": ["urn:x:a/*"]});
         stamp_settings("memory.json", &mut plain);
         assert_eq!(plain["format"], 1, "older releases keep reading it");
@@ -1565,7 +1573,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["format"], 2);
         assert!(check_settings("memory.json", &v).is_ok());
-        let e = check_settings("memory.json", &json!({"format": 4})).unwrap_err();
+        let e = check_settings("memory.json", &json!({"format": 5})).unwrap_err();
         assert!(matches!(e, Error::Unsupported(_)), "{e}");
     }
 
@@ -1586,6 +1594,15 @@ mod tests {
         let mut v = json!({"scratchBranches": {"ttl": "1d"}});
         stamp_settings("memory.json", &mut v);
         assert_eq!(v["format"], 2);
+    }
+
+    #[test]
+    fn memory_format_four_needs_redaction() {
+        use serde_json::json;
+        let mut v = json!({"redaction": {"serverIngest": "refuse"}});
+        stamp_settings("memory.json", &mut v);
+        assert_eq!(v["format"], 4, "{v}");
+        assert!(check_settings("memory.json", &v).is_ok());
     }
 
     #[test]

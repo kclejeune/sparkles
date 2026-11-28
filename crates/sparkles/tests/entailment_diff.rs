@@ -510,3 +510,42 @@ r(?x) :- (?x ex:p ?y).
         "{e}"
     );
 }
+
+/// A named input graph whose name passes the diagnostic report's share is a refusal
+/// of the analysis's memory bounds, not a malformed request.
+#[test]
+fn a_diagnostic_scope_beyond_its_share_is_a_reasoning_budget_refusal() {
+    let (_dir, dataset) = open();
+    let graph = format!("http://ex.org/graph/{}", "g".repeat(270_000));
+    update(
+        &dataset,
+        &format!("INSERT DATA {{ GRAPH <{graph}> {{ ex:Manager rdfs:subClassOf ex:Employee }} }}"),
+    );
+    let from = dataset.store().snapshot().commit;
+    update(
+        &dataset,
+        &format!("INSERT DATA {{ GRAPH <{graph}> {{ ex:alice a ex:Manager }} }}"),
+    );
+    let mut req = request(from, "head");
+    req.analysis.program.as_mut().unwrap().inputs = Inputs {
+        data_graphs: vec![sparkles::reasoning::reasoner::GraphRef::Named(
+            graph.clone(),
+        )],
+        ..Default::default()
+    };
+    // The scope is valid: with room for the report the diff answers.
+    let diff = dataset.reasoning().diff(&req).unwrap();
+    assert_eq!((diff.added, diff.removed), (1, 0));
+    // An eighth of the limit holds witnesses, an eighth of the rest is the analysis
+    // share, and the report has half of that share, which the scope alone passes.
+    let max_memory = 8 * 1024 * 1024;
+    let report_limit = (max_memory - max_memory / 8) / 16;
+    assert!(graph.len() * 2 + 32 > report_limit);
+    req.analysis.max_memory = Some(max_memory);
+    let error = dataset.reasoning().diff(&req).unwrap_err();
+    assert!(
+        matches!(&error, Error::Component(c) if c.code == "reasoning-budget"
+            && c.message.contains(&format!("memory limit of {report_limit} bytes"))),
+        "{error:?}"
+    );
+}

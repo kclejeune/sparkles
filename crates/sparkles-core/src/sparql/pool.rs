@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 mod memory;
+mod wakes;
 pub use memory::DomainStats;
+#[doc(hidden)]
+pub use wakes::ReleaseWakes;
 
 /// The size in which grants grow and shrink.
 pub const GRANULE: u64 = 4 << 20;
@@ -39,10 +42,40 @@ fn round_up(bytes: u64) -> u64 {
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
+enum Wake {
+    Callback(Waker),
+    Signal(std::sync::mpsc::SyncSender<()>),
+}
+
+/// A wake-up taken out of the queue, delivered after its lock is released.
+enum Notice {
+    Callback(Waker),
+    Signal(std::sync::mpsc::SyncSender<()>),
+}
+
+impl Notice {
+    fn deliver(self) {
+        match self {
+            Self::Callback(callback) => callback(),
+            // One queued signal suffices. This never invokes user code.
+            Self::Signal(sender) => {
+                let _ = sender.try_send(());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`QueryPool::wake`] between choosing a waiter and notifying it.
+    static AFTER_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct Waiter {
     ticket: u64,
     bytes: u64,
-    wake: Option<Waker>,
+    wake: Option<Wake>,
 }
 
 #[derive(Default)]
@@ -140,13 +173,35 @@ impl QueryPool {
         }
     }
 
-    fn wake(&self) {
+    fn wake(self: &Arc<Self>) {
         // the callback runs outside the lock, so that it may poll its ticket
-        let next = self.next_to_serve(&self.queue.lock());
-        if let Some((_, Some(f))) = next {
-            f();
+        let notice = self.notice(&self.queue.lock(), None);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SELECT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        if let Some(notice) = notice {
+            notice.deliver();
         }
         self.changed.notify_all();
+    }
+
+    /// The wake-up owed to the waiter [`next_to_serve`](Self::next_to_serve) picks,
+    /// unless that is `skip`. A callback is deferred while this thread has a deferral
+    /// open, and then nothing of it is cloned. A clone could otherwise become its last
+    /// owner when another thread drops the ticket, and its captured values would be
+    /// dropped inside the deferral's protected scope.
+    fn notice(self: &Arc<Self>, q: &Queue, skip: Option<u64>) -> Option<Notice> {
+        let waiter = &q.waiters[self.next_to_serve(q)?];
+        if skip == Some(waiter.ticket) {
+            return None;
+        }
+        match waiter.wake.as_ref()? {
+            Wake::Callback(callback) => {
+                (!wakes::defer(self)).then(|| Notice::Callback(callback.clone()))
+            }
+            Wake::Signal(sender) => Some(Notice::Signal(sender.clone())),
+        }
     }
 
     /// The wake-up of the first waiter that [`Ticket::poll`] would serve now, if it has
@@ -154,15 +209,13 @@ impl QueryPool {
     /// fits, so a release wakes the waiters that fit one after another instead of all of
     /// them. A waiter that was woken but finds the memory taken again passes the wake-up
     /// on in the same way. Blocking waiters have no callback and wait on `changed`.
-    fn next_to_serve(&self, q: &Queue) -> Option<(u64, Option<Waker>)> {
+    fn next_to_serve(&self, q: &Queue) -> Option<usize> {
         let granted = self.granted.load(Ordering::SeqCst);
-        (0..q.waiters.len())
-            .find(|&pos| {
-                let w = &q.waiters[pos];
-                granted.saturating_add(w.bytes) <= self.capacity
-                    && may_pass(q, pos, granted, self.capacity)
-            })
-            .map(|pos| (q.waiters[pos].ticket, q.waiters[pos].wake.clone()))
+        (0..q.waiters.len()).find(|&pos| {
+            let w = &q.waiters[pos];
+            granted.saturating_add(w.bytes) <= self.capacity
+                && may_pass(q, pos, granted, self.capacity)
+        })
     }
 
     /// The most a request can be granted at admission: a pool smaller than the usual
@@ -191,10 +244,27 @@ impl QueryPool {
 
     /// Join the admission queue for an initial grant of `bytes`. `wake` is called when
     /// the pool's state changes, so that an async caller can poll again.
-    /// It runs synchronously during release, including Drop, and must not panic.
+    /// It may run synchronously during release, including Drop, and must not panic.
     /// Callback panics are not contained.
     pub fn enter(self: &Arc<Self>, bytes: u64, wake: Option<Waker>) -> Ticket {
+        self.enqueue(bytes, wake.map(Wake::Callback))
+    }
+
+    /// Join the admission queue with a signal receiver. Signals can be delivered
+    /// while callbacks are deferred. The receiver already holds a signal when the
+    /// ticket could be served at entry, so a caller may wait for a signal first and
+    /// poll the ticket after each one.
+    pub fn enter_with_signal(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> (Ticket, std::sync::mpsc::Receiver<()>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        (self.enqueue(bytes, Some(Wake::Signal(sender))), receiver)
+    }
+
+    fn enqueue(self: &Arc<Self>, bytes: u64, wake: Option<Wake>) -> Ticket {
         let bytes = self.clamp(bytes);
+        let signal = matches!(wake, Some(Wake::Signal(_)));
         let mut q = self.queue.lock();
         let ticket = q.next_ticket;
         q.next_ticket += 1;
@@ -204,6 +274,16 @@ impl QueryPool {
             wake,
         });
         self.waiting.store(q.waiters.len(), Ordering::SeqCst);
+        // A release before the entry saw no waiter and sent no signal. A signal never
+        // runs user code, so it is sent under the lock.
+        if signal
+            && let Some(pos) = self.next_to_serve(&q)
+            && q.waiters[pos].ticket == ticket
+            && let Some(Wake::Signal(sender)) = &q.waiters[pos].wake
+        {
+            let _ = sender.try_send(());
+        }
+        drop(q);
         Ticket {
             pool: self.clone(),
             ticket,
@@ -290,25 +370,25 @@ impl Ticket {
             // This waiter may have been the one a release woke, and a running grant may
             // have grown into the memory since. Another waiter may fit in what is left,
             // so the wake-up goes on to it rather than ending here.
-            let next = pool.next_to_serve(&q);
+            let notice = pool.notice(&q, Some(self.ticket));
             drop(q);
-            if let Some((ticket, Some(f))) = next
-                && ticket != self.ticket
-            {
-                f();
+            if let Some(notice) = notice {
+                notice.deliver();
             }
             return None;
         }
-        q.waiters.remove(pos);
+        let served = q.waiters.remove(pos);
         q.bypassed = if pos == 0 { 0 } else { q.bypassed + 1 };
         pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         pool.admitted.fetch_add(1, Ordering::Relaxed);
         self.done = true;
         // the next waiter may fit in what is left
-        let next = pool.next_to_serve(&q);
+        let notice = pool.notice(&q, None);
         drop(q);
-        if let Some((_, Some(f))) = next {
-            f();
+        // Dropping the closure's captured values can also run user code.
+        drop(served);
+        if let Some(notice) = notice {
+            notice.deliver();
         }
         pool.changed.notify_all();
         Some(PoolGrant::with(pool.clone(), self.bytes))
@@ -321,13 +401,17 @@ impl Drop for Ticket {
             return;
         }
         let mut q = self.pool.queue.lock();
-        if q.waiters.front().is_some_and(|w| w.ticket == self.ticket) {
+        let Some(pos) = q.waiters.iter().position(|w| w.ticket == self.ticket) else {
+            return;
+        };
+        if pos == 0 {
             // the next head starts with no bypasses behind it
             q.bypassed = 0;
         }
-        q.waiters.retain(|w| w.ticket != self.ticket);
+        let cancelled = q.waiters.remove(pos);
         self.pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         drop(q);
+        drop(cancelled);
         // a smaller request behind this one may fit now
         self.pool.wake();
     }
@@ -342,6 +426,8 @@ pub struct PoolGrant {
     granted: AtomicU64,
     /// Sum of eager context contributions, live cursor charges and direct charges.
     used: AtomicU64,
+    /// Part of `used` whose leases can outlive the request and repay the pool directly.
+    surviving: AtomicU64,
     /// the most the grant has held
     peak: AtomicU64,
     /// serializes growth and trimming of this grant
@@ -369,6 +455,7 @@ impl PoolGrant {
             pool,
             granted: AtomicU64::new(bytes),
             used: AtomicU64::new(0),
+            surviving: AtomicU64::new(0),
             peak: AtomicU64::new(bytes),
             resize: Mutex::new(()),
         }
@@ -560,7 +647,8 @@ impl PoolGrant {
 
 impl Drop for PoolGrant {
     fn drop(&mut self) {
-        self.pool.release(*self.granted.get_mut());
+        self.pool
+            .release(*self.granted.get_mut() - *self.surviving.get_mut());
     }
 }
 
@@ -569,6 +657,211 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    /// Records the thread that drops the callback's last owner.
+    struct DropProbe(Arc<parking_lot::Mutex<Option<std::thread::ThreadId>>>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            *self.0.lock() = Some(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn a_ticket_cancelled_after_selection_drops_its_callback_outside_the_deferral() {
+        let pool = QueryPool::new(GRANULE);
+        let grant = pool.try_grant(GRANULE).unwrap();
+        let dropped_on = Arc::new(parking_lot::Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ticket = pool.enter(
+            GRANULE,
+            Some({
+                let probe = DropProbe(dropped_on.clone());
+                let calls = calls.clone();
+                Arc::new(move || {
+                    std::hint::black_box(&probe);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        // Between choosing the waiter and notifying it, another thread cancels the
+        // ticket and drops the queue's copy of its callback.
+        let cancel = std::sync::Mutex::new(Some(ticket));
+        AFTER_SELECT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let ticket = cancel.lock().unwrap().take();
+                std::thread::spawn(move || drop(ticket)).join().unwrap();
+            }))
+        });
+        let scope = std::thread::current().id();
+        QueryPool::with_deferred_release_wakes(|| {
+            drop(grant);
+            assert!(dropped_on.lock().is_some(), "the cancellation ran");
+            assert_ne!(
+                *dropped_on.lock(),
+                Some(scope),
+                "the callback's captures were dropped inside the deferral"
+            );
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.waiting(), 0);
+    }
+
+    #[test]
+    fn a_captured_deferral_holds_releases_from_other_threads_until_its_drain() {
+        let pool = QueryPool::new(GRANULE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let calls = calls.clone();
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        let scope = std::thread::current().id();
+        for other_scope in [false, true] {
+            let grant = pool.empty_grant();
+            grant.charge(GRANULE).unwrap();
+            let wakes = QueryPool::with_deferred_release_wakes(|| {
+                let wakes = QueryPool::capture_release_wakes().expect("open scope");
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        assert_ne!(std::thread::current().id(), scope);
+                        let release = || wakes.run(|| drop(grant));
+                        if other_scope {
+                            // Another run's deferral on this thread drains first.
+                            QueryPool::with_deferred_release_wakes(release);
+                        } else {
+                            release();
+                        }
+                    });
+                });
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "other_scope={other_scope}");
+                wakes
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "other_scope={other_scope}");
+            // A closed capture leaves later releases to notify as before.
+            let grant = pool.empty_grant();
+            grant.charge(GRANULE).unwrap();
+            wakes.run(|| drop(grant));
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "other_scope={other_scope}");
+            calls.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_capture_that_closes_during_a_release_falls_back_to_the_threads_deferral() {
+        let pool = QueryPool::new(GRANULE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let calls = calls.clone();
+                Arc::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        let grant = pool.empty_grant();
+        grant.charge(GRANULE).unwrap();
+        let (wakes_tx, wakes_rx) = std::sync::mpsc::channel();
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            // Run B releases memory that run A's budget owns, and A finishes while
+            // A's capture is in place on B's thread.
+            s.spawn({
+                let calls = calls.clone();
+                move || {
+                    let wakes: ReleaseWakes = wakes_rx.recv().unwrap();
+                    QueryPool::with_deferred_release_wakes(|| {
+                        wakes.run(|| {
+                            installed_tx.send(()).unwrap();
+                            closed_rx.recv().unwrap();
+                            drop(grant);
+                        });
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            0,
+                            "the callback ran inside run B's deferral"
+                        );
+                    });
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                }
+            });
+            QueryPool::with_deferred_release_wakes(|| {
+                let wakes = QueryPool::capture_release_wakes().expect("open scope");
+                wakes_tx.send(wakes).unwrap();
+                installed_rx.recv().unwrap();
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "run A had nothing queued");
+            closed_tx.send(()).unwrap();
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_signal_ticket_that_fits_at_entry_holds_a_signal() {
+        let pool = QueryPool::new(2 * GRANULE);
+        let (mut ticket, signal) = pool.enter_with_signal(GRANULE);
+        signal.try_recv().expect("an idle pool signals at entry");
+        assert!(ticket.poll().is_some());
+        let grant = pool.try_grant(2 * GRANULE).unwrap();
+        let (mut ticket, signal) = pool.enter_with_signal(GRANULE);
+        assert!(
+            signal.try_recv().is_err(),
+            "a ticket that waits has no signal yet"
+        );
+        drop(grant);
+        signal.try_recv().expect("the release signals");
+        assert!(ticket.poll().is_some());
+    }
+
+    #[test]
+    fn nested_release_deferral_remains_available_during_tls_teardown() {
+        struct ReleaseOnExit {
+            grant: Option<PoolGrant>,
+            wakes: Arc<AtomicUsize>,
+        }
+        impl Drop for ReleaseOnExit {
+            fn drop(&mut self) {
+                QueryPool::with_deferred_release_wakes(|| {
+                    QueryPool::with_deferred_release_wakes(|| drop(self.grant.take()));
+                    assert_eq!(self.wakes.load(Ordering::Relaxed), 0);
+                });
+                assert_eq!(self.wakes.load(Ordering::Relaxed), 1);
+            }
+        }
+        thread_local! {
+            static ON_EXIT: std::cell::RefCell<Option<ReleaseOnExit>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        let pool = QueryPool::new(GRANULE);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let grant = pool.try_grant(GRANULE).unwrap();
+        let _ticket = pool.enter(
+            GRANULE,
+            Some({
+                let wakes = wakes.clone();
+                Arc::new(move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                })
+            }),
+        );
+        std::thread::spawn(move || {
+            ON_EXIT.with(|slot| {
+                *slot.borrow_mut() = Some(ReleaseOnExit {
+                    grant: Some(grant),
+                    wakes,
+                })
+            });
+            QueryPool::with_deferred_release_wakes(|| {});
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn grants_round_to_granules_and_return_on_drop() {

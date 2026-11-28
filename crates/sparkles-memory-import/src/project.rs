@@ -3,6 +3,7 @@
 //! for a directory without a remote.
 
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 
 /// A project: its directory, the root of its repository and its key.
@@ -37,6 +38,26 @@ impl Project {
             dir,
             key,
         }
+    }
+
+    /// A stable project identity to publish under the import redaction policy.
+    pub fn redacted_key(&self, policy: &crate::redact::Policy) -> Cow<'_, str> {
+        let matches = |text: &str| policy.first_match(text).is_some();
+        let local_name_matches = self.key.starts_with("local.")
+            && self
+                .root
+                .file_name()
+                .is_some_and(|n| matches(&n.to_string_lossy()));
+        if local_name_matches || matches(&self.key) || matches(&self.segment()) {
+            return Cow::Owned(self.redacted_alias());
+        }
+        Cow::Borrowed(&self.key)
+    }
+
+    /// The identity any policy that redacts this project publishes.
+    pub fn redacted_alias(&self) -> String {
+        let digest = crate::ids::digest(self.key.as_bytes());
+        format!("redacted-project.{}", digest.trim_start_matches("sha256:"))
     }
 
     /// The key as one graph segment: `/` turned into `.`.

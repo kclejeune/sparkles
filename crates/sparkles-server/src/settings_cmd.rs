@@ -40,7 +40,7 @@ enum SettingsCmd {
         /// The dataset; with --global, the server-wide kind (default: models)
         #[arg(value_name = "DS", required_unless_present = "global")]
         dataset: Option<String>,
-        /// assistant, memory or ingest (default: every kind)
+        /// Settings kind such as assistant or index (default: every kind)
         kind: Option<String>,
         /// Print one layer: the effective object, the declared layers of the settings
         /// file, or the runtime layer. With --json and a layer, print only that object
@@ -79,7 +79,7 @@ enum SettingsCmd {
         /// The dataset; with --global, the server-wide kind (default: models)
         #[arg(value_name = "DS", required_unless_present = "global")]
         dataset: Option<String>,
-        /// assistant, memory or ingest
+        /// Settings kind such as assistant or index
         kind: Option<String>,
         /// Edit a server-wide kind, as in `edit --global models` (needs server-admin)
         #[arg(long)]
@@ -957,10 +957,14 @@ mod remote {
     /// The runtime values of one kind that differ from the declared values and the
     /// built-in defaults beneath them. The answer's `overrides` gives the fields that
     /// replace a declared value, and the other runtime leaves are compared with the
-    /// defaults of this build.
+    /// server-reported base when available, or the CLI's built-in defaults otherwise.
     fn kind_diff(owner: &Owner, k: &J) -> Vec<J> {
         let name = k["kind"].as_str().unwrap_or("");
-        let base = merged(&owner.defaults(name), &k["declared"]);
+        let base = k
+            .get("base")
+            .filter(|base| base.is_object())
+            .cloned()
+            .unwrap_or_else(|| merged(&owner.defaults(name), &k["declared"]));
         let overridden: Vec<Vec<String>> = k["overridden"]
             .as_array()
             .map(|a| {

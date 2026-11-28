@@ -55,6 +55,21 @@ pub(crate) fn generation_name_matches(path: &str, sha256: &str) -> bool {
         .is_none_or(|(_, file)| file.strip_suffix(".json") == Some(sha256))
 }
 
+pub(crate) fn validate_for_repo(
+    m: &Manifest,
+    marker: &crate::layout::Marker,
+    index_formats: &[u32],
+) -> Result<()> {
+    validate(m, marker.piece_bytes, index_formats)?;
+    if marker.chunking.is_none() && m.requires.iter().any(|f| f == crate::chunking::FEATURE) {
+        return Err(BackupError::new(
+            Code::IncompatibleFormat,
+            "a content-defined backup requires a repository with vocabulary chunking enabled",
+        ));
+    }
+    Ok(())
+}
+
 /// Everything a restore checks before writing (`422 invalid-backup` naming the field;
 /// `422 incompatible-format` for `indexFormat != index_format`):
 /// * every `path` passes `layout::valid_backup_path`, without duplicates, and the only
@@ -220,8 +235,26 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             .any(|feature| feature == "evidence-configuration-history/1");
     let mut history_files = false;
     let mut imported_source_files = false;
+    let chunker_required = m.requires.iter().any(|f| f == crate::chunking::FEATURE);
+    let mut chunked_files = false;
     for (i, f) in m.files.iter().enumerate() {
         let field = |k: &str| format!("files[{i}].{k}");
+        if let Some(crate::chunking::Chunker::Unknown(name)) = &f.chunker {
+            return Err(BackupError::new(
+                Code::IncompatibleFormat,
+                format!("unsupported chunker {name:?}"),
+            ));
+        }
+        if f.chunker.is_some() {
+            chunked_files = true;
+            if !chunker_required
+                || !crate::chunking::eligible(&f.path, f.kind)
+                || f.definition.is_some()
+                || !crate::chunking::valid_sizes(&f.blobs)
+            {
+                return bad(&field("chunker"), "invalid FastCDC vocabulary file".into());
+            }
+        }
         let history = crate::layout::configuration_history_path(&f.path);
         let imported = crate::layout::imported_configuration_history_path(&f.path);
         if history {
@@ -303,6 +336,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
         total = total
             .checked_add(f.size)
             .ok_or_else(|| BackupError::invalid_backup("files", "sizes overflow"))?;
+    }
+    if chunker_required && !chunked_files {
+        return bad(
+            "requires",
+            "FastCDC requires a chunked vocabulary file".into(),
+        );
     }
     if !seen.contains("CURRENT") {
         return bad("files", "no CURRENT".into());
@@ -527,6 +566,18 @@ mod tests {
 
     const PIECE: u64 = 100;
 
+    #[test]
+    fn future_chunker_refuses_with_incompatible_format() {
+        let mut value = serde_json::to_value(good()).unwrap();
+        value["files"][0]["chunker"] = json!("future-chunker/2");
+        value["requires"] = json!(["future-chunker/2"]);
+        let manifest = parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            validate(&manifest, PIECE, &[2]).unwrap_err().code(),
+            Code::IncompatibleFormat
+        );
+    }
+
     fn hex64(c: char) -> String {
         c.to_string().repeat(64)
     }
@@ -544,6 +595,7 @@ mod tests {
                     size: *s,
                 })
                 .collect(),
+            chunker: None,
             definition: None,
         }
     }

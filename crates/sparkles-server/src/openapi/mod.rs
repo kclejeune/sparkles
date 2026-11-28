@@ -520,19 +520,14 @@ fn parameters() -> Map<String, J> {
             "The name of the stored query, snapshot, vector index, branch, ingest profile or model secret.",
         ),
     );
-    let mut kind = path(
-        "kind",
-        "The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server.",
+    let mut kind = path("kind", "The dataset or server-wide settings kind.");
+    kind["schema"]["enum"] = json!(
+        crate::settings::KINDS
+            .iter()
+            .chain(&crate::settings::SERVER_KINDS)
+            .map(|kind| kind.name)
+            .collect::<Vec<_>>()
     );
-    kind["schema"]["enum"] = json!([
-        "assistant",
-        "memory",
-        "ingest",
-        "graphrag",
-        "forms",
-        "models",
-        "notifications"
-    ]);
     put("kind", kind);
     put(
         "id",

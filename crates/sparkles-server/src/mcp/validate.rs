@@ -126,7 +126,7 @@ impl Tools<'_> {
             );
         }
         let reasoning = Self::reasoning(&ds, reasoning);
-        let has_inferred = ds.reasoning.read().is_some();
+        let has_inferred = ds.read_reasoning().is_some();
         let inferred = has_inferred.then_some(INFERRED_GRAPH);
         let inputs = validation_common::inputs(&snap, &graph, inferred, reasoning)
             .map_err(|e| ToolError::bad_argument(format!("{e:#}")))?;

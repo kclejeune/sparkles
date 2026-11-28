@@ -1455,6 +1455,9 @@ impl<S: Sink> Sink for Guard<'_, S> {
     fn dl(&self) -> &super::dl_rules::DlRun {
         self.out.dl()
     }
+    fn meter_reads(&self) -> Option<&std::cell::Cell<usize>> {
+        self.out.meter_reads()
+    }
     fn busy(&self) -> bool {
         self.out.busy()
     }
@@ -1616,6 +1619,9 @@ impl<S: Sink> Sink for DlGuard<'_, S> {
     fn dl(&self) -> &super::dl_rules::DlRun {
         self.out.dl()
     }
+    fn meter_reads(&self) -> Option<&std::cell::Cell<usize>> {
+        self.out.meter_reads()
+    }
     fn busy(&self) -> bool {
         self.out.busy()
     }
@@ -1740,6 +1746,9 @@ impl<S: Sink> Sink for CreditGuard<'_, S> {
     }
     fn dl(&self) -> &super::dl_rules::DlRun {
         self.out.dl()
+    }
+    fn meter_reads(&self) -> Option<&std::cell::Cell<usize>> {
+        self.out.meter_reads()
     }
     fn busy(&self) -> bool {
         self.out.busy()
@@ -2134,6 +2143,9 @@ struct Out<'r, 'a> {
     /// whether this thread was already panicking when `Out` was created, so a classifier
     /// invoked inside a `Drop` during an unrelated outer panic is not treated as unwinding
     already_panicking: bool,
+    /// the reads Tier D's meters counted since the activation last checked the bounds
+    /// through one of them ([`Sink::meter_reads`])
+    meter: std::cell::Cell<usize>,
 }
 
 /// The bytes an activation keeps uncharged ([`Sink::keep_data`]) before it charges them.
@@ -2429,6 +2441,12 @@ pub trait Sink {
     fn conjunction(&mut self, core: &[Ex]) -> Option<Ex> {
         let _ = core;
         unreachable!("the Horn rules run only in a saturation")
+    }
+    /// The reads that Tier D's meters counted since the run's bounds were last checked in
+    /// this activation, which every [`super::dl_rules::Meter`] of the activation shares,
+    /// or `None` for a sink that keeps no such count (roadmap item 1280).
+    fn meter_reads(&self) -> Option<&std::cell::Cell<usize>> {
+        None
     }
     /// what the contexts of Tier D share
     fn dl(&self) -> &super::dl_rules::DlRun {
@@ -2853,6 +2871,9 @@ impl Sink for Out<'_, '_> {
 
     fn dl(&self) -> &super::dl_rules::DlRun {
         self.run.bounds.dl.expect("a run with Tier D")
+    }
+    fn meter_reads(&self) -> Option<&std::cell::Cell<usize>> {
+        Some(&self.meter)
     }
 
     #[inline]
@@ -3822,6 +3843,8 @@ impl<'a> Run<'a> {
             WORKER.with(|w| w.set(0));
             return;
         }
+        #[cfg(test)]
+        let late = super::dl_rules::late_unit_mode_test();
         std::thread::scope(|s| {
             let start = || {
                 // counted while the first worker is busy, so that the count cannot reach 0
@@ -3834,6 +3857,7 @@ impl<'a> Run<'a> {
                         {
                             self.helper_ran.store(true, Ordering::Relaxed);
                             WORKER.with(|w| w.set(HELPER));
+                            super::dl_rules::set_late_unit_mode_test(late);
                         }
                         self.worker::<R>(None)
                     });
@@ -4044,6 +4068,7 @@ impl<'a> Run<'a> {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         for _ in 0..messages {
             out.send(to, Concl::Sub(to));
@@ -4096,6 +4121,8 @@ impl<'a> Run<'a> {
             seeds.into()
         };
         let mut root = 0;
+        #[cfg(test)]
+        let late = super::dl_rules::late_unit_mode_test();
         std::thread::scope(|s| {
             // dropped last, so that the helpers end however this thread leaves
             let _helpers = Helpers::new(self, &sh);
@@ -4137,6 +4164,8 @@ impl<'a> Run<'a> {
                     for w in 1..threads {
                         let sh = &sh;
                         s.spawn(move || {
+                            #[cfg(test)]
+                            super::dl_rules::set_late_unit_mode_test(late);
                             let mut seen = 0;
                             loop {
                                 let phase = {
@@ -4756,6 +4785,7 @@ impl<'a> Run<'a> {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         let mut skip = false;
         let mut ctx_changed = false;
@@ -5802,6 +5832,7 @@ pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         for r in 0..rounds {
             if !out.admit_dl(step_admit) {
@@ -5956,6 +5987,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: false,
+                meter: Default::default(),
             };
             assert!(out.top_chain_sub(tail, domain, Some(&probe)));
             assert_eq!(out.sent, 0);
@@ -6270,6 +6302,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: false,
+                    meter: Default::default(),
                 };
                 assert!(out.top_chain_sub(source, domain, Some(&probe)));
                 assert_eq!(out.sent, 0);
@@ -6773,6 +6806,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.keep_data(100);
             assert_eq!(held(out.run), 0);
@@ -6869,6 +6903,7 @@ mod horn_accounting_tests {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         out.kept = 13;
         let ok = if memory_only {
@@ -6934,6 +6969,7 @@ mod horn_accounting_tests {
                         kept: 0,
                         wake_split: false,
                         already_panicking: std::thread::panicking(),
+                        meter: Default::default(),
                     };
                     out.keep_data(13);
                     if memory_only {
@@ -7016,6 +7052,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.reserve_data(64)
         }));
@@ -7236,6 +7273,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(out.admit_data(16));
             out.retain_shared(16);
@@ -7308,6 +7346,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(out.admit_data(0));
             assert!(out.admit_data(16));
@@ -7549,6 +7588,7 @@ mod horn_accounting_tests {
                             kept: 0,
                             wake_split: false,
                             already_panicking: std::thread::panicking(),
+                            meter: Default::default(),
                         };
                         let ok = if memory_only {
                             out.admit_data(bytes)
@@ -7594,6 +7634,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.release_data(bytes);
         }
@@ -7602,9 +7643,10 @@ mod horn_accounting_tests {
 
     #[test]
     fn data_reservation_rejected_before_debit_preserves_other_debit_and_kept() {
-        // 32 x 32 premises gives a representable fold_slack larger than the remaining
-        // headroom (`room = dl.bytes() + 4096`), so `base + first + dl.bytes()` fits in
-        // `usize` while `base + first + fold_slack` overflows `run.memory` before debit.
+        // 32 x 32 premises give premise lists and product tables that a return admits
+        // past the remaining headroom (`room = dl.bytes() + 4096`), so `base + first +
+        // dl.bytes()` fits in `usize` while the return's admission overflows `run.memory`
+        // before debit.
         let (ix, dl, mut st, cid, _, _) =
             super::dl_root::tests::multi_list_return(super::dl_rules::MREPAIR_ON, &[32, 32]);
         let ctx: Contexts = (0..16).map(|_| OnceLock::new()).collect();
@@ -7646,11 +7688,12 @@ mod horn_accounting_tests {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         assert!(out1.reserve_data(first));
         assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
 
-        let before_st = st.bytes();
+        let before_st = st.bytes() + dl.mtab_bytes();
         let retained;
         {
             let mut m2 = Marks::default();
@@ -7668,16 +7711,21 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out2.keep_data(500);
             assert_eq!(out2.kept, 500);
             // rret commits its small retained seen/MRep/rets growth into `run.memory`
-            // (single ledger) and then requests a representable fold_slack larger than the
-            // remaining headroom (`room`), so `base + first + retained + fold_slack`
-            // overflows `run.memory` before debit; its cleanup must leave out1's debit,
-            // the committed retained growth, and out2's kept untouched.
+            // (single ledger), admits the buffer of its lists' sizes, and then admits its
+            // premise lists and its product's tables, which pass the remaining headroom
+            // (`room`), so that admission overflows `run.memory` before debit; its cleanup
+            // must leave out1's debit and the committed retained growth untouched. The
+            // release of the sizes' buffer nets against out2's kept bytes first, as every
+            // release of an activation does, so those bytes move from kept to the run's
+            // count and their sum is unchanged.
+            let sizes = dl.table.get(cid).body().len() * std::mem::size_of::<usize>();
             assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
-            retained = st.bytes() - before_st;
+            retained = st.bytes() + dl.mtab_bytes() - before_st;
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
             assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
             assert_eq!(
@@ -7687,17 +7735,21 @@ mod horn_accounting_tests {
             );
             assert_eq!(
                 run.memory.load(Ordering::Relaxed),
-                base + first + retained,
+                base + first + retained + sizes,
                 "overflow refusal in rret must not subtract from worker 1's debit"
             );
             assert_eq!(
-                out2.kept, 500,
-                "overflow refusal in rret must not consume worker 2's pending kept bytes"
+                out2.kept,
+                500 - sizes,
+                "overflow refusal in rret must not lose worker 2's pending kept bytes"
             );
             // Also verify direct unrepresentable request leaves both untouched.
             assert!(!out2.reserve_data(isize::MAX as usize + 1));
-            assert_eq!(run.memory.load(Ordering::Relaxed), base + first + retained);
-            assert_eq!(out2.kept, 500);
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                base + first + retained + sizes
+            );
+            assert_eq!(out2.kept, 500 - sizes);
         }
         // Dropping out2 flushes its 500 kept bytes cleanly onto base + first + retained.
         assert_eq!(
@@ -7748,6 +7800,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.keep_data(120);
             assert!(!out.reserve_data(512));
@@ -7799,6 +7852,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(!out.reserve_data(512));
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
@@ -7877,6 +7931,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.keep_data(200);
             assert!(!out.reserve_data(5000));
@@ -7930,6 +7985,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             out.keep_data(200);
             assert!(!out.reserve_data(5000));
@@ -7981,6 +8037,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 out.keep_data(200);
                 assert!(out.reserve_data(5000));
@@ -8046,6 +8103,7 @@ mod horn_accounting_tests {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         let mut tally = Tally::default();
         assert!(run.flush_links(&st, &mut out, &mut tally));
@@ -8090,6 +8148,7 @@ mod horn_accounting_tests {
             kept: 0,
             wake_split: false,
             already_panicking: std::thread::panicking(),
+            meter: Default::default(),
         };
         assert!(run.flush_links(&st, &mut out, &mut tally));
         assert_eq!(out.sent, 0);
@@ -8146,6 +8205,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(run.flush_links(&st, &mut out, &mut Tally::default()));
             // the messages to other contexts, the context's own aside
@@ -8439,6 +8499,7 @@ mod horn_accounting_tests {
             kept: 0,
             wake_split: false,
             already_panicking: false,
+            meter: Default::default(),
         };
         let queued_before = run.queued.load(Ordering::Relaxed);
         let flushed = run.flush_links(&st, &mut out, &mut tally);
@@ -8834,6 +8895,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 assert_eq!(run.check_debit(0, 25, 0), (true, true));
                 assert_eq!(run.memory.load(Ordering::Relaxed), 95);
@@ -8869,6 +8931,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 assert!(out.reserve_data(20));
                 assert_eq!(run.memory.load(Ordering::Relaxed), 90);
@@ -8921,6 +8984,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(out.reserve_data(15));
             assert_eq!(run.memory.load(Ordering::Relaxed), usize::MAX - 5);
@@ -8987,6 +9051,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 out.keep_data(13);
                 let _ = out.go_on();
@@ -9044,6 +9109,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 out.keep_data(13);
                 let _ = out.reserve_data(64);
@@ -9110,6 +9176,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             assert!(out.reserve_data(20)); // committed=90, paid=90 (0 charge)
             assert_eq!(charge_calls.load(Ordering::Relaxed), 0);
@@ -9199,6 +9266,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             // speculative_overflow via Guard must NOT upgrade STOP_SPLIT or raise peak to MAX!
             {
@@ -9287,6 +9355,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             let next_before = dl.table.len();
             let built = AtomicBool::new(false);
@@ -9356,6 +9425,7 @@ mod horn_accounting_tests {
                 kept: 0,
                 wake_split: false,
                 already_panicking: std::thread::panicking(),
+                meter: Default::default(),
             };
             let bytes_before = dl.table.bytes();
             let (res, sample) = measure(|| {
@@ -9550,6 +9620,7 @@ mod horn_accounting_tests {
                     kept: 0,
                     wake_split: false,
                     already_panicking: std::thread::panicking(),
+                    meter: Default::default(),
                 };
                 let _ = push_clause_admitted(&mut out, 32, || {
                     Clause::new(vec![Lit::x(7)], vec![Lit::x(8)])

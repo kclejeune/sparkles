@@ -31,7 +31,218 @@ including a head that was classified while the pinned run waited for the flight.
 individual and term reads now answer a dataset returned by `at()` and an active read
 transaction at their own commit, where they threw `JenaTransactionException` before. They
 still throw it in a write transaction, before anything is flushed. Python and Node.js
-selectors are roadmap item 1325.
+selectors are roadmap item 1339.
+
+### Optional pruning of rooted equality conclusions (item 1284)
+
+With `SPARKLES_ROOTED_EQ_KNOWN=1`, rooted classification skips an equality rewrite
+when the query context already holds the class assertion the rewrite would produce.
+
+### The marker repair on by default in rooted runs (items 1231 and 1247)
+
+A rooted run now repairs the delivery of conditional ground facts about individuals by
+default. `Limits::rooted_marker_repair` is true, in the filtered mode `129` of item 1250,
+and `Limits::rooted_decline`, the partial check that withdrew answers which could miss such
+facts and also withdrew complete ones, is false. The measurement covers 18,916 generated
+input files in 33 sets, 18,870 of them with a usable HermiT 1.4.5 reference. Each runs on
+one thread with the cautious strategy and with four threads requested with the eager one,
+which a rooted run with the default steps saturates on one thread. The parser rejects 690
+files of two sets in both configurations and in every build, 1,380 rows in all, which
+leaves 36,360 result rows, 18,180 for each configuration. On them the default rooted run
+claims 34,810 answers against 32,674 for the previous default and loses 3 to the work
+bound. Its answers differ from HermiT's only on s2-g2-150, as every earlier setting's did.
+Against a run with both the repair and the check off, over the answers that both claim, the
+repair derives 3 to 13% more conclusions and holds 2 to 5% more estimated memory on the
+larger generated corpora, and 1.96 and 1.26 times on the fixtures built for orders of
+arrival, of which the previous default claimed none. Runs with `--no-dl-steps` on four
+saturation workers give no answer that differs from HermiT. Item 1337 follows the cost of
+the notices that make most of the added conclusions, and item 1251 the family whose nested
+conditions pass the work bound with the repair. A run that sets the repair off should set
+the check on, which the tests of the check now do.
+
+The repair's state moves out of the contexts into a table that a run makes with the
+repair's first use, and a context names its slot in the padding of its Tier D state (item
+1247). A rooted run without the repair allocates nothing for the repair and charges 8 bytes
+less for each context with constants. A run with the repair charges the table, a slot for
+each context that holds repair state and the state itself. On the generated corpora that
+adds a median of 0.03% and at most 512 bytes to the peak estimated memory. The repair's
+handlers take a context's state out of its slot for their reads and changes and put it back
+when they are done or unwind. A context's first slot is admitted with the table's lock
+released, so the caller's memory callback never runs under it, and a worker that loses the
+race to make the table frees its own before it gives the charge back.
+
+### Backup repository copy, vocabulary chunking and S3 retention
+
+The repository library copies and verifies snapshots between repositories and
+rekeys blobs when the destination is encrypted. New repositories can opt in to
+FastCDC for vocabulary files. S3 repositories can select a blob storage class and
+enforce Object Lock on manifests and their referenced blobs. Garbage collection
+reports retention and partial deletion failures.
+
+Held backup leases renew with conditional updates, open-file mtime updates on
+local filesystems, or overwrites on single-writer object stores. Restore and
+verify stop with `repository-locked` when a lease is lost or expires.
+
+**Format.** Repositories using these layout options write format 2 markers. A
+chunked backup requires the `fastcdc-2016/1` manifest feature. Readers continue to
+accept format 1 repositories and raw and LZ4 blobs.
+
+### Dataset-local index settings
+
+The `index` settings kind controls vocabulary compression and predicate patterns for
+future bulk builds and compactions. It supports front coding, optional FSST, and a
+boolean pattern switch. The CLI, HTTP API and embedded Rust handles read the saved
+policy without relabeling existing generations. Builds without the native zstd
+feature continue to refuse zstd input.
+
+### Rooted classification keeps the Horn share (item 1286)
+
+A classification with `Limits::rooted` and without `Limits::counting` no longer trades the
+axioms that the Horn rules take for the disjunctive axioms that the rooted rules take.
+Before Tier D normalizes anything, a rooted run checks whether its rules would leave out a
+Horn axiom only for lack of counting, such as a functional or inverse-functional property
+or a minimum above one, that the Horn rules take. When one would, every axiom outside
+OWL 2 EL goes to the Horn rules, as in a run without the option, and the disjunctive axioms
+are left out and reported instead. An axiom that both rules leave out, such as a minimum
+above 64, or that the rooted rules leave out for another reason, such as a self
+restriction, keeps the rooted run's disjunctive axioms. The check changes nothing in the
+classifier's interner and polls for cancellation, so a refused run interns what the default
+run interns. On the item's fixtures and the new regression ontologies it answers, falls
+back or stops as the default run does under memory budgets, with partial answers or not.
+Over item 805's rewriting the Horn rules are asked about the original axioms, so a Horn
+piece of a rewritten disjunctive axiom keeps the rewriting. The four `dl603` fixtures
+`mixed-031`, `sroiq-017`, `sroiq-030` and `sroiq-032` now give the default run's answer,
+and `sroiq-030` and `sroiq-032` are inconsistent as HermiT finds them. Across the 640
+`dl603` fixtures a rooted run misses 1,225 of HermiT's subsumptions against 1,349 before. A
+run asked to count that passes its bound still starts again without counting and leaves
+those axioms out. Rooted runs remain off by default, and item 1326 follows the irreflexive
+properties that the rooted rules still leave out.
+
+### Shared ground reasoning in rooted runs (item 1061)
+
+A rooted run with `SPARKLES_ROOTED_SHARED_FACTS=1` now forwards a unit the root delivered
+to a context on to that context's predecessors as the root's own delivery, in place of
+Pred. The context's copy takes the root's identifier when the root's delivery arrives,
+also after the context sent a copy of its own by Pred, so the predecessor takes the unit
+once, however many successors send it and in whatever order, and applies the shared-facts
+rule to it. On the forwarding build measured before the canonical-ID arrival-order fix,
+ore_ont_14924 drops from 5.07 million to about 324,000 derived conclusions on
+one thread and finishes within the rooted bound with HermiT's taxonomy.
+`SPARKLES_ROOTED_FACT_FORWARD=0` turns forwarding off. Shared facts, constant merging
+(`Limits::rooted_merge`) and the per-class rooted bound stay off by default, and 36
+generated ontologies with keys or the universal property and ore_ont_15803 still pass the
+bound, as roadmap item 1061 records.
+
+### Rooted counting applies at-most restrictions at individuals
+
+The opt-in rooted counting classifier now derives equalities between the values of a
+named individual or a successor term of an individual wherever the restriction, edges
+and qualifiers hold together. A query can use a merge that depends on its class without
+exporting that equality as an unconditional fact. This repairs missing subsumptions in
+the generated at-most and qualified at-most cases and preserves the consistent answers
+for compound qualifiers from item 897. In the corpus comparison, 302 previously
+complete configurations reached the work bound and fell back, 118 on the at-most set
+and 184 on the qualified set.
+
+### A persistent ordered map in place of `imbl` (item 1152)
+
+The predicate statistics of a delta and the control keyspace are kept in a persistent B+ tree
+map that copies one path from the root to a leaf for each write, and the rows that commits add
+to the spatial index after its overlay are kept in a persistent append-only vector. Snapshots
+still share every unchanged node. The `imbl` crate is no longer a dependency, and the
+`THIRD_PARTY_LICENSES.md` files no longer list it or the crates that only it used. The JVM library's
+notices take the MPL-2.0 text that UniFFI needs from the crates of the server binary, since no
+crate that the library links ships it any longer.
+
+### Floor-cache bypass for string pairs that rarely repeat
+
+Order comparisons of two columns of stored strings skip the per-query floor cache when
+few of its lookups hit. The first eligible comparison estimates from a sample how often
+its strings repeat and defers the floor table when the estimate predicts fewer than one
+hit in eight lookups. Between later comparisons, or between the parts of a large one, the
+cache bypasses the table when the lookups since its last check hit less often than that.
+The check needs at least 2,048 lookups. It skips a pass in which the table grew, and a
+table that the estimate sized above the first table's size must first serve lookups
+numbering half its slots. A bypassed comparison reads the two keys directly through the
+vocabulary's checked single-key walk, with scratch that each worker reuses and admits
+again only when it grows. While the cache bypasses the table, every fourth comparison
+probes the floors again, so inputs whose strings repeat in later batches return to the
+cache. A floor lookup uses the common
+prefix length that both vocabulary codecs store and reads the preceding key only at a
+block boundary. Answers are unchanged, and the memory budget, cancellation and deadlines
+still apply to the bypassed comparison. This implements roadmap item 1088, which stays
+open until the forge confirmation of `str-pair-colleague`, `str-pair-names` and
+`str-pair-lt` completes.
+
+### Hierarchical memory budgets for reasoning and views
+
+Reasoning, ontology reads and maintained views share the dataset's query memory pool.
+Retained ontology, classification and DL query results carry credit for as long as
+their admitted handles live.
+
+- **Rust compatibility.** `Opened::ontology` now uses `Arc<SharedOntology>`.
+  Borrow the original `read::Ontology` with `AsRef`. `Classified::excluded` now
+  uses `Arc<ClassifiedExclusions>`. Borrow the exclusions with `AsRef`.
+  The new types keep the credit through Arc clones. `AdmittedEntailmentDiff` and
+  `AdmittedDlQueryAnswer` provide shared ownership of admitted output. The existing
+  diff and DL query methods still return application-owned values.
+
+### The OWL modules' pass in the classifier's memory budget (item 1277)
+
+The modules' pass that decides which classes are incomplete when a classification left
+axioms out now admits its index, its extractions and its lists against the classifier's
+memory budget and the pool's grant before each growth, as the saturation is admitted.
+The new `Stats::coverage_memory` reports the pass's own peak, which raises the run's
+admitted peak in `Stats::peak_memory`, and the held estimate grows only by the list of
+incomplete classes. The walk of each axiom, its literal checks included, is admitted
+before it allocates, and the extractions no longer check literals again. A
+classification whose pass or list merge the budget or the pool refuses fails with the
+memory error, and a `partial` one answers with every class incomplete, the consistency
+unknown and `coverageStopped` set. The pass polls the deadline and the cancellation every
+4,096 axioms while it counts and indexes the axioms, marks the left-out ones and checks
+the terminology's gates. `Stats::coverage_stopped` now also covers that refusal.
+
+### Growing ground conditions with the selection off (item 1250)
+
+The F24 specification now records a conditional completeness argument for the cut of
+ground-bodied clauses in rooted runs with the selection of ground body literals off, and
+names the obligations it leaves open, which stay with item 1220. On 104 generated input
+files around g1-051_p0012 configured with a 4 million conclusion limit, every file except
+C4 finishes with item 1231's repair off, and every complete rooted disjunctive answer
+agrees with HermiT in every mode of the repair. The containment test adds the generated
+files H1 and U2, which fall back without the cut. Item 1324 follows the cut's cost on
+part022 p01 and the fallback on C4. This completes roadmap item 1250.
+
+### A closure check of the Pred replay
+
+Unit tests check after saturation that Pred, run again with every clause a successor
+sent and every restriction that reaches it, gives nothing that the context does not
+already hold. With item 1229's replay of late restrictions the check found no open
+context on the generated and fixture sets. Disabling the replay exposed inferences
+that the late restrictions left out. Item 1229 tracks the proof for all arrival orders
+and for ground counting under the rooted selection and delivery rules.
+
+### One meter for the marker repair and the rooted premise lists (item 1280)
+
+Tier D's rooted rules and the marker repair of item 1231 read their premise lists through
+one meter, which checks the run's work bound, memory budget, deadline and cancellation once
+every 1,024 reads, with the count since the last check shared across an activation and a
+wide read split at each check. It reads the premise lists of a returned clause, the copies of
+their premises and their pruning on initial arrival and on a late premise's replay, the index
+of a returned clause and of a clause that the root offers, and Hyper's, Join's and the root
+fact offer's premise lists, partners and scans on the default path. A check that stops the
+meter ends the scan that made it at once. An initial return checks the bounds in full before
+it derives, as a late replay's batch does. The diagnostic's redundancy test reads through a
+meter of its own, which checks the deadline and cancellation and counts separate deficit
+work. The new reads charge nothing to the work bound, so the counts of derived conclusions do
+not change. A returned clause admits the buffer of its lists' sizes before it makes it and its
+premise lists exactly before it builds them, and its product that is not ground charges its
+own tables as they grow in place of the upfront bound, which could exceed them more than a
+thousand times. Scans and copies of a wide premise, side or head read in spans that meet the
+checks as they go, and the diagnostic's search of a head for an equality's inequality reads
+through its meter. A test harness grows each input dimension of the metered steps and asserts
+at most 1,024 reads counted and at most 1,024 reads made between two checks. Item 1323 follows the scans that the meter does not
+read.
 
 ### Strict term decoding in SPARQL update, extension, service, planner and RDFS callers
 
@@ -1060,6 +1271,37 @@ and from one state of the dataset. On atlas at 105,302 triples, a probe in a bat
 of 64 took 0.31 µs on the JVM against 0.97 µs for a single call, and 0.31 µs in
 Node against 0.84 µs. In Python a batch saves about a tenth, since the lookup is most
 of an `in`.
+
+### BIND reuse across cursor batches
+
+A cursor BIND keeps observing repetition after its first batch, through a sampled sketch
+of its input keys and the exact distinct count of each batch, and admits its map of
+results when one row in eight repeats, or half the rows of a parallel-capable expression's
+first batch on more than one worker. Before, a first batch without enough repetition
+ended reuse for the query, so an input whose keys repeated only after 65,536 rows
+evaluated every row. A map that stops paying is released, and the sketch and the map are
+charged to the query's memory budget, about 128 KiB and 6 MiB when full. A refused batch
+charge releases them and evaluates the batch the ordinary way. A refusal of memory that
+the evaluation of the map's misses meets beside the map, including the terms it interns on
+the way to its result, releases them too. The misses that finished keep their values and
+are not evaluated again, and the remaining keys are evaluated the ordinary way in row
+order. A finished miss's transient allocation, such as the decode of a long triple term,
+is therefore not met a second time after later rows' results are retained. A miss that had
+not finished is evaluated again, and on several workers a later miss can finish while an
+earlier one is refused, so the earlier row's work repeats beside the later result. Item
+1322 tracks the case where such a retried row repeats a large transient allocation beside
+an intermediate term that it had already interned. After such a refusal the miss gives up as it would after
+a query's memory failure, so it evaluates no `COALESCE`, `IF` or other arm that the
+ordinary evaluation skips. A BIND that ends its input releases
+them for the operators above it. Expressions that can construct a geometry never enter
+the map, because each geometry they build stays charged until the query ends. On more than one
+worker, weak repetition of a parallel-capable expression admits the map only when the
+measured evaluation rate says it pays. The map's misses and the ordinary evaluation share
+one split controller, which keeps a contended expression serial for a cooldown and then
+retries the pool, in place of disabling parallel evaluation for the rest of the query.
+Roadmap item 293 stays open for its confirmation on forge, items 1082, 1083 and 1319
+follow the remaining costs, and item 1320 follows the charges that stand above the map's
+heap.
 
 ### One plan in every execution mode
 

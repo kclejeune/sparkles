@@ -28,8 +28,53 @@ const SMALL = { provider: 'mock', model: 'small' };
 const LARGE = { provider: 'mock', model: 'large' };
 const DRAFT = [SMALL, LARGE];
 
-/** The settings of datasets that changed them, by name. */
+const EXTRACT = [SMALL, LARGE];
+
+/** The runtime assistant settings of datasets, by name. */
 const settings = {};
+let settingsRev = 1;
+const LOCKED_BY_DS = {
+  scratch: { declared: { send: 'rows' }, locked: ['send'] },
+};
+
+function layeredAssistant(name) {
+  const lockInfo = LOCKED_BY_DS[name] ?? { declared: {}, locked: [] };
+  const defaults = {
+    enabled: false,
+    ask: true,
+    ingest: false,
+    send: 'schema',
+    sendByProvider: {},
+    historyDays: 30,
+  };
+  const initialRuntime = name === 'org' ? { enabled: true, ingest: true, send: 'documents' } : {};
+  const runtime = settings[name] ?? initialRuntime;
+  const declared = { ...lockInfo.declared };
+  const effective = { ...defaults, ...declared, ...runtime };
+  for (const f of lockInfo.locked) {
+    if (f in declared) effective[f] = declared[f];
+  }
+  const sources = {};
+  for (const k of Object.keys(effective)) {
+    if (lockInfo.locked.includes(k)) sources[k] = 'locked';
+    else if (k in runtime) sources[k] = 'runtime';
+    else if (k in declared) sources[k] = 'declared';
+    else sources[k] = 'default';
+  }
+  return {
+    dataset: name,
+    kind: 'assistant',
+    effective,
+    declared,
+    runtime,
+    sources,
+    locked: lockInfo.locked,
+    overridden: lockInfo.locked.filter((f) => f in runtime),
+    overrides: [],
+    status: { valid: true },
+    etag: `"mock-${name}-${settingsRev}"`,
+  };
+}
 /** The history of each dataset, oldest first. `org` starts with one record kept before
  * threads and stored answers (format 1 of `asks.json`), which reopens as a thread of its
  * own without its answer. */
@@ -120,24 +165,33 @@ const GLOBAL = {
 };
 
 function settingsOf(name) {
-  const s = settings[name] ?? (name === 'org' ? { enabled: true, send: 'rows' } : {});
+  const s = layeredAssistant(name).effective;
   const enabled = !!s.enabled;
   const days = s.historyDays ?? 30;
+  const extract = s.roles?.extract ?? EXTRACT;
+  const receives = (p) => (s.sendByProvider[p.provider] ?? s.send) === 'documents';
+  const ingestOn = enabled && !!s.ingest && s.send === 'documents' && extract.some(receives);
   return {
     ...s,
     status: enabled
       ? {
           models: true,
+          modelRevision: 'mock-model-revision',
           historyDays: days,
           ask: s.ask !== false,
           draft: DRAFT,
           summary: s.send !== 'schema',
+          ingest: ingestOn,
+          extract,
         }
       : {
           models: true,
+          modelRevision: 'mock-model-revision',
           historyDays: days,
           ask: false,
           reason: 'the dataset has no assistant (PUT /$/assistant/{ds} with enabled)',
+          ingest: false,
+          extract,
         },
   };
 }
@@ -468,6 +522,37 @@ export async function handleAssistant(req, res, url, seg, ctx) {
       return null;
     }
   };
+  if (seg[0] === '$' && seg[1] === 'settings' && seg[2] && seg[3] === 'assistant') {
+    const ds = datasets.get(seg[2]);
+    if (!ds) return (fail(res, 404, `No such dataset: ${seg[2]}`), true);
+    if (req.method === 'GET') {
+      const k = layeredAssistant(ds.name);
+      return (send(res, 200, k, 'application/json', { ETag: k.etag }), true);
+    }
+    if (req.method === 'PATCH') {
+      if (!isAdmin(req)) return (fail(res, 403, 'admin access needed'), true);
+      const cur = layeredAssistant(ds.name);
+      const ifMatch = req.headers['if-match'];
+      if (ifMatch && ifMatch !== '*' && ifMatch !== cur.etag) {
+        return (
+          fail(res, 412, 'settings changed elsewhere', { code: 'precondition-failed' }), true
+        );
+      }
+      const b = await jsonBody();
+      if (!b || typeof b !== 'object' || Array.isArray(b))
+        return (fail(res, 400, 'invalid JSON', { code: 'bad-settings' }), true);
+      const next = { ...cur.runtime };
+      for (const [k, v] of Object.entries(b)) {
+        if (v === null) delete next[k];
+        else next[k] = v;
+      }
+      settings[ds.name] = next;
+      settingsRev++;
+      const out = layeredAssistant(ds.name);
+      return (send(res, 200, out, 'application/json', { ETag: out.etag }), true);
+    }
+    return (fail(res, 405, 'method not allowed'), true);
+  }
   if (seg[0] === '$' && seg[1] === 'assistant' && seg[2]) {
     const ds = datasets.get(seg[2]);
     if (!ds) return (fail(res, 404, `No such dataset: ${seg[2]}`), true);

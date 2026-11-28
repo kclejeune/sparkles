@@ -400,10 +400,6 @@ async fn select_branch(
         let (first, tail) = rest.split_once('/').map_or((rest, ""), |(a, b)| (a, b));
         let decoded = percent_encoding::percent_decode_str(first).decode_utf8_lossy();
         if let Some((ds, b)) = decoded.split_once('@') {
-            if ds.is_empty() || b.is_empty() {
-                return bad_branch(format!("invalid dataset and branch '{decoded}'"));
-            }
-            chosen.push(b.to_string());
             let new_path = if tail.is_empty() && !rest.contains('/') {
                 format!("/{ds}")
             } else {
@@ -413,6 +409,24 @@ async fn select_branch(
                 Some(q) => format!("{new_path}?{q}"),
                 None => new_path,
             };
+            if ds.is_empty() || b.is_empty() {
+                let mut r = bad_branch(format!("invalid dataset and branch '{decoded}'"));
+                let mut parts = req.uri().clone().into_parts();
+                if let Ok(p) = pq.parse() {
+                    parts.path_and_query = Some(p);
+                    if let Ok(u) = Uri::from_parts(parts) {
+                        rewrite_kept = super::kept_request(req.method(), &u);
+                    }
+                }
+                if rewrite_kept {
+                    r.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        header::HeaderValue::from_static("no-store"),
+                    );
+                }
+                return r;
+            }
+            chosen.push(b.to_string());
             let mut parts = req.uri().clone().into_parts();
             match pq.parse() {
                 Ok(p) => parts.path_and_query = Some(p),
@@ -502,12 +516,21 @@ async fn select_branch(
         // rebuilding a resolution map works on any branch
         let rebuild_identities = seg == "evidence" && path.ends_with("/identities/rebuild");
         let evidence_reconcile = seg == "evidence" && path.ends_with("/projections/reconcile");
+        // Index settings display the selected branch's inherited codec.
+        let index_settings = path
+            .strip_prefix("/$/settings/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, kind)| {
+                percent_encoding::percent_decode_str(kind).decode_utf8_lossy()
+                    == crate::settings::index::INDEX.name
+            });
         if branch != MAIN
             && !clone
             && !algo_run
             && !memberships
             && !rebuild_identities
             && !evidence_reconcile
+            && !index_settings
             && !ADMIN_BRANCH_ROUTES.contains(&seg)
         {
             return bad_branch(format!("{path} does not take a branch"));
@@ -1811,7 +1834,7 @@ async fn execute(
             dry_run::Request::for_write(st, headers, &params, dry, false, Some(p), &tds, &o.write)
         })
         .transpose()?;
-    let reasoned = tds.reasoning.read().is_some();
+    let reasoned = tds.read_reasoning().is_some();
     let d = ds.clone();
     let (op2, o2) = (op.clone(), o.clone());
     let t0 = std::time::Instant::now();

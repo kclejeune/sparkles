@@ -304,11 +304,14 @@ fn f16_incremental_runs_are_charged() {
     }
 
     // a limit between the closure and the full need: the closure is taken and the run
-    // fails later, after it changed the closure, so the next run does not find it
+    // fails later, after it changed the closure, so the next run does not find it. The
+    // change is a few staged triples that give every individual new types, so the
+    // run's later work, and not the staged changes held while the closure is taken,
+    // sets its peak.
     let insert = |s: &Store| {
-        let mut ttl = String::new();
-        for i in 0..600 {
-            ttl.push_str(&format!("ex:n{i} a ex:A .\n"));
+        let mut ttl = String::from("ex:C rdfs:subClassOf ex:E0 .\n");
+        for j in 0..7 {
+            ttl.push_str(&format!("ex:E{j} rdfs:subClassOf ex:E{} .\n", j + 1));
         }
         load(s, &ttl);
     };

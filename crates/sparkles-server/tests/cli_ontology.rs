@@ -385,6 +385,18 @@ fn partial_on_the_command_line(inconsistent: bool) -> Vec<String> {
         assert_eq!(j["classes"], full["classes"], "{j}");
         let clean = j["consistent"] == true && j["unsatisfiableCount"] == 0;
         if j["partial"] == false {
+            if j["stats"]["coverageStopped"] == true {
+                assert_eq!(j["complete"], false, "{j}");
+                assert_eq!(j["consistency"], "unknown", "{j}");
+                assert_eq!(
+                    o.status.code(),
+                    Some(if clean { 0 } else { 1 }),
+                    "{}",
+                    err(&o)
+                );
+                assert!(err(&o).contains("incomplete answer"), "{}", err(&o));
+                return true;
+            }
             assert_eq!(j["complete"], true, "{j}");
             assert_eq!(
                 o.status.code(),

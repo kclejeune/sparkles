@@ -247,7 +247,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server.",
+        "description": "The dataset or server-wide settings kind.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -256,10 +256,15 @@
             "assistant",
             "memory",
             "ingest",
+            "prefixes",
             "graphrag",
+            "paths",
             "forms",
+            "evidence",
+            "index",
             "models",
-            "notifications"
+            "notifications",
+            "connections"
           ],
           "type": "string"
         }
@@ -2735,8 +2740,35 @@
                 },
                 "type": "array"
               },
+              "extract": {
+                "description": "The effective `extract` role list for this dataset (dataset override or server list).",
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
               "historyDays": {
                 "type": "integer"
+              },
+              "ingest": {
+                "description": "Whether server-side document ingestion can extract facts with an `extract` provider.",
+                "type": "boolean"
+              },
+              "modelRevision": {
+                "description": "Opaque revision of the installed model configuration for ingestion enable confirmation.",
+                "type": "string"
               },
               "models": {
                 "type": "boolean"
@@ -4143,6 +4175,10 @@
           "halfLifeDays": {
             "description": "The age at which a fact's weight halves, 90 by default.",
             "type": "number"
+          },
+          "includeProjectAliases": {
+            "description": "Include readable imports under both the project key and its redacted alias in a project brief.",
+            "type": "boolean"
           },
           "includeUnreviewed": {
             "type": "boolean"
@@ -14371,6 +14407,40 @@
         ],
         "type": "object"
       },
+      "IndexSettings": {
+        "additionalProperties": false,
+        "description": "Vocabulary and predicate pattern settings for future generation builds. Null clears the runtime override in a write.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#index-settings"
+        },
+        "properties": {
+          "patterns": {
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vocabCodec": {
+            "oneOf": [
+              {
+                "enum": [
+                  "front",
+                  "fsst"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "InferenceExplainRequest": {
         "description": "The triple to explain and the limits of the search.",
         "externalDocs": {
@@ -14790,7 +14860,7 @@
           },
           "input": {
             "additionalProperties": true,
-            "description": "What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`.",
+            "description": "The request mode, format and size when supplied. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`.",
             "type": "object"
           },
           "message": {
@@ -14802,7 +14872,7 @@
           },
           "result": {
             "additionalProperties": true,
-            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
+            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `already-proposed`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, `redactions` counts by detector when text was redacted, a table's mapping draft and preview, or a workbook's drafts and redaction counts for each sheet. A `claims` ingestion reports the evidence operation, commit, first availability, revision, records and their counts by kind, the claims, failed facts, flagged entities, `factGuard` `not-run`, and `previousRevision` (the linked prior evidence `SourceRevision` IRI, distinct from the C18 `previousRendition`, omitted when no predecessor evidence revision is linked, when the recorded link is hidden from the caller or on `already-proposed`). A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
             "type": "object"
           },
           "status": {
@@ -17141,6 +17211,90 @@
             "required": [
               "base"
             ],
+            "type": "object"
+          },
+          "redaction": {
+            "additionalProperties": false,
+            "description": "Redaction policy for agent memory imports, `register_source` and server-side document ingestion. Written as `format` 4 of `memory.json`.",
+            "properties": {
+              "allow": {
+                "description": "Regular expressions whose matched spans are never redacted.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "entropy": {
+                "additionalProperties": false,
+                "description": "High-entropy token detector for assignments, headers, query parameters and quoted values. Off when omitted.",
+                "properties": {
+                  "minBitsPerChar": {
+                    "description": "Minimum Shannon entropy in bits per character, 0.0 to 8.0, 4.0 by default.",
+                    "maximum": 8.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  "minLength": {
+                    "description": "Minimum token length in characters, 8 to 1024, 20 by default.",
+                    "maximum": 1024,
+                    "minimum": 8,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "everywhere": {
+                "description": "Apply the `secret-detected` check of `register_source` to every graph of the dataset, not only `imports.base`. `false` by default.",
+                "type": "boolean"
+              },
+              "knownValues": {
+                "description": "Enable exact matching against the server secret inventory for server administrators and the local operator, or against sensitive environment variables in the CLI. `true` by default.",
+                "type": "boolean"
+              },
+              "patterns": {
+                "description": "Extra regular-expression redaction patterns, merged with `imports.secretPatterns`.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "regex": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "regex"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "personal": {
+                "description": "Opt-in personal data detectors.",
+                "items": {
+                  "enum": [
+                    "email",
+                    "phone",
+                    "payment-card",
+                    "iban",
+                    "ip"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "serverIngest": {
+                "description": "How server-side document ingestion handles detected secrets: `redact` replaces them before storage and model calls (default), `refuse` fails the task with `secret-detected`, and `off` leaves text untouched. A stored rendition requiring redaction must be replaced before extraction.",
+                "enum": [
+                  "redact",
+                  "refuse",
+                  "off"
+                ],
+                "type": "string"
+              }
+            },
             "type": "object"
           },
           "retention": {
@@ -26697,6 +26851,10 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
         },
         "properties": {
+          "base": {
+            "$ref": "#/components/schemas/IndexSettings",
+            "description": "The index settings inherited from the selected generation, server invocation and declared settings before runtime overrides."
+          },
           "dataset": {
             "type": "string"
           },
@@ -26723,7 +26881,8 @@
               "graphrag",
               "paths",
               "forms",
-              "evidence"
+              "evidence",
+              "index"
             ],
             "type": "string"
           },
@@ -56049,7 +56208,7 @@
     },
     "/$/settings/{ds}/{kind}": {
       "delete": {
-        "description": "Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.",
+        "description": "Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
         },
@@ -56073,6 +56232,14 @@
             "description": "The `etag` of the runtime layer the change is based on.",
             "in": "header",
             "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset.",
+            "in": "query",
+            "name": "branch",
             "schema": {
               "type": "string"
             }
@@ -56139,7 +56306,7 @@
         "x-sparkles-permission": "admin"
       },
       "get": {
-        "description": "The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`.",
+        "description": "The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer. The `evidence` kind needs `admin` on the dataset and includes `recorded`. The `index` kind accepts `?branch=NAME` and includes its resolved `base`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
         },
@@ -56150,6 +56317,14 @@
           },
           {
             "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset.",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -56186,7 +56361,7 @@
         "x-sparkles-permission": "read"
       },
       "patch": {
-        "description": "Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.",
+        "description": "Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin` on the whole dataset for `index`, including when `?branch=NAME` selects a branch.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
         },
@@ -56197,6 +56372,22 @@
           },
           {
             "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "For an assistant ingestion enable patch, percent-encoded JSON naming the approved settings fields, document recipients, and the modelRevision from assistant status. A changed proposal returns 412.",
+            "in": "header",
+            "name": "If-Ingest-Confirmation",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset.",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "description": "The `etag` of the runtime layer the change is based on.",
@@ -56216,7 +56407,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `IndexSettings`.",
           "required": true
         },
         "responses": {
@@ -56280,7 +56471,7 @@
         "x-sparkles-permission": "admin"
       },
       "put": {
-        "description": "Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.",
+        "description": "Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. For `index`, explicit values including equal ones are stored, and omitted or null fields inherit the resolved base. The `index` kind accepts `?branch=NAME` and requires `admin` on the whole dataset.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
         },
@@ -56291,6 +56482,14 @@
           },
           {
             "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "For the index kind, the branch whose generation supplies the inherited codec. The runtime layer is shared by the dataset.",
+            "in": "query",
+            "name": "branch",
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "description": "The `etag` of the runtime layer the change is based on.",
@@ -56310,7 +56509,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, `EvidenceSettings`, or for `prefixes` a map from prefix names to IRIs. The `index` kind accepts `IndexSettings`.",
           "required": true
         },
         "responses": {

@@ -487,10 +487,16 @@ fn admitted<T: Send>(
     f: impl FnOnce(&pool::Exec) -> anyhow::Result<T> + Send,
 ) -> anyhow::Result<T> {
     pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
-    pool::off_rayon(|| {
-        let exec = pool::Exec::admit(opts.threads, opts.pool.as_ref(), opts.cancel.as_deref())?;
-        f(&exec)
-    })
+    pool::off_rayon(|| with_permit(opts, f))
+}
+
+/// Call on the native thread which owns and releases the reasoning permit.
+fn with_permit<T>(
+    opts: &ReasonOptions,
+    f: impl FnOnce(&pool::Exec) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let exec = pool::Exec::admit(opts.threads, opts.pool.as_ref(), opts.cancel.as_deref())?;
+    f(&exec)
 }
 
 fn derive(
@@ -1294,12 +1300,67 @@ pub fn materialize_incremental(
     inc: Incremental<'_>,
     opts: &ReasonOptions,
 ) -> anyhow::Result<ReasonReport> {
+    materialize_incremental_prepared(store, profile, extras, inc, opts, |_, _| Ok(()))
+}
+
+/// Admit the facade's reasoning record while the materialization can still roll back.
+#[doc(hidden)]
+pub fn materialize_incremental_prepared(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    prepare: impl FnOnce(&Resolved, &[String]) -> anyhow::Result<()> + Send,
+) -> anyhow::Result<ReasonReport> {
+    materialize_incremental_prepared_with_memory(
+        store,
+        profile,
+        extras,
+        inc,
+        opts,
+        |resolved, warnings, _| prepare(resolved, warnings),
+    )
+}
+
+#[doc(hidden)]
+pub use budget::PreparationMemory;
+
+/// Prepare facade metadata with the same live allowance as the inference transaction.
+#[doc(hidden)]
+pub fn materialize_incremental_prepared_with_memory(
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()> + Send,
+) -> anyhow::Result<ReasonReport> {
     extras.validate()?;
     opts.inputs.validate()?;
     refuse_query_only(profile)?;
     let t0 = Instant::now();
-    admitted(opts, |exec| {
-        materialize_admitted(exec, store, profile, extras, inc, opts, t0)
+    run_materialization(opts, |exec| {
+        materialize_admitted(exec, store, profile, extras, inc, opts, t0, prepare)
+    })
+}
+
+fn run_materialization(
+    opts: &ReasonOptions,
+    materialize: impl FnOnce(&pool::Exec) -> anyhow::Result<ReasonReport> + Send,
+) -> anyhow::Result<ReasonReport> {
+    pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
+    pool::off_rayon(|| {
+        // A rejected preparation can release a copy lease under both the
+        // import journal and RDF writer. Drain callbacks on their owning
+        // thread after rollback (or commit) and reasoning permit release.
+        let report = sparkles_core::sparql::pool::QueryPool::with_deferred_release_wakes(|| {
+            with_permit(opts, materialize)
+        })?;
+        if let Some(callback) = &opts.progress {
+            pool::report_done(opts.pool.as_ref(), callback);
+        }
+        Ok(report)
     })
 }
 
@@ -1312,9 +1373,21 @@ fn materialize_admitted(
     inc: Incremental<'_>,
     opts: &ReasonOptions,
     t0: Instant,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut laps = Laps::new(t0);
-    let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs, &mut laps);
+    let staging = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
+    let full = Incremental {
+        since: None,
+        cache: None,
+    };
+    let staged = if matches!(profile, Profile::ShaclAf(_)) {
+        full
+    } else {
+        inc
+    };
+    let (mut txn, raw, resolved) = lock_with_changes(store, staged, opts, &staging, &mut laps)?;
+    drop(staging);
     let snap = txn.base().clone();
     let inspected = match &opts.inspect {
         Some(f) => {
@@ -1395,7 +1468,7 @@ fn materialize_admitted(
             changes: None,
         };
         return finish(
-            store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+            store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps, prepare,
         );
     }
     if let (Some(since), Some(raw)) = (inc.since, raw) {
@@ -1407,6 +1480,7 @@ fn materialize_admitted(
                 done.warnings.extend_borrowed(&inspected)?;
                 return finish(
                     store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+                    prepare,
                 );
             }
             Err(e) => {
@@ -1471,9 +1545,15 @@ fn materialize_admitted(
         changes: None,
     };
     finish(
-        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps,
+        store, txn, &snap, profile, digest, &resolved, inc, opts, t0, done, laps, prepare,
     )
 }
+
+type LockedChanges<'s> = (
+    sparkles_core::store::WriteTxn<'s>,
+    Option<Result<maintain::RawChanges, String>>,
+    Resolved,
+);
 
 /// Take the writer lock, with the input graphs resolved in the state it locks, and the
 /// changes since `inc.since` up to that state.
@@ -1487,13 +1567,11 @@ fn materialize_admitted(
 fn lock_with_changes<'s>(
     store: &'s Store,
     inc: Incremental<'_>,
-    inputs: &Inputs,
+    opts: &ReasonOptions,
+    budget: &Arc<Budget>,
     laps: &mut Laps,
-) -> (
-    sparkles_core::store::WriteTxn<'s>,
-    Option<Result<maintain::RawChanges, String>>,
-    Resolved,
-) {
+) -> anyhow::Result<LockedChanges<'s>> {
+    let inputs = &opts.inputs;
     let locked = |txn: sparkles_core::store::WriteTxn<'s>| {
         let r = inputs::resolve(txn.base(), inputs);
         (txn, r)
@@ -1501,12 +1579,20 @@ fn lock_with_changes<'s>(
     let Some(since) = inc.since else {
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         laps.lap("lock");
-        return (txn, None, r);
+        return Ok((txn, None, r));
     };
     for _ in 0..3 {
         let live = store.snapshot();
         let graphs = inputs::resolve(&live, inputs).graph_set();
-        let raw = maintain::changes(store, since, &live, inc.cache, &graphs);
+        let raw = maintain::changes(
+            store,
+            since,
+            &live,
+            inc.cache,
+            &graphs,
+            budget,
+            opts.cancel.as_ref(),
+        )?;
         laps.lap("changes");
         let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
         laps.lap("lock");
@@ -1514,24 +1600,30 @@ fn lock_with_changes<'s>(
             Err("the input graphs changed while the changes were read".into())
         } else if txn.base().commit == live.commit {
             raw
-        } else if let Some(raw) =
-            maintain::kept_changes(store, since, txn.base(), inc.cache, &graphs)
-        {
+        } else if let Some(raw) = maintain::kept_changes(
+            store,
+            since,
+            txn.base(),
+            inc.cache,
+            &graphs,
+            budget,
+            opts.cancel.as_ref(),
+        )? {
             raw
         } else {
             continue;
         };
-        return (txn, Some(raw), r);
+        return Ok((txn, Some(raw), r));
     }
     let (txn, r) = locked(store.write_as(sparkles_core::commit::CommitKind::Reason));
     laps.lap("lock");
-    (
+    Ok((
         txn,
         Some(Err(
             "commits kept arriving while the changes were read".into()
         )),
         r,
-    )
+    ))
 }
 
 /// The closure a run ends with, for the next incremental run.
@@ -1660,8 +1752,10 @@ fn finish(
     t0: Instant,
     done: Done,
     mut laps: Laps,
+    prepare: impl FnOnce(&Resolved, &[String], &mut PreparationMemory<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<ReasonReport> {
     let mut txn = txn;
+    let mut preparation = PreparationMemory::new(&done.budget);
     let checked = (|| -> anyhow::Result<WorkingWarnings> {
         if opts
             .cancel
@@ -1688,6 +1782,7 @@ fn finish(
         let mut warnings = WorkingWarnings::try_clone_from(&resolved.warnings, &done.budget)?;
         warnings.extend_borrowed(done.warnings.as_slice())?;
         done.budget.check_peak()?;
+        prepare(resolved, warnings.as_slice(), &mut preparation)?;
         Ok(warnings)
     })();
     let warnings = match checked {
@@ -1705,7 +1800,6 @@ fn finish(
     laps.lap("checks");
     let receipt = txn.commit()?;
     laps.lap("commit");
-    progress(opts, 1.0, "done");
     let graphs = resolved.graph_set();
     let mut kept = false;
     let witness_report = done.witnesses.as_ref().map(|w| w.report.clone());
@@ -1937,7 +2031,10 @@ fn update_closure(
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
-    let budget = Budget::with_parent(opts.max_memory, opts.memory_parent.clone());
+    let budget = raw.as_ref().map_or_else(
+        |_| Budget::with_parent(opts.max_memory, opts.memory_parent.clone()),
+        maintain::RawChanges::budget,
+    );
     let (rules, blocker) = incremental_rules(profile, extras, digest, snap, &budget)?;
     if let Some(why) = blocker {
         return Err(Fallback(why).into());
@@ -2328,11 +2425,19 @@ pub fn refuse_query_only(profile: &Profile) -> anyhow::Result<()> {
 
 /// Remove [`INFERRED_GRAPH`]. Returns the number of triples removed.
 pub fn clear(store: &Store) -> anyhow::Result<u64> {
-    maintain::remove_saved(store);
+    Ok(clear_prepared(store, || ())?.0)
+}
+
+/// Capture the facade's clear order under the same writer as materialization
+/// preparation, even if the inferred graph has never existed.
+#[doc(hidden)]
+pub fn clear_prepared<T>(store: &Store, prepare: impl FnOnce() -> T) -> anyhow::Result<(u64, T)> {
     let mut txn = store.write_as(sparkles_core::commit::CommitKind::ReasonClear);
+    maintain::remove_saved(store);
+    let prepared = prepare();
     let snap = txn.base().clone();
     let Some(g) = snap.lookup_iri(INFERRED_GRAPH) else {
-        return Ok(0);
+        return Ok((0, prepared));
     };
     let keys = snap.scan_keys(Perm::Gspo, &[g.0])?;
     let mut n = 0;
@@ -2342,7 +2447,7 @@ pub fn clear(store: &Store) -> anyhow::Result<u64> {
         }
     }
     txn.commit()?;
-    Ok(n)
+    Ok((n, prepared))
 }
 
 /// How many facts of the closure of `snap`'s default graph DRed would delete first if

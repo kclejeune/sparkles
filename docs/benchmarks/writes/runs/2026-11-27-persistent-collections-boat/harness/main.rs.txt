@@ -1,0 +1,327 @@
+//! Item 1152: PMap and AppendVec against imbl 7.0.2 at the sizes of
+//! PERFORMANCE-EXPERIMENTS.md#writes. Arms interleave A,B,B,A in one process.
+
+mod store {
+    pub mod keyset {
+        pub(crate) fn with_room<T: Clone>(v: &[T], cap: usize) -> Vec<T> {
+            let mut out = Vec::with_capacity(cap + 1);
+            out.extend_from_slice(v);
+            out
+        }
+        pub(crate) fn split_with_room<T>(v: &mut Vec<T>, at: usize, cap: usize) -> Vec<T> {
+            let mut right = Vec::with_capacity(cap + 1);
+            right.extend(v.drain(at..));
+            v.shrink_to(cap + 1);
+            right
+        }
+    }
+    #[allow(dead_code)]
+    #[path = "../../../../../../crates/sparkles-core/src/store/pmap.rs"]
+    pub mod pmap;
+    #[allow(dead_code)]
+    #[path = "../../../../../../crates/sparkles-core/src/store/append_vec.rs"]
+    pub mod append_vec;
+}
+
+use std::hint::black_box;
+use std::sync::Arc;
+use std::time::Instant;
+use store::append_vec::AppendVec;
+use store::pmap::PMap;
+
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Stat {
+    count: u64,
+    s: u64,
+    o: u64,
+}
+
+#[derive(Clone)]
+struct TailRow {
+    _row: [u64; 4],
+    _entry: Arc<u64>,
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+fn ckey(i: u64) -> Box<[u8]> {
+    format!("branch/main/meta/{i:010}").into_bytes().into()
+}
+
+/// ns per op of `iters` calls of `f`
+fn time(iters: u64, mut f: impl FnMut(u64)) -> f64 {
+    let t = Instant::now();
+    for i in 0..iters {
+        f(i);
+    }
+    t.elapsed().as_nanos() as f64 / iters as f64
+}
+
+fn report(name: &str, n: usize, a: &mut Vec<f64>, b: &mut Vec<f64>) {
+    a.sort_by(f64::total_cmp);
+    b.sort_by(f64::total_cmp);
+    let med = |v: &Vec<f64>| v[v.len() / 2];
+    println!(
+        "{name}\t{n}\timbl\t{:.1}\t[{:.1},{:.1}]\tpmap\t{:.1}\t[{:.1},{:.1}]\tratio\t{:.3}",
+        med(a),
+        a[0],
+        a[a.len() - 1],
+        med(b),
+        b[0],
+        b[b.len() - 1],
+        med(b) / med(a)
+    );
+}
+
+const ROUNDS: usize = 8;
+
+fn iters_for(n: usize, base: u64) -> u64 {
+    if n >= 1_000_000 { base / 4 } else { base }
+}
+
+#[inline(never)]
+fn pm_get<'a>(m: &'a PMap<Box<[u8]>, Arc<[u8]>>, k: &[u8]) -> Option<&'a Arc<[u8]>> {
+    m.get(k)
+}
+
+#[inline(never)]
+fn im_get<'a>(m: &'a imbl::OrdMap<Box<[u8]>, Arc<[u8]>>, k: &[u8]) -> Option<&'a Arc<[u8]>> {
+    m.get(k)
+}
+
+/// PROFILE=pm|im SIZE=n: three seconds of control-get, for perf
+fn profile(which: &str) {
+    let n: u64 = std::env::var("SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let value: Arc<[u8]> = vec![7u8; 48].into();
+    let mut im: imbl::OrdMap<Box<[u8]>, Arc<[u8]>> = imbl::OrdMap::new();
+    let mut pm: PMap<Box<[u8]>, Arc<[u8]>> = PMap::new();
+    for i in 0..n {
+        im.insert(ckey(i * 2), value.clone());
+        pm.insert(ckey(i * 2), value.clone());
+    }
+    let keys: Vec<Box<[u8]>> = (0..4096u64).map(|i| ckey(Rng(i).next() % n * 2)).collect();
+    let t = Instant::now();
+    let mut c = 0u64;
+    while t.elapsed().as_secs() < 3 {
+        for k in &keys {
+            c += if which == "pm" { pm_get(&pm, k).is_some() } else { im_get(&im, k).is_some() } as u64;
+        }
+    }
+    println!("{which} {c} gets");
+}
+
+fn main() {
+    if let Ok(w) = std::env::var("PROFILE") {
+        return profile(&w);
+    }
+    let rounds = std::env::var("ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(ROUNDS);
+    println!("case\tsize\tarm\tmedian_ns\t[min,max]\tarm\tmedian_ns\t[min,max]\tratio(pmap/imbl)");
+    for &n in &[100usize, 10_000, 1_000_000] {
+        // ---- Delta::predicates: u64 -> stats
+        let mut im: imbl::OrdMap<u64, Stat> = imbl::OrdMap::new();
+        let mut pm: PMap<u64, Stat> = PMap::new();
+        for i in 0..n as u64 {
+            im.insert(i * 2, Stat::default());
+            pm.insert(i * 2, Stat::default());
+        }
+        let iters = iters_for(n, 200_000);
+        let span = n as u64;
+        for (case, new_key) in [("predicate-update", false), ("predicate-insert", true)] {
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let mut ra = Rng(r as u64);
+                let mut rb = Rng(r as u64);
+                let ia = || {
+                    time(iters, |_| {
+                        let k = ra.next() % span * 2 + new_key as u64;
+                        let mut m = im.clone();
+                        let e = m.entry(k).or_default();
+                        e.count += 1;
+                        black_box(&m);
+                    })
+                };
+                let ib = || {
+                    time(iters, |_| {
+                        let k = rb.next() % span * 2 + new_key as u64;
+                        let mut m = pm.clone();
+                        let e = m.get_or_insert_with(k, Default::default);
+                        e.count += 1;
+                        black_box(&m);
+                    })
+                };
+                let (mut ia, mut ib) = (ia, ib);
+                if r % 2 == 0 {
+                    a.push(ia());
+                    b.push(ib());
+                } else {
+                    b.push(ib());
+                    a.push(ia());
+                }
+            }
+            report(case, n, &mut a, &mut b);
+        }
+        // lookups and full scans
+        {
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let mut ra = Rng(r as u64 + 100);
+                let mut rb = Rng(r as u64 + 100);
+                let mut ia = || time(iters * 4, |_| { black_box(im.get(&(ra.next() % span * 2))); });
+                let mut ib = || time(iters * 4, |_| { black_box(pm.get(&(rb.next() % span * 2))); });
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report("predicate-get", n, &mut a, &mut b);
+            let (mut a, mut b) = (vec![], vec![]);
+            let scans = (2_000_000 / n as u64).max(2);
+            for r in 0..rounds {
+                let mut ia = || time(scans, |_| { black_box(im.iter().map(|(k, v)| k + v.count).sum::<u64>()); }) / n as f64;
+                let mut ib = || time(scans, |_| { black_box(pm.iter().map(|(k, v)| k + v.count).sum::<u64>()); }) / n as f64;
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report("predicate-iter-per-entry", n, &mut a, &mut b);
+            let (mut a, mut b) = (vec![], vec![]);
+            let builds = (2_000_000 / n as u64).max(1);
+            for r in 0..rounds {
+                let mut ia = || time(builds, |_| {
+                    let mut m = imbl::OrdMap::new();
+                    for i in 0..n as u64 { m.insert(i.wrapping_mul(0x9e37_79b9) % (4 * n as u64), Stat::default()); }
+                    black_box(m);
+                }) / n as f64;
+                let mut ib = || time(builds, |_| {
+                    let mut m = PMap::new();
+                    for i in 0..n as u64 { m.insert(i.wrapping_mul(0x9e37_79b9) % (4 * n as u64), Stat::default()); }
+                    black_box(m);
+                }) / n as f64;
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report("predicate-build-per-insert", n, &mut a, &mut b);
+        }
+        drop((im, pm));
+
+        // ---- ControlState::entries: Box<[u8]> -> Arc<[u8]>
+        let value: Arc<[u8]> = vec![7u8; 48].into();
+        let mut im: imbl::OrdMap<Box<[u8]>, Arc<[u8]>> = imbl::OrdMap::new();
+        let mut pm: PMap<Box<[u8]>, Arc<[u8]>> = PMap::new();
+        for i in 0..n as u64 {
+            im.insert(ckey(i * 2), value.clone());
+            pm.insert(ckey(i * 2), value.clone());
+        }
+        let keys: Vec<Box<[u8]>> = (0..4096u64).map(|i| {
+            let mut r = Rng(i);
+            ckey(r.next() % span * 2)
+        }).collect();
+        let fresh: Vec<Box<[u8]>> = (0..4096u64).map(|i| {
+            let mut r = Rng(i);
+            ckey(r.next() % span * 2 + 1)
+        }).collect();
+        let iters = iters_for(n, 100_000);
+        for (case, set) in [("control-put-existing", &keys), ("control-put-new", &fresh), ("control-delete", &keys)] {
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let del = case == "control-delete";
+                let mut ia = || time(iters, |i| {
+                    let k = &set[i as usize & 4095];
+                    let mut m = im.clone();
+                    if del { m.remove(&**k); } else { m.insert(k.clone(), value.clone()); }
+                    black_box(&m);
+                });
+                let mut ib = || time(iters, |i| {
+                    let k = &set[i as usize & 4095];
+                    let mut m = pm.clone();
+                    if del { m.remove(&**k); } else { m.insert(k.clone(), value.clone()); }
+                    black_box(&m);
+                });
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report(case, n, &mut a, &mut b);
+        }
+        {
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let mut ia = || time(iters * 4, |i| { black_box(im.get(&*keys[i as usize & 4095])); });
+                let mut ib = || time(iters * 4, |i| { black_box(pm.get(&*keys[i as usize & 4095])); });
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report("control-get", n, &mut a, &mut b);
+            // a prefix scan of 16 entries, as ControlState::prefix does
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let mut ia = || time(iters, |i| {
+                    let k: &[u8] = &keys[i as usize & 4095][..24];
+                    let start: Box<[u8]> = k.into();
+                    black_box(im.range(start..).take_while(|(x, _)| x.starts_with(k)).take(16).count());
+                });
+                let mut ib = || time(iters, |i| {
+                    let k: &[u8] = &keys[i as usize & 4095][..24];
+                    black_box(pm.range::<[u8], _>((std::ops::Bound::Included(k), std::ops::Bound::Unbounded)).take_while(|(x, _)| x.starts_with(k)).take(16).count());
+                });
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report("control-prefix16", n, &mut a, &mut b);
+        }
+        drop((im, pm));
+    }
+
+    // ---- spatial tails: clone a view and append one row; scan; index
+    for &n in &[4096usize, 100_000, 1_000_000] {
+        let entry = Arc::new(1u64);
+        let row = |i: u64| TailRow { _row: [i, i + 1, i + 2, i + 3], _entry: entry.clone() };
+        let mut iv: imbl::Vector<TailRow> = imbl::Vector::new();
+        let mut av: AppendVec<TailRow> = AppendVec::new();
+        for i in 0..n as u64 {
+            iv.push_back(row(i));
+            av.push_back(row(i));
+        }
+        // a chain of commits: each view is the clone of the last with rows appended,
+        // and the previous view stays alive as an older snapshot until the next commit
+        for per in [1u64, 16] {
+            let (mut a, mut b) = (vec![], vec![]);
+            for r in 0..rounds {
+                let mut ia = || {
+                    let mut cur = iv.clone();
+                    time(20_000, |i| {
+                        let mut next = cur.clone();
+                        for j in 0..per { next.push_back(row(i * per + j)); }
+                        cur = next;
+                    })
+                };
+                let mut ib = || {
+                    let mut cur = av.clone();
+                    time(20_000, |i| {
+                        let mut next = cur.clone();
+                        for j in 0..per { next.push_back(row(i * per + j)); }
+                        cur = next;
+                    })
+                };
+                if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+            }
+            report(&format!("tail-commit-{per}-rows"), n, &mut a, &mut b);
+        }
+        let scans = (4_000_000 / n as u64).max(2);
+        let (mut a, mut b) = (vec![], vec![]);
+        for r in 0..rounds {
+            let mut ia = || time(scans, |_| { black_box(iv.iter().map(|t| t._row[0]).sum::<u64>()); }) / n as f64;
+            let mut ib = || time(scans, |_| { black_box(av.iter().map(|t| t._row[0]).sum::<u64>()); }) / n as f64;
+            if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+        }
+        report("tail-iter-per-row", n, &mut a, &mut b);
+        let (mut a, mut b) = (vec![], vec![]);
+        for r in 0..rounds {
+            let mut ra = Rng(r as u64);
+            let mut rb = Rng(r as u64);
+            let mut ia = || time(400_000, |_| { black_box(iv[(ra.next() % n as u64) as usize]._row[1]); });
+            let mut ib = || time(400_000, |_| { black_box(av[(rb.next() % n as u64) as usize]._row[1]); });
+            if r % 2 == 0 { a.push(ia()); b.push(ib()); } else { b.push(ib()); a.push(ia()); }
+        }
+        report("tail-index", n, &mut a, &mut b);
+    }
+}

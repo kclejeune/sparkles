@@ -63,6 +63,18 @@ fn pairs(t: &sparkles_owl::classify::Taxonomy, cs: &[Class]) -> BTreeSet<(String
 fn check_partial(part: &Classification, full: &Classification, cs: &[Class]) {
     let got = pairs(&part.taxonomy, cs);
     let want = pairs(&full.taxonomy, cs);
+    if part.complete_for_taken && part.stats.coverage_stopped {
+        // a stop in the modules' pass keeps the taxonomy and leaves the consistency
+        // unknown, with every class incomplete
+        assert!(!part.complete);
+        assert_eq!(part.consistency, Consistency::Unknown);
+        assert_eq!(got, want);
+        let open: BTreeSet<&Class> = part.incomplete.iter().collect();
+        for c in part.taxonomy.classes() {
+            assert!(open.contains(c), "{c:?} is not incomplete");
+        }
+        return;
+    }
     if part.complete_for_taken {
         assert_eq!(part.consistent, full.consistent);
         assert_eq!(part.consistency, full.consistency);
@@ -616,10 +628,14 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         }
     }
     let horn_ax = axioms(&horn_body);
+    // The EL runs and the runs that fall back leave the modules' pass to later
+    // (`cover_later`), since the pass's state counts in the peak (roadmap item 1277) and
+    // this test pins the tiers' saturation peaks.
     let el_full = Classifier::of(&horn_ax)
         .classify(&Limits {
             threads: 1,
             el_only: true,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
@@ -648,6 +664,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         let non_partial = Classifier::of(&horn_ax).classify(&Limits {
             threads: 1,
             partial: false,
+            cover_later: true,
             max_memory: Some(cap),
             ..Limits::default()
         });
@@ -698,6 +715,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         .classify(&Limits {
             threads: 1,
             el_only: true,
+            cover_later: true,
             ..Limits::default()
         })
         .unwrap();
@@ -709,6 +727,7 @@ fn pre_saturation_memory_refusal_preserves_horn_and_tier_d() {
         let non_partial = Classifier::of(&dl_ax).classify(&Limits {
             threads: 1,
             partial: false,
+            cover_later: true,
             max_memory: Some(cap),
             ..Limits::default()
         });

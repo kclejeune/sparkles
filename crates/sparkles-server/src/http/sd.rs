@@ -165,7 +165,7 @@ pub(super) async fn describe(
     format: RdfFormat,
 ) -> ApiResult<Response> {
     let base = base_url(&st, &headers);
-    let reasoning = ds.reasoning.read().clone();
+    let reasoning = ds.read_reasoning().clone();
     let federate = st.allow_service && p.has(ServerPerm::Federate);
     let read_only = st.read_only;
     let describe = ds.dataset.settings().describe().get();

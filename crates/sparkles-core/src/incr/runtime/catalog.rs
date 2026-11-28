@@ -42,27 +42,42 @@ impl Runtime {
             reg.writable()?;
             let (target, lagging) = self.lagging_cells(&mut reg);
             // a new definition is the operator's: it runs, and no longer waits for a check
-            if let Some(root) = &self.root {
-                views::write(root, name, &def)?;
-            }
-            if let Some(c) = reg.views.remove(name).and_then(|old| old.cell) {
-                if c.release_view(name) == 0 {
-                    need_gc = true;
-                }
-                deferred.cells.push(c);
-            }
-            reg.views
+            let old = reg
+                .views
                 .insert(name.to_string(), ViewEntry::new(name, def, None));
-            *self.defs.write() = reg.defs();
-            let res = self.attach(store, &mut reg, name, &mut deferred.retired);
-            (res, target, lagging)
+            let result =
+                self.attach_persisting(store, &mut reg, name, &mut deferred.retired, |def| {
+                    if let Some(root) = &self.root {
+                        store.failpoint("view-definition-writing");
+                        views::write(root, name, def)?;
+                    }
+                    Ok(())
+                });
+            if result.is_err() {
+                reg.views.remove(name).expect("staged definition");
+                if let Some(old) = old {
+                    reg.views.insert(name.to_string(), old);
+                }
+            } else {
+                if let Some(cell) = old.and_then(|entry| entry.cell)
+                    && !reg.views[name]
+                        .cell
+                        .as_ref()
+                        .is_some_and(|new| Arc::ptr_eq(new, &cell))
+                {
+                    need_gc = cell.release_view(name, &mut deferred.retired) == 0;
+                    deferred.cells.push(cell);
+                }
+                *self.defs.write() = reg.defs();
+            }
+            (result, target, lagging)
         };
         let any_busy = if !lagging.is_empty() {
             self.try_switch_cells(&lagging, &target, &mut deferred)
         } else {
             false
         };
-        drop(deferred);
+        Operation::after(move || drop(deferred));
         if !lagging.is_empty() && !any_busy {
             self.mark_mode_switched(target.generation);
         }
@@ -76,24 +91,26 @@ impl Runtime {
 
     /// Remove view `name` and its state.
     pub fn delete(&self, name: &str) -> Result<()> {
-        let mut detached = None;
+        let _operation = Operation::enter();
+        let mut deferred = DeferredDrops::default();
         let mut need_gc = false;
         {
             let mut reg = self.reg.lock();
             reg.writable()?;
-            let old = reg.views.remove(name).ok_or_else(|| not_found(name))?;
-            if let Some(c) = old.cell {
-                if c.release_view(name) == 0 {
-                    need_gc = true;
-                }
-                detached = Some(c);
+            if !reg.views.contains_key(name) {
+                return Err(not_found(name));
             }
             if let Some(root) = &self.root {
                 views::remove(root, name)?;
             }
+            let old = reg.views.remove(name).expect("checked above");
+            if let Some(c) = old.cell {
+                need_gc = c.release_view(name, &mut deferred.retired) == 0;
+                deferred.cells.push(c);
+            }
             *self.defs.write() = reg.defs();
         }
-        drop(detached);
+        Operation::after(move || drop(deferred));
         if need_gc {
             self.gc();
         }

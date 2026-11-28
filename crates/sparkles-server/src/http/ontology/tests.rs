@@ -1123,6 +1123,15 @@ fn server_with_memory(data: &str, memory: Option<u64>) -> Server {
             None,
         )])
         .unwrap();
+    if memory.is_some() {
+        // A budget comes from the classifier's estimate, which leaves out reading the
+        // ontology. Read it once without a budget so that the budget stops the run in
+        // its saturation, as the handle's budget tests do.
+        ds.dataset
+            .ontology()
+            .open(&Default::default(), &Default::default())
+            .unwrap();
+    }
     let app = router(state.clone());
     Server {
         _dir: dir,
@@ -1165,8 +1174,8 @@ async fn whole_over_http(inconsistent: bool) -> (serde_json::Value, f64) {
 /// Classifies the cases on one thread on a server of its own, which keeps a complete
 /// answer for the next call, with the query string `query` and the memory budget
 /// `memory`. Checks the answer against the full one and returns the consistency of a
-/// partial answer, `Some(None)` for a complete one, and `None` when the call ended with the
-/// status `refused`.
+/// partial answer, `Some(None)` for a complete one or one whose modules' pass the deadline
+/// stopped, and `None` when the call ended with the status `refused`.
 async fn stopped_over_http(
     inconsistent: bool,
     full: &serde_json::Value,
@@ -1194,6 +1203,19 @@ async fn stopped_over_http(
     };
     let j = r.json();
     assert_eq!(j["classes"], full["classes"], "{j}");
+    // A deadline that stops the modules' pass after the saturation answers in full for
+    // the axioms it took, with every class open and the consistency unknown. It is
+    // answered but not partial.
+    if j["partial"] == false && j["stats"]["coverageStopped"] == true {
+        assert_eq!(j["complete"], false, "{j}");
+        assert_eq!(j["consistency"], "unknown", "{j}");
+        let open = j["incomplete"].as_array().unwrap();
+        assert!(
+            open.len() as u64 + 2 >= j["classes"].as_u64().unwrap(),
+            "{j}"
+        );
+        return Some(None);
+    }
     if j["partial"] == false {
         if j["complete"] == false {
             // a budget past the one of the disjunctive rules runs the EL rules instead,

@@ -5,9 +5,10 @@
 
 use super::delete_fs::{Kind, RecoveryDir};
 use super::{
-    DatasetKind, KEPT_PREFIX, Refusal, Registry, RegistryEntry, TRASH_PREFIX, check_name,
-    read_registry, read_registry_at, sync_dir, write_registry,
+    DatasetKind, KEPT_PREFIX, Refusal, Registry, RegistryEntry, TRASH_PREFIX, check_name, sync_dir,
 };
+#[cfg(test)]
+use super::{read_registry, write_registry};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sparkles_core::store::ProcessLock;
@@ -243,16 +244,20 @@ pub(super) fn check_prepare(dir: &Path) -> Result<()> {
 /// Older registries have no identity. Persist it before staging so startup
 /// can distinguish this row from later registrations with different UUIDs.
 pub(super) fn bind_registry_identity(dir: &Path, name: &str, id: Uuid) -> Result<()> {
-    let mut registry = read_registry(dir)?;
-    let entry = registry
-        .datasets
-        .iter_mut()
-        .find(|entry| entry.name == name && entry.kind == DatasetKind::Persistent)
+    let catalog = RecoveryDir::open(dir)?;
+    let file = super::open_registry(&catalog)?
         .ok_or_else(|| Error::Corrupt(format!("dataset /{name} has no persistent registry row")))?;
-    if entry.id != Some(id) {
-        entry.id = Some(id);
-        settle_reused_identities(dir, &registry)?;
-        write_registry(dir, &registry)?;
+    let mut disk = super::registry_identities(&file)?;
+    let index = disk
+        .datasets
+        .iter()
+        .position(|row| row.name == name && row.kind == DatasetKind::Persistent)
+        .ok_or_else(|| Error::Corrupt(format!("dataset /{name} has no persistent registry row")))?;
+    if disk.datasets[index].id != Some(id) {
+        disk.datasets[index].id = Some(id);
+        settle_reused_identities(dir, &disk)?;
+        super::registry_io::bind_row(file, dir, index, id, disk.datasets.len())?;
+        sync_dir(dir)?;
     }
     Ok(())
 }
@@ -260,7 +265,7 @@ pub(super) fn bind_registry_identity(dir: &Path, name: &str, id: Uuid) -> Result
 /// A restore or rename can register the same alias and UUID as a prior delete.
 /// Once the old registry proves the delete committed, persist that decision
 /// before a registry save can make the prepared record ambiguous again.
-pub(super) fn settle_reused_identities(dir: &Path, next: &Registry) -> Result<()> {
+pub(super) fn settle_reused_identities<R>(dir: &Path, next: &Registry<R>) -> Result<()> {
     let catalog = RecoveryDir::open(dir)?;
     let mut intents = read_intents_at(&catalog)?;
     let mut reused = intents
@@ -278,7 +283,7 @@ pub(super) fn settle_reused_identities(dir: &Path, next: &Registry) -> Result<()
         return catalog.sync();
     }
 
-    let current = read_registry_at(&catalog)?.ok_or_else(|| {
+    let current = super::read_registry_identities(&catalog)?.ok_or_else(|| {
         Error::Corrupt("config.json is missing while a delete identity is being reused".into())
     })?;
     catalog.sync()?;
@@ -304,10 +309,10 @@ pub(super) fn settle_reused_identities(dir: &Path, next: &Registry) -> Result<()
     Ok(())
 }
 
-pub(super) fn registered_dataset<'a>(
-    registry: &'a Registry,
+pub(super) fn registered_dataset<'a, R>(
+    registry: &'a Registry<R>,
     name: &str,
-) -> Option<&'a RegistryEntry> {
+) -> Option<&'a RegistryEntry<R>> {
     registry
         .datasets
         .iter()

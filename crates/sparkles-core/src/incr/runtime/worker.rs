@@ -1,7 +1,6 @@
 //! The worker thread, shutdown, and the operations a thread runs on the runtime.
 
 use super::*;
-use crate::incr::live::QueuedEvent;
 
 struct Operations {
     depth: usize,
@@ -24,12 +23,29 @@ thread_local! {
 }
 
 /// Declare before operation-local guards, so cleanup runs after their locks drop.
-pub(super) struct Operation;
+pub(crate) struct Operation;
 
 impl Operation {
     pub(super) fn enter() -> Self {
         OPERATIONS.with(|s| s.borrow_mut().depth += 1);
         Operation
+    }
+
+    pub(crate) fn release_publication(credit: MemoryLease) {
+        Self::after(move || drop(credit));
+    }
+
+    pub(super) fn after(f: impl FnOnce() + 'static) {
+        let mut f = Some(f);
+        let _ = OPERATIONS.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.depth != 0 {
+                s.close.push(Box::new(f.take().unwrap()));
+            }
+        });
+        if let Some(f) = f {
+            f();
+        }
     }
 }
 
@@ -72,6 +88,7 @@ impl Drop for WorkerRound<'_> {
 #[must_use]
 pub struct WorkerPause<'a> {
     _gate: parking_lot::ReentrantMutexGuard<'a, ()>,
+    _operation: Operation,
 }
 
 impl Runtime {
@@ -82,9 +99,10 @@ impl Runtime {
     /// it closes the dataset. The gate is reentrant, so the pausing thread can still
     /// close this runtime while it holds the pause.
     pub fn pause_worker(&self, until: Instant) -> Option<WorkerPause<'_>> {
-        self.worker
-            .try_lock_until(until)
-            .map(|gate| WorkerPause { _gate: gate })
+        self.worker.try_lock_until(until).map(|gate| WorkerPause {
+            _gate: gate,
+            _operation: Operation::enter(),
+        })
     }
 
     /// Coordinate an owned dataset close with this thread's runtime operations.
@@ -98,26 +116,16 @@ impl Runtime {
             close();
             return;
         }
-        let mut close: Option<Box<dyn FnOnce()>> = Some(Box::new(close));
-        let _ = OPERATIONS.try_with(|s| {
-            let mut s = s.borrow_mut();
-            if s.depth != 0 {
-                s.close.push(close.take().unwrap());
-            }
-        });
-        if let Some(close) = close {
-            close();
-        }
+        Operation::after(close);
     }
 
     /// Stop the rounds and checkpoint every view (a clean close).
     pub fn close(&self, store: &Store) {
+        let _operation = Operation::enter();
         if self.worker.is_owned_by_current_thread() && self.worker_round.load(Ordering::Acquire) {
             self.deferred_close.store(true, Ordering::Release);
             return;
         }
-        // Drop queued event credit after the worker gate and all metadata locks.
-        let mut queued = Vec::new();
         let _worker = self.worker.lock();
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -126,10 +134,10 @@ impl Runtime {
         // even if `checkpoint(store)` unwinds on a failpoint or panic.
         struct CloseCleanup<'a> {
             runtime: &'a Runtime,
-            queued: &'a mut Vec<VecDeque<QueuedEvent>>,
         }
         impl Drop for CloseCleanup<'_> {
             fn drop(&mut self) {
+                let mut queued = Vec::new();
                 let mut retired = Vec::new();
                 let (mut cells, internal, live) = {
                     let mut reg = self.runtime.reg.lock();
@@ -158,22 +166,23 @@ impl Runtime {
                 }
                 for entry in live {
                     if let Some(shared) = entry.queue.upgrade() {
-                        self.queued.push(shared.close(true));
+                        queued.push(shared.close(true));
                     }
                 }
                 drop(cells);
                 drop(internal);
-                drop(retired);
+                // WorkerRound may still own an outer worker guard on this thread.
+                Operation::after(move || {
+                    drop(queued);
+                    drop(retired);
+                });
                 *self.runtime.subscription.lock() = None;
                 self.runtime.kick();
                 let _e = self.runtime.epoch.lock();
                 self.runtime.cv.notify_all();
             }
         }
-        let _cleanup = CloseCleanup {
-            runtime: self,
-            queued: &mut queued,
-        };
+        let _cleanup = CloseCleanup { runtime: self };
         self.checkpoint(store);
     }
 
@@ -220,6 +229,7 @@ impl Runtime {
                     drop(active);
                     drop(s);
                 }
+                runtime.complete_round();
                 drop(runtime);
                 let gone = exec.block_on(async {
                     let mut changed = std::pin::pin!(commits.changed());
@@ -242,6 +252,11 @@ impl Runtime {
         })
     }
 
+    pub(super) fn complete_round(&self) {
+        *self.epoch.lock() += 1;
+        self.cv.notify_all();
+    }
+
     /// Whether a worker round or its synchronized shutdown is in progress.
     pub fn worker_busy(&self) -> bool {
         self.worker.is_locked()
@@ -250,9 +265,14 @@ impl Runtime {
     /// Run a round on the worker and wait for it, at most `timeout`: views defined in
     /// the dataset are then attached and recovered.
     pub fn settle(&self, timeout: Duration) {
+        self.settle_checked(timeout);
+    }
+
+    /// Kick the worker and report whether a round completed.
+    pub fn settle_checked(&self, timeout: Duration) -> bool {
         let start = self.round_epoch();
         self.kick();
-        self.wait_round_after(start, Instant::now() + timeout);
+        self.wait_round_after(start, Instant::now() + timeout)
     }
 
     /// The current completed-round epoch, captured before inspecting a condition that
@@ -273,5 +293,76 @@ impl Runtime {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn close_releases_credit_after_unlocking_live_cell() {
+    let store = Store::in_memory(Default::default());
+    crate::sparql::update::update(
+        &store,
+        "INSERT DATA { <urn:s> <urn:p> 1 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let pool = QueryPool::new(8 << 20);
+    for (in_worker, paused) in [(false, false), (true, false), (false, true)] {
+        let runtime = Runtime::open_with_pool(
+            None,
+            store.dataset_id(),
+            RuntimeOptions::default(),
+            Some(pool.clone()),
+        );
+        runtime.set_host(Arc::new(OpenHost));
+        let query = "SELECT ?s WHERE { ?s <urn:p> ?o }";
+        runtime.put(&store, "view", ViewDef::table(query)).unwrap();
+        runtime.round(&store);
+        let live = runtime
+            .live(&store, query, None, &LiveOptions::default())
+            .unwrap();
+        let filler = pool
+            .work_parent()
+            .reserve(pool.capacity() - (4 << 20) - pool.granted() + 1)
+            .unwrap();
+        let cell = live.slot.clone();
+        let rt = runtime.clone();
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback = woke.clone();
+        let ticket = pool.enter(
+            4 << 20,
+            Some(Arc::new(move || {
+                let status = if !rt.worker_busy() && cell.state.try_lock().is_some() {
+                    1
+                } else {
+                    2
+                };
+                let _ = callback.compare_exchange(0, status, Ordering::SeqCst, Ordering::SeqCst);
+            })),
+        );
+        if in_worker {
+            let _operation = Operation::enter();
+            let _worker = runtime.worker.lock();
+            runtime.worker_round.store(true, Ordering::Release);
+            let active = WorkerRound {
+                runtime: &runtime,
+                store: &store,
+            };
+            runtime.close(&store);
+            drop(active);
+            assert_eq!(woke.load(Ordering::SeqCst), 0);
+        } else if paused {
+            let pause = runtime
+                .pause_worker(Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            runtime.close(&store);
+            assert_eq!(woke.load(Ordering::SeqCst), 0);
+            drop(pause);
+        } else {
+            runtime.close(&store);
+        }
+        assert_eq!(woke.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.granted(), filler.bytes());
+        drop(ticket);
     }
 }

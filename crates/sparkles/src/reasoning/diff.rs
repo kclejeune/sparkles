@@ -1,6 +1,7 @@
 //! Read-only entailment changes between branches, commits and preview snapshots.
 
 use super::analysis::{self, AnalysisControl, AnalysisOptions, State, fact_bytes, hold};
+use super::memory::Memory;
 use crate::store::Snapshot;
 use crate::{Dataset, Result};
 use oxrdf::Term;
@@ -66,6 +67,44 @@ pub struct EntailmentDiff {
     pub findings_complete: bool,
     pub sample_truncated: bool,
     pub warnings: Vec<String>,
+}
+
+/// A diff whose output continues to hold its request memory credit.
+#[derive(Clone, Debug)]
+pub struct AdmittedEntailmentDiff(Arc<DiffBacking>);
+
+#[derive(Debug)]
+struct DiffBacking {
+    value: EntailmentDiff,
+    _memory: Memory,
+}
+
+impl AdmittedEntailmentDiff {
+    fn into_value(self) -> EntailmentDiff {
+        Arc::into_inner(self.0).expect("unshared diff").value
+    }
+}
+
+impl std::ops::Deref for AdmittedEntailmentDiff {
+    type Target = EntailmentDiff;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.value
+    }
+}
+
+// Includes evidence containers and expansion when RDF terms and the key are escaped.
+fn finding_bytes(finding: &Finding) -> usize {
+    let mut bytes = 512 + finding.message.len() + crate::explain::term_bytes(&finding.focus) * 16;
+    for (name, values) in &finding.evidence {
+        bytes += 256 + name.len() * 8;
+        let term = |term: &Term| 96 + crate::explain::term_bytes(term) * 16;
+        bytes += match values {
+            Evidence::One(value) => term(value),
+            Evidence::Many(values) => values.iter().map(term).sum(),
+        };
+    }
+    bytes
 }
 
 pub(crate) fn finding_key(finding: &Finding) -> String {
@@ -240,6 +279,11 @@ pub(crate) fn resolve(
 }
 
 pub fn diff(dataset: &Dataset, request: &DiffRequest) -> Result<EntailmentDiff> {
+    diff_admitted(dataset, request).map(AdmittedEntailmentDiff::into_value)
+}
+
+/// Compare selected states and keep the output's memory credit with the result.
+pub fn diff_admitted(dataset: &Dataset, request: &DiffRequest) -> Result<AdmittedEntailmentDiff> {
     let control = AnalysisControl::new(&request.analysis)?;
     let from = resolve_state(dataset, &request.from, &control)?;
     let to = resolve_state(dataset, &request.to, &control)?;
@@ -289,7 +333,7 @@ pub(crate) fn compare(
     to: &Arc<Snapshot>,
     request: &DiffRequest,
     control: &AnalysisControl,
-) -> Result<EntailmentDiff> {
+) -> Result<AdmittedEntailmentDiff> {
     compare_resolved(dataset, from, to, request, control, None)
 }
 
@@ -300,7 +344,7 @@ fn compare_resolved(
     request: &DiffRequest,
     control: &AnalysisControl,
     pinned: Option<(Dataset, Dataset)>,
-) -> Result<EntailmentDiff> {
+) -> Result<AdmittedEntailmentDiff> {
     let program = analysis::program(dataset, &request.analysis)?;
     let mut from_options = request.analysis.clone();
     from_options.access = request.from_access.clone().or(from_options.access);
@@ -340,34 +384,54 @@ fn compare_resolved(
     delta(
         a,
         b,
-        DiffState {
-            selector: request.from.clone(),
-            commit: from.commit,
-        },
-        DiffState {
-            selector: request.to.clone(),
-            commit: to.commit,
-        },
+        (from.commit, to.commit),
         request,
         control,
+        dataset.pool().map(|pool| pool.work_parent()),
     )
 }
 
 fn delta(
     a: State,
     b: State,
-    from: DiffState,
-    to: DiffState,
+    commits: (u64, u64),
     request: &DiffRequest,
     control: &AnalysisControl,
-) -> Result<EntailmentDiff> {
-    let mut retained = a
+    parent: Option<sparkles_budget::ParentHandle>,
+) -> Result<AdmittedEntailmentDiff> {
+    let retained = a
         .bytes
         .checked_add(b.bytes)
         .ok_or_else(|| analysis::budget("the retained analysis size overflowed"))?;
+    let output_limit = request
+        .analysis
+        .max_memory
+        .map(|limit| limit.saturating_sub(retained));
+    let mut output = Memory::new(output_limit.map(|limit| limit as u64), parent.clone());
+    let mut scratch = Memory::new(None, parent);
+    let mut live = 0;
+    hold(
+        output_limit,
+        &mut live,
+        size_of::<EntailmentDiff>()
+            + request.from.len()
+            + request.to.len()
+            + a.warnings
+                .iter()
+                .chain(&b.warnings)
+                .map(|s| 48 + s.len())
+                .sum::<usize>(),
+    )?;
+    output.grow(live as u64)?;
     let mut result = EntailmentDiff {
-        from,
-        to,
+        from: DiffState {
+            selector: request.from.clone(),
+            commit: commits.0,
+        },
+        to: DiffState {
+            selector: request.to.clone(),
+            commit: commits.1,
+        },
         added: 0,
         removed: 0,
         added_triples: Vec::new(),
@@ -398,17 +462,37 @@ fn delta(
                 (false, &mut result.by_predicate, &triple[1]),
                 (true, &mut result.by_class, &triple[2]),
             ] {
-                if is_class && triple[1] != oxrdf::vocab::rdf::TYPE.into_owned().into() {
+                if is_class
+                    && !matches!(&triple[1], Term::NamedNode(node)
+                    if node.as_ref() == oxrdf::vocab::rdf::TYPE)
+                {
                     continue;
                 }
-                let name = match term {
-                    Term::NamedNode(node) => node.as_str().to_string(),
-                    term => term.to_string(),
+                let counts = if let Term::NamedNode(node) = term {
+                    let name = node.as_str();
+                    if let Some(counts) = map.get_mut(name) {
+                        counts
+                    } else {
+                        let mut peak = output.bytes() as usize;
+                        hold(output_limit, &mut peak, 96 + name.len())?;
+                        output.grow((96 + name.len()) as u64)?;
+                        map.entry(name.to_owned()).or_default()
+                    }
+                } else {
+                    let mut peak = output.bytes() as usize;
+                    let name_bytes = 160 + crate::explain::term_bytes(term) * 8;
+                    hold(output_limit, &mut peak, name_bytes)?;
+                    scratch.grow(name_bytes as u64)?;
+                    let name = term.to_string();
+                    if !map.contains_key(&name) {
+                        output.grow(96)?;
+                        scratch.shrink_to(name.capacity() as u64);
+                        output.absorb(&mut scratch)?;
+                    }
+                    let counts = map.entry(name).or_default();
+                    scratch.shrink_to(0);
+                    counts
                 };
-                if !map.contains_key(&name) {
-                    hold(request.analysis.max_memory, &mut retained, 96 + name.len())?;
-                }
-                let counts = map.entry(name).or_default();
                 if adding {
                     counts.added += 1;
                 } else {
@@ -428,26 +512,39 @@ fn delta(
                 }));
             }
             if request.all_changes || rows.len() < request.sample_limit {
-                hold(
-                    request.analysis.max_memory,
-                    &mut retained,
-                    fact_bytes(key, triple),
-                )?;
+                let bytes = fact_bytes(key, triple);
+                let mut live = output.bytes() as usize;
+                hold(output_limit, &mut live, bytes)?;
+                output.grow(bytes as u64)?;
                 rows.push(triple.clone());
             } else {
                 result.sample_truncated = true;
             }
         }
     }
-    let known: HashSet<_> = a.diagnostics.findings.iter().map(finding_key).collect();
+    let mut known = HashSet::new();
+    for finding in &a.diagnostics.findings {
+        control.check()?;
+        let bytes = finding_bytes(finding);
+        let mut live = output.bytes().saturating_add(scratch.bytes()) as usize;
+        hold(output_limit, &mut live, bytes)?;
+        scratch.grow(bytes as u64)?;
+        known.insert(finding_key(finding));
+    }
     for finding in &b.diagnostics.findings {
         control.check()?;
-        if known.contains(&finding_key(finding)) {
+        let bytes = finding_bytes(finding);
+        let mut live = output.bytes().saturating_add(scratch.bytes()) as usize;
+        hold(output_limit, &mut live, bytes)?;
+        let prior = scratch.bytes();
+        scratch.grow(bytes as u64)?;
+        let seen = known.contains(&finding_key(finding));
+        scratch.shrink_to(prior);
+        if seen {
             continue;
         }
         if check_complete(&a.diagnostics, finding.check) {
-            let bytes = serde_json::to_vec(&finding_json(finding)).unwrap().len() * 2 + 256;
-            hold(request.analysis.max_memory, &mut retained, bytes)?;
+            output.grow(bytes as u64)?;
             result.new_findings.push(finding.clone());
         } else {
             result.findings_complete = false;
@@ -459,7 +556,12 @@ fn delta(
         .iter()
         .chain(&b.diagnostics.checks)
         .all(|outcome| matches!(outcome.status, CheckStatus::None | CheckStatus::Violations));
-    Ok(result)
+    drop(known);
+    drop(scratch);
+    Ok(AdmittedEntailmentDiff(Arc::new(DiffBacking {
+        value: result,
+        _memory: output,
+    })))
 }
 
 impl DiffRequest {
@@ -487,6 +589,15 @@ pub fn preview(
     preview: &crate::preview::Preview,
     request: &DiffRequest,
 ) -> Result<EntailmentDiff> {
+    preview_admitted(dataset, preview, request).map(AdmittedEntailmentDiff::into_value)
+}
+
+/// Compare preview states and keep the output's memory credit with the result.
+pub fn preview_admitted(
+    dataset: &Dataset,
+    preview: &crate::preview::Preview,
+    request: &DiffRequest,
+) -> Result<AdmittedEntailmentDiff> {
     let states = preview
         .states
         .as_ref()
@@ -498,7 +609,9 @@ pub fn preview(
 #[cfg(test)]
 mod review_regressions {
     use super::*;
-    fn same_snapshot_after_interposed_write(profile: sparkles_reasoner::Profile) -> EntailmentDiff {
+    fn same_snapshot_after_interposed_write(
+        profile: sparkles_reasoner::Profile,
+    ) -> AdmittedEntailmentDiff {
         let dataset = Dataset::memory();
         dataset
             .update("INSERT DATA {<urn:trigger> <urn:p> 1}")
@@ -543,19 +656,102 @@ mod review_regressions {
         delta(
             a,
             b,
-            DiffState {
-                selector: "fixed".into(),
-                commit: snapshot.commit,
-            },
-            DiffState {
-                selector: "fixed".into(),
-                commit: snapshot.commit,
-            },
+            (snapshot.commit, snapshot.commit),
             &request,
             &control,
+            None,
         )
         .unwrap()
     }
+    #[test]
+    fn comparison_requires_headroom_beside_two_admitted_states() {
+        use crate::sparql::pool::QueryPool;
+        let pool = QueryPool::new(16 << 20);
+        let dataset = Dataset::from_store_with(
+            crate::store::Store::in_memory(Default::default()),
+            crate::DatasetOptions {
+                pool: Some(pool.clone()),
+                ..Default::default()
+            },
+        );
+        let mut schema =
+            String::from("PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {");
+        for class in 0..64 {
+            use std::fmt::Write;
+            write!(schema, " <urn:A> rdfs:subClassOf <urn:class:{class}> .").unwrap();
+        }
+        schema.push('}');
+        dataset.update(&schema).unwrap();
+        let older = dataset.store().snapshot();
+        dataset.update("INSERT DATA { <urn:x> a <urn:A> }").unwrap();
+        let newer = dataset.store().snapshot();
+        let mut request = DiffRequest::new("older", "newer");
+        request.sample_limit = 0;
+        request.analysis.program = Some(analysis::AnalysisProgram {
+            profile: sparkles_reasoner::Profile::RdfsSimple,
+            inputs: Default::default(),
+            extras: Default::default(),
+        });
+        let control = AnalysisControl::new(&request.analysis).unwrap();
+        let program = analysis::program(&dataset, &request.analysis).unwrap();
+        let states = || {
+            let a = analysis::analyze(
+                &dataset,
+                &older,
+                &program,
+                &request.analysis,
+                &control,
+                0,
+                None,
+                &[],
+            )
+            .unwrap();
+            let b = analysis::analyze(
+                &dataset,
+                &newer,
+                &program,
+                &request.analysis,
+                &control,
+                a.bytes,
+                None,
+                &[],
+            )
+            .unwrap();
+            (a, b)
+        };
+        let compare = |a, b| {
+            delta(
+                a,
+                b,
+                (older.commit, newer.commit),
+                &request,
+                &control,
+                Some(pool.work_parent()),
+            )
+        };
+        let (a, b) = states();
+        let held = pool.granted();
+        assert!(held > 0);
+        let sibling = pool
+            .work_parent()
+            .reserve(pool.capacity() - held - 768)
+            .unwrap();
+        assert!(matches!(compare(a, b), Err(crate::Error::BudgetExceeded(e))
+            if e.kind == crate::BudgetKind::ServerMemory));
+        drop(sibling);
+        let baseline = pool.granted();
+        let (a, b) = states();
+        let result = compare(a, b).unwrap();
+        assert!(
+            result.by_class.len() >= 64,
+            "the sample limit must not limit class counts"
+        );
+        assert!(result.sample_truncated);
+        assert!(pool.granted() > baseline);
+        drop(result);
+        assert_eq!(pool.granted(), baseline);
+    }
+
     #[test]
     fn unrelated_blank_allocation_cannot_change_a_fixed_generated_closure() {
         for call in ["makeTemp(?w)", "makeSkolem(?w, ?value)"] {

@@ -68,6 +68,7 @@ impl ManagedSlot {
 /// Retained last by each store and branch set, after their owned resources.
 pub(crate) struct Family {
     pub(crate) gate: Arc<FamilyGate>,
+    pub(super) index_settings: super::index_settings::State,
     /// The managed-graph registry every member admits its commits against (see
     /// [`crate::managed`]). One registry serves main and every branch, including those
     /// created before it was enabled, so they cannot diverge. Shared with snapshots via
@@ -99,6 +100,7 @@ impl Family {
         }
         Arc::new(Self {
             gate: Arc::new(FamilyGate::default()),
+            index_settings: Default::default(),
             managed: Arc::new(ManagedSlot::empty()),
             managed_change: Mutex::new(()),
             holds: Default::default(),

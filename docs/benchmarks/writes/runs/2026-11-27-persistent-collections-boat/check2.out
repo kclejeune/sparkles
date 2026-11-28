@@ -1,0 +1,12 @@
+tree 5b09ff6ad2b9fab2a08a04e2e616d02537adfc0e
+== fmt2: mbx fmt --all -- --check
+PASS fmt2
+== clippy2: mbx clippy -p sparkles-core --all-targets -- -D warnings
+PASS clippy2
+== clippy-geo2: mbx clippy -p sparkles-core --all-targets --features geo -- -D warnings
+PASS clippy-geo2
+== nextest-pmap: mbx nextest run -p sparkles-core --lib -E test(/store::(pmap|append_vec)::/)
+PASS nextest-pmap
+     Summary [   0.468s] 15 tests run: 15 passed, 3331 skipped
+tree 5b09ff6ad2b9fab2a08a04e2e616d02537adfc0e
+CHECK2-DONE

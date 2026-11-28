@@ -77,6 +77,36 @@ fn openapi_document() {
     let doc: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(doc["openapi"], "3.1.0");
     assert!(doc["paths"]["/$/datasets"]["get"].is_object());
+    assert!(
+        doc["components"]["parameters"]["kind"]["schema"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("index"))
+    );
+    assert!(
+        doc["components"]["schemas"]["SettingsKind"]["properties"]["base"]["$ref"]
+            == "#/components/schemas/IndexSettings"
+    );
+    for method in ["get", "put", "patch", "delete"] {
+        let operation = &doc["paths"]["/$/settings/{ds}/{kind}"][method];
+        assert!(
+            operation["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|param| param["name"] == "branch"
+                    || param["$ref"] == "#/components/parameters/branch"),
+            "{operation}"
+        );
+        if method != "get" {
+            assert!(
+                operation["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("whole dataset")
+            );
+        }
+    }
     let y = run(&["openapi", "--format", "yaml"]);
     assert!(out(&y).contains("\nopenapi: \"3.1.0\"\n"));
 }

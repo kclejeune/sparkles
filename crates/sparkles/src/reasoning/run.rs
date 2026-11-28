@@ -4,12 +4,14 @@
 use super::freshness::{Freshness, freshness};
 use super::{ReasoningRecord, RunChanges, RunInfo};
 use crate::Dataset;
+use crate::dataset::{RecordedReasoning, reasoning_strings_bytes};
 use crate::error::{ComponentError, Error, Result};
 use crate::handles::from_anyhow;
 use crate::sparql::QueryOptions;
 use crate::store::Store;
 use crate::task::Control;
 use sparkles_reasoner::diagnostics::{DiagnoseOptions, DiagnosticsReport};
+use sparkles_reasoner::inputs::Fetched;
 use sparkles_reasoner::{Extras, ImportMode, Inputs, Profile, ReasonReport};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,7 +67,8 @@ impl Default for ReasonRequest {
     }
 }
 
-/// What a materialization did, and the record it left.
+/// What a materialization did, and the record it left. The application owns these
+/// values. The dataset keeps its own record and credit for its warnings and fetched names.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ReasonOutcome {
@@ -73,7 +76,7 @@ pub struct ReasonOutcome {
     pub record: ReasoningRecord,
 }
 
-/// The error code of a run that yielded to a waiting write
+/// The error code of a run superseded by a later publication, a clear or a waiting write
 /// ([`ReasonRequest::yield_to_writers`]).
 pub const SUPERSEDED: &str = "superseded";
 
@@ -88,28 +91,53 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
     let state = ds.state();
     let store: &Store = &state.store;
     let cancel = ctl.cancel.flag();
-    let fetched_before: Vec<String> = ds
-        .reasoning_record()
-        .map(|r| r.fetched_imports)
-        .unwrap_or_default();
-    let mut fetched = fetched_before.clone();
-    let mut fetch_warnings = Vec::new();
-    if req.inputs.imports == ImportMode::Fetch || req.refresh_imports {
-        ctl.progress.report(0.02, "fetching imports");
-        let qopts = QueryOptions {
-            cancel: Some(cancel.clone()),
-            ..req.load.clone()
-        };
-        let refresh = if req.refresh_imports {
-            fetched_before
-        } else {
-            Vec::new()
-        };
-        let f = sparkles_reasoner::fetch_imports(store, &req.inputs, &refresh, &qopts)
+    let collecting = state.pending_imports.lock().collecting.clone();
+    let (fetched, fetch_memory, initial) =
+        if req.inputs.imports == ImportMode::Fetch || req.refresh_imports {
+            ctl.progress.report(0.02, "fetching imports");
+            let mut qopts = req.load.clone();
+            qopts.cancel = Some(cancel.clone());
+            qopts.deadline = ctl.deadline.into_iter().chain(qopts.deadline).min();
+            qopts.max_memory_bytes = req
+                .max_memory
+                .map(|bytes| bytes as u64)
+                .into_iter()
+                .chain(qopts.max_memory_bytes)
+                .min();
+            if qopts.pool.is_none() && qopts.grant.is_none() {
+                qopts.pool = state.pool.clone();
+            }
+            let (initial, pending) = {
+                let journal = state.pending_imports.lock();
+                let pending = if req.refresh_imports {
+                    journal.loaded.refresh_names(&mut qopts)?
+                } else {
+                    Default::default()
+                };
+                (state.recorded_reasoning(), pending)
+            };
+            let recorded = initial
+                .value
+                .as_ref()
+                .filter(|_| req.refresh_imports)
+                .map_or(&[][..], |r| r.fetched_imports.as_slice());
+            let refresh = recorded.iter().map(String::as_str).chain(
+                pending
+                    .names()
+                    .filter(|name| !recorded.iter().any(|iri| iri == name)),
+            );
+            let (fetched, memory) = sparkles_reasoner::inputs::fetch_imports_with_names(
+                store,
+                &req.inputs,
+                refresh,
+                &qopts,
+                |iri, update, opts| ds.load_reasoning_import(iri, update, opts),
+            )
             .map_err(|e| from_anyhow(e.context("fetching imports")))?;
-        fetched.extend(f.fetched);
-        fetch_warnings = f.warnings;
-    }
+            (fetched, Some(memory), initial)
+        } else {
+            (Fetched::default(), None, state.recorded_reasoning())
+        };
     ctl.progress.report(0.05, "loading triples");
     // the reasoner reports progress only once it holds the writer lock
     let locked = Arc::new(AtomicBool::new(false));
@@ -121,24 +149,35 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             p.report(f, msg);
         })
     };
+    let max_memory = req.max_memory.map(|limit| {
+        limit.saturating_sub(fetch_memory.as_ref().map_or(0, |memory| memory.bytes()))
+    });
     let opts = sparkles_reasoner::ReasonOptions {
         progress: Some(progress),
         cancel: Some(cancel),
         inputs: req.inputs.clone(),
         threads: req.threads,
-        max_memory: req.max_memory,
+        max_memory,
         memory_parent: state.pool.as_ref().map(|p| p.work_parent()),
         max_inferred: req
             .max_inferred
             .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
         // the input graphs' axioms outside OWL 2 RL, in the state the run reads
-        inspect: rl_inspector(store, req, ctl),
+        inspect: rl_inspector(ds, req, ctl, max_memory),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
     let done = AtomicBool::new(false);
+    let mut prepared = None;
     let result = std::thread::scope(|s| {
+        struct SignalDone<'a>(&'a AtomicBool);
+        impl Drop for SignalDone<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _signal = SignalDone(&done);
         if req.yield_to_writers {
             // a newer write waiting for the lock supersedes this run
             s.spawn(|| {
@@ -154,7 +193,7 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             });
         }
         let since = if req.incremental {
-            incremental_since(ds.reasoning_record().as_ref(), store)
+            incremental_since(state.read_reasoning().as_ref(), store)
         } else {
             None
         };
@@ -162,15 +201,35 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             since,
             cache: Some(&state.closure),
         };
-        let r = sparkles_reasoner::materialize_incremental(
+        sparkles_reasoner::materialize_incremental_prepared_with_memory(
             store,
             &req.profile,
             &req.extras,
             inc,
             &opts,
-        );
-        done.store(true, Ordering::Relaxed);
-        r
+            |resolved, warnings, work| {
+                let mut journal = state.pending_imports.lock();
+                let current = state.recorded_reasoning();
+                let recorded = [&initial, &current].map(|owner| {
+                    owner
+                        .value
+                        .as_ref()
+                        .map_or(&[][..], |r| r.fetched_imports.as_slice())
+                });
+                let strings = prepare_record_strings(
+                    state,
+                    resolved,
+                    recorded,
+                    &journal.loaded,
+                    &fetched,
+                    warnings,
+                    work,
+                )?;
+                drop(collecting);
+                prepared = Some((journal.prepare_run(), strings));
+                Ok(())
+            },
+        )
     });
     let report = match result {
         Ok(r) => r,
@@ -192,38 +251,152 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             return Err(from_anyhow(e));
         }
     };
-    let mut record = recorded(&req.profile, &req.extras, &report, store);
-    record_inputs(&mut record, &req.inputs, &report, fetched);
-    record.warnings.splice(0..0, fetch_warnings);
+    drop(initial);
+    drop(fetched);
+    drop(fetch_memory);
+    let (
+        run,
+        PreparedRecordStrings {
+            warnings,
+            fetched_imports,
+            memory,
+            claims,
+            _claim_memory,
+        },
+    ) = prepared.expect("materialization prepared its record before committing");
+    let mut record = recorded_with_warnings(&req.profile, &req.extras, &report, store, warnings);
+    record_input_metadata(&mut record, &req.inputs, &report);
+    record.fetched_imports = fetched_imports;
     // a run keeps the dataset's automatic re-run setting
-    record.auto = ds.reasoning_record().and_then(|r| r.auto);
-    state.set_reasoning(Some(record.clone()))?;
+    record.auto = state.read_reasoning().as_ref().and_then(|r| r.auto.clone());
+    let outcome = record.clone();
+    state.set_reasoning_admitted(record, memory, claims, run)?;
     ctl.progress.report(1.0, "materialized");
-    Ok(ReasonOutcome { report, record })
+    Ok(ReasonOutcome {
+        report,
+        record: outcome,
+    })
+}
+
+struct PreparedRecordStrings {
+    warnings: Vec<String>,
+    fetched_imports: Vec<String>,
+    memory: Option<sparkles_budget::MemoryLease>,
+    claims: Vec<super::imports::NameClaim>,
+    _claim_memory: Option<sparkles_budget::MemoryLease>,
+}
+
+fn prepare_record_strings(
+    state: &crate::dataset::DatasetState,
+    resolved: &sparkles_reasoner::inputs::Resolved,
+    recorded: [&[String]; 2],
+    pending: &super::imports::PendingImports,
+    fetched: &Fetched,
+    warnings: &[String],
+    work: &mut sparkles_reasoner::PreparationMemory<'_>,
+) -> Result<PreparedRecordStrings> {
+    // The resolver supplies the names actually read. Only a previous record,
+    // committed journal entry or successful fetch establishes LOAD provenance.
+    let names = resolved
+        .imports
+        .iter()
+        .filter(|i| {
+            i.graph.is_some()
+                && (recorded.iter().any(|names| names.contains(&i.iri))
+                    || fetched.fetched.contains(&i.iri)
+                    || pending.contains(&i.iri))
+        })
+        .map(|i| &i.iri);
+    let warning_count = fetched.warnings.len() + warnings.len();
+    let warnings = fetched.warnings.iter().chain(warnings);
+    let count = names.clone().count();
+    let bytes = reasoning_strings_bytes(warning_count, warnings.clone().map(String::len))
+        + reasoning_strings_bytes(count, names.clone().map(String::len));
+    let mut claims = Vec::new();
+    let mut claim_memory = None;
+    let pool = state.pool.as_ref();
+    let mut memory = match RecordedReasoning::reserve(pool, bytes) {
+        Ok(memory) => memory,
+        Err(error) => {
+            let Some(pool) = pool.filter(|p| p.domain_stats().retained_capacity != 0) else {
+                return Err(error);
+            };
+            if count == 0 {
+                return Err(error);
+            }
+            claim_memory = work
+                .reserve(count * size_of::<super::imports::NameClaim>())
+                .map_err(super::parent_error)?;
+            claims = Vec::with_capacity(count);
+            let mut reused = 0;
+            for name in names.clone() {
+                if let Some(claim) = pending.claim(name, work)? {
+                    reused += claim.bytes();
+                    claims.push(claim);
+                }
+            }
+            if claims.is_empty() {
+                return Err(error);
+            }
+            state.store.failpoint("reasoning-import-copies-claimed");
+            RecordedReasoning::reserve(
+                Some(pool),
+                bytes - reused + (claims.len() * size_of::<sparkles_budget::MemoryLease>()) as u64,
+            )?
+        }
+    };
+    let mut saved_warnings = Vec::with_capacity(warning_count);
+    saved_warnings.extend(warnings.cloned());
+    let mut fetched_imports = Vec::with_capacity(count);
+    fetched_imports.extend(names.cloned());
+    fetched_imports.sort_unstable();
+    fetched_imports.dedup();
+    if let Some(lease) = &mut memory {
+        let actual = reasoning_strings_bytes(
+            saved_warnings.capacity(),
+            saved_warnings.iter().map(String::capacity),
+        ) + reasoning_strings_bytes(
+            fetched_imports.capacity(),
+            fetched_imports.iter().map(String::capacity),
+        );
+        lease
+            .shrink(bytes - actual)
+            .expect("unused duplicate name credit");
+    }
+    Ok(PreparedRecordStrings {
+        warnings: saved_warnings,
+        fetched_imports,
+        memory,
+        claims,
+        _claim_memory: claim_memory,
+    })
 }
 
 /// The warnings of spec F21 §7 for an `owl-rl` run: the axioms of its inputs outside
 /// OWL 2 RL and those whose rules the rule subset lacks. Other profiles have none, and
 /// so does a library built without the `ontology` feature.
 fn rl_inspector(
-    store: &Store,
+    ds: &Dataset,
     req: &ReasonRequest,
     ctl: &Control,
+    max_memory: Option<usize>,
 ) -> Option<sparkles_reasoner::InspectFn> {
     #[cfg(feature = "ontology")]
     if req.profile == Profile::OwlRl {
         let opts = QueryOptions {
             cancel: Some(ctl.cancel.flag()),
             deadline: ctl.deadline,
+            max_memory_bytes: max_memory.map(|bytes| bytes as u64),
+            pool: ds.pool().cloned(),
             ..Default::default()
         };
         return Some(crate::handles::ontology::rl_inspector(
-            store,
+            ds.store(),
             &req.inputs,
             opts,
         ));
     }
-    let _ = (store, req, ctl);
+    let _ = (ds, req, ctl, max_memory);
     None
 }
 
@@ -233,6 +406,16 @@ pub fn recorded(
     extras: &Extras,
     report: &ReasonReport,
     store: &Store,
+) -> ReasoningRecord {
+    recorded_with_warnings(profile, extras, report, store, report.warnings.clone())
+}
+
+fn recorded_with_warnings(
+    profile: &Profile,
+    extras: &Extras,
+    report: &ReasonReport,
+    store: &Store,
+    warnings: Vec<String>,
 ) -> ReasoningRecord {
     let receipt = report.receipt.as_ref();
     ReasoningRecord {
@@ -256,7 +439,7 @@ pub fn recorded(
         },
         vocabularies: extras.names(),
         geo_default_geometry: extras.geo_default_geometry,
-        warnings: report.warnings.clone(),
+        warnings,
         millis: Some(report.millis),
         inherited_stale: false,
         auto: None,
@@ -274,6 +457,20 @@ pub fn record_inputs(
     report: &ReasonReport,
     fetched: Vec<String>,
 ) {
+    record_input_metadata(record, inputs, report);
+    let Some(r) = &report.inputs else {
+        return;
+    };
+    let mut f: Vec<String> = fetched
+        .into_iter()
+        .filter(|iri| r.imports.iter().any(|i| &i.iri == iri && i.graph.is_some()))
+        .collect();
+    f.sort();
+    f.dedup();
+    record.fetched_imports = f;
+}
+
+fn record_input_metadata(record: &mut ReasoningRecord, inputs: &Inputs, report: &ReasonReport) {
     if *inputs != Inputs::default() {
         record.inputs = serde_json::to_value(inputs).ok();
     }
@@ -292,13 +489,6 @@ pub fn record_inputs(
             .filter_map(|i| serde_json::to_value(i).ok())
             .collect();
     }
-    let mut f: Vec<String> = fetched
-        .into_iter()
-        .filter(|iri| r.imports.iter().any(|i| &i.iri == iri && i.graph.is_some()))
-        .collect();
-    f.sort();
-    f.dedup();
-    record.fetched_imports = f;
 }
 
 /// How a run materialized, for its record.
@@ -520,7 +710,14 @@ pub(crate) fn diagnose_snapshot_with(
         typings.as_deref(),
         controls,
     )
-    .map_err(from_anyhow)?;
+    .map_err(|error| {
+        // a report that passes its own memory limit is a reasoning budget refusal,
+        // not a malformed request
+        match error.downcast_ref::<sparkles_reasoner::MemoryLimitExceeded>() {
+            Some(limit) => super::analysis::budget(limit.to_string()),
+            None => from_anyhow(error),
+        }
+    })?;
     let inferences = record
         .filter(|_| opts.inferences)
         .map(|r| (r.profile.clone(), freshness(r, store, commit)));

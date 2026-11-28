@@ -80,13 +80,13 @@ pub(super) fn checked_hash_table_bytes(capacity: usize, entry_size: usize) -> Op
 /// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
 /// `entry_size` bytes.
 #[inline]
-pub(super) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+pub(crate) fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
     checked_hash_table_bytes(capacity, entry_size).unwrap_or(usize::MAX)
 }
 
 /// Allocation size of the next hashbrown table when a table at `capacity` rehashes.
 #[inline]
-pub(super) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
+pub(crate) fn next_hash_table_bytes(capacity: usize, entry_size: usize) -> Option<usize> {
     let cur = hash_buckets(capacity)?;
     let next = if cur == 0 { 4 } else { cur.checked_mul(2)? };
     table_layout_bytes(next, entry_size)
@@ -688,6 +688,29 @@ impl Lits {
         self.unadmitted_bytes.load(Ordering::Relaxed)
     }
 
+    /// A copy of the interner with every literal at its id, for the closure check of
+    /// item 1229's lemma, whose replay must not intern into the run it reads.
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> Lits {
+        let copy = Lits::default();
+        let n = self.next.load(Ordering::Relaxed);
+        {
+            let mut ids = copy.ids.lock();
+            for id in 0..n {
+                let l = *self
+                    .recs
+                    .slot_with_delta(id)
+                    .0
+                    .get()
+                    .expect("an interned literal");
+                let _ = copy.recs.slot_with_delta(id).0.set(l);
+                ids.insert(l, id);
+            }
+        }
+        copy.next.store(n, Ordering::Relaxed);
+        copy
+    }
+
     /// Re-bases `unadmitted_bytes` to total `bytes` when starting a new saturation round that
     /// carries `self` forward from a previous run.
     pub(super) fn sync_unadmitted_on_begin_run(&mut self) {
@@ -704,6 +727,41 @@ impl Lits {
                     matches!(m.kind(), NE | XL) && self.view(m, inv) == XLit::Ne(s, t)
                 }))
         })
+    }
+
+    /// [`Lits::complementary`], telling `read` of each literal of `head` that it tests,
+    /// those of the inner search for an equality's inequality included, `None` once read
+    /// answers false.
+    pub(super) fn complementary_with(
+        &self,
+        head: &[Lit],
+        inv: impl Fn(Role) -> Option<Role> + Copy,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        for &l in head {
+            if !read(1) {
+                return None;
+            }
+            #[cfg(test)]
+            super::dl_rules::meter_probe::visit(1);
+            if !matches!(l.kind(), EQ | XL) {
+                continue;
+            }
+            let XLit::Eq(s, t) = self.view(l, inv) else {
+                continue;
+            };
+            for &m in head {
+                if !read(1) {
+                    return None;
+                }
+                #[cfg(test)]
+                super::dl_rules::meter_probe::visit(1);
+                if matches!(m.kind(), NE | XL) && self.view(m, inv) == XLit::Ne(s, t) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     /// The general form of any literal, canonical as [`XLit::canon`] makes it.
@@ -1213,6 +1271,37 @@ impl Rooted<'_> {
     }
 }
 
+/// [`subset`] of two sorted slices, telling `read` of each literal of `b`
+/// that it steps over, `None` once read answers false.
+#[inline]
+pub(super) fn subset_with<F: FnMut(usize) -> bool + ?Sized>(
+    a: &[Lit],
+    b: &[Lit],
+    read: &mut F,
+) -> Option<bool> {
+    if a.len() > b.len() {
+        return Some(false);
+    }
+    let mut j = 0;
+    for &x in a {
+        loop {
+            if !read(1) {
+                return None;
+            }
+            if j < b.len() && b[j] < x {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j == b.len() || b[j] != x {
+            return Some(false);
+        }
+        j += 1;
+    }
+    Some(true)
+}
+
 /// Whether sorted `a` is a subset of sorted `b`.
 /// Whether the sorted literals `a` without repeats are among the sorted literals `b`
 /// without repeats.
@@ -1338,6 +1427,18 @@ impl Table {
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed) as usize
     }
+
+    /// A copy of the table with every clause at its id, for the closure check of item
+    /// 1229's lemma, whose replay must not append to the run it reads.
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> Table {
+        let copy = Table::default();
+        for id in 0..self.len() as u32 {
+            let at = copy.push(self.get(id).clone());
+            debug_assert_eq!(at, id);
+        }
+        copy
+    }
 }
 
 /// Unwind-safe credit holder for slot-bound [`Table`] appends, refunding any unused
@@ -1438,7 +1539,8 @@ pub struct Stored {
     pub dead: bool,
     /// the rules have run on it
     pub done: bool,
-    /// its id in the run's table, once sent to a predecessor
+    /// its id in the run's table, once sent to a predecessor, which is the root's id of
+    /// the same unit once the root delivered it in a run that forwards root units
     pub sent: Option<u32>,
     /// its maximal literal once processed, when it has one
     pub max: Option<Lit>,
@@ -1623,6 +1725,48 @@ impl Store {
         self.subsumed_parts(c.body(), c.head(), sig)
     }
 
+    /// [`Store::subsumed_parts`] of a sorted body and head without repeats, telling `read`
+    /// of each candidate it reads and of each literal that a comparison steps over, for
+    /// item 1280's meter, and `None` once read answers false.
+    pub(super) fn subsumed_with(
+        &self,
+        body: &[Lit],
+        head: &[Lit],
+        sig: u64,
+        read: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<bool> {
+        let check = |ids: &[u32], read: &mut dyn FnMut(usize) -> bool| -> Option<bool> {
+            for &i in ids {
+                if !read(1) {
+                    return None;
+                }
+                let s = &self.clauses[i as usize];
+                if s.sig & !sig == 0
+                    && !s.dead
+                    && subset_with(s.c.body(), body, read)?
+                    && subset_with(s.c.head(), head, read)?
+                {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        };
+        if check(&self.empty, read)? {
+            return Some(true);
+        }
+        for l in head {
+            if !read(1) {
+                return None;
+            }
+            if let Some(ids) = self.by_last.get(l)
+                && check(ids, read)?
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// Upper bound on peak index/container allocation (excluding the clause's own literal
     /// slice) needed by [`Store::add_unchecked`] for a clause with head `head`.
     fn add_index_growth_bound(&self, head: &[Lit]) -> Option<usize> {
@@ -1797,19 +1941,24 @@ impl Store {
         covered_payload: usize,
         out: &mut S,
     ) -> (bool, bool) {
-        self.add_parts_admitted_covered_with_fact(body, head, covered_payload, false, out)
+        self.add_parts_admitted_covered_with_fact(body, head, covered_payload, false, None, out)
     }
 
     /// [`Store::add_parts_admitted_covered`], conferring exact root-unit provenance
     /// (`Stored::fact = true`) when `is_fact` is set and the normalized clause is an exact
     /// empty-body unit. When a live exact duplicate unit already exists in the store (even
-    /// if still queued), marks it `fact = true` in place with zero allocation.
+    /// if still queued), marks it `fact = true` in place with zero allocation. With
+    /// `root_id`, the root's table id of that unit, the stored copy takes the root's id as
+    /// the id it goes to predecessors by, in place of any local id it was sent by before,
+    /// so that every forwarded copy carries the root's id whatever the arrival order (item
+    /// 1061).
     fn add_parts_admitted_covered_with_fact<S: Sink>(
         &mut self,
         mut body: Vec<Lit>,
         mut head: Vec<Lit>,
         covered_payload: usize,
         is_fact: bool,
+        root_id: Option<u32>,
         out: &mut S,
     ) -> (bool, bool) {
         body.sort_unstable();
@@ -1827,6 +1976,9 @@ impl Store {
                     let s = &mut self.clauses[i as usize];
                     if !s.dead && s.c.body().is_empty() && s.c.head() == head.as_slice() {
                         s.fact = true;
+                        if root_id.is_some() {
+                            s.sent = root_id;
+                        }
                     }
                 }
             }
@@ -1859,6 +2011,9 @@ impl Store {
         }
         let c = Clause::from_sorted(body, head);
         let delta = self.add_unchecked(c, sig, unit_fact);
+        if unit_fact && let Some(s) = self.clauses.last_mut() {
+            s.sent = root_id;
+        }
         let committed_bound = covered_payload + extra_need;
         debug_assert!(committed_bound >= total_need);
         out.commit_dl(committed_bound, delta);
@@ -1875,19 +2030,22 @@ impl Store {
         head: Vec<Lit>,
         out: &mut S,
     ) -> bool {
-        self.add_parts_admitted_covered_with_fact(body, head, 0, false, out)
+        self.add_parts_admitted_covered_with_fact(body, head, 0, false, None, out)
             .0
     }
 
-    /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set.
+    /// [`Store::add_parts_admitted`], with exact root-unit provenance when `is_fact` is set
+    /// and the root's table id `root_id` of the unit when the run forwards root units, as
+    /// [`Store::add_parts_admitted_covered_with_fact`] describes.
     pub fn add_parts_admitted_with_fact<S: Sink>(
         &mut self,
         body: Vec<Lit>,
         head: Vec<Lit>,
         is_fact: bool,
+        root_id: Option<u32>,
         out: &mut S,
     ) -> bool {
-        self.add_parts_admitted_covered_with_fact(body, head, 0, is_fact, out)
+        self.add_parts_admitted_covered_with_fact(body, head, 0, is_fact, root_id, out)
             .0
     }
 

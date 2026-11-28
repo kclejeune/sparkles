@@ -530,6 +530,12 @@ impl QueryResult {
             .collect()
     }
 
+    /// Query-owned bytes still live, including any result rows decoded by this owner.
+    #[doc(hidden)]
+    pub fn live_memory_bytes(&self) -> u64 {
+        self.inner.ctx.live_bytes()
+    }
+
     pub fn variables(&self) -> &[String] {
         match &self.inner.variables {
             Some(ResultVariables::Eager(variables)) => &variables.names,
@@ -1133,6 +1139,15 @@ pub fn validation_query_context(
     data: &crate::validation::DataGraph,
     controls: QueryOptions,
 ) -> Result<Ctx> {
+    validation_query_context_with_parent(data, controls, None)
+}
+
+/// Prepare a validation query whose allocations also count against an enclosing operation.
+pub fn validation_query_context_with_parent(
+    data: &crate::validation::DataGraph,
+    controls: QueryOptions,
+    parent: Option<sparkles_budget::ParentHandle>,
+) -> Result<Ctx> {
     let opts = QueryOptions {
         deadline: controls.deadline,
         cancel: controls.cancel,
@@ -1143,7 +1158,10 @@ pub fn validation_query_context(
         work: controls.work,
         ..Default::default()
     };
-    let preparation = crate::access::Preparation::for_request(&opts)?;
+    let preparation = match parent {
+        Some(parent) => crate::access::Preparation::with_upstream(&opts, parent, None, false)?,
+        None => crate::access::Preparation::for_request(&opts)?,
+    };
     let view = crate::access::GraphAccess::all().masked_controlled(&data.snap, &preparation)?;
     let (mut ctx, access) = make_source_ctx_policy(view.read_source(), &opts, None)?;
     ctx.use_cache = false;
