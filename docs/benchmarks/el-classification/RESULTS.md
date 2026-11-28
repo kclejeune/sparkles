@@ -33,6 +33,81 @@ their conclusions. Total DL work increased by 7.2% and 17.5%. A maximum of two w
 three neighbours can introduce three alternative equalities into subsequent inferences.
 Item 1232 tracks the cost of repeated products.
 
+## Rooted equality pruning on ORE 2015 DL development files
+
+Boat worker `bx_z8s55a5v` ran the release example at `ac994f489` with Rust
+1.99.1 and Boxington 1.29.1. Each pair used the same ontology and the same
+524,288-conclusion cap, once with `SPARKLES_ROOTED_EQ_KNOWN=0` and once with
+`SPARKLES_ROOTED_EQ_KNOWN=1`. One-thread cautious runs used both the stock
+settings and shared facts with constant merging. The 12 historical bound
+cases also ran with shared facts and merging and four threads requested in
+eager mode. Item 1061 measures `ore_ont_14924` and `ore_ont_15803` separately.
+
+| Original input cohort | Files | Switch pairs | Pairs with identical taxonomies |
+|---|---:|---:|---:|
+| Historical bound cases | 12 | 36 | 36 |
+| Top-property cases | 6 | 12 | 12 |
+| Controls | 3 | 6 | 6 |
+
+The original historical bound cases and top-property files report zero DL
+work with either switch setting. The controls `ore_ont_3250` and
+`ore_ont_5857` run within the cap. The first is partial with 15 left-out
+axioms. Sharing and merging reduce its work from 6,006 to 2,104 conclusions.
+The second is complete at 510,083 conclusions with stock settings
+and 510,069 with sharing and merging, and its taxonomy agrees exactly with
+HermiT's. The equality switch changes neither control's work.
+The [F24 rationale](../../specs/F24-owl-classification/SPEC.md#equality-rewrites-to-known-query-atoms-item-1284)
+describes which products the cut can omit.
+
+The diagnostic build bypassed item 1286's two Horn-share routing decisions.
+The same build applied the data and anonymous-individual ablation to the
+top-property files. The diagnostic runs requested one cautious thread
+with and without shared facts and merging.
+
+| Cohort with the routing bypass | Files | Switch pairs | Work-bound pairs | DL memory pairs | Pairs with partial DL work |
+|---|---:|---:|---:|---:|---:|
+| Historical bound cases | 12 | 24 | 24 | 0 | 0 |
+| Top-property ablations | 6 | 12 | 9 | 2 | 1 |
+
+All 36 pairs give byte-identical taxonomies across the equality switch.
+The ablated `ore_ont_15516` is the only diagnostic file to finish within
+the bound. It derives 60,715 conclusions and leaves 17 axioms out with
+shared facts and merging, and its taxonomy agrees exactly with HermiT's.
+Without those switches it exhausts the bound and misses 7,008 reference
+edges.
+`ore_ont_15993` reaches the DL memory budget in both configurations.
+
+Four diagnostic files also ran with shared facts and merging at a cap of
+8,388,608 conclusions. Each pair produced the same taxonomy.
+
+| Original file | Equality cut off | Equality cut on |
+|---|---:|---:|
+| `ore_ont_10006` | 646,479 conclusions | 626,360 conclusions |
+| `ore_ont_16462` | 6,963,231 conclusions | 4,467,610 conclusions |
+| `ore_ont_12698` | Work bound | Work bound |
+| `ore_ont_9540` | DL memory budget | DL memory budget |
+
+Both wider-bound finishers agree exactly with HermiT and leave two axioms
+out. Each still needs more than 524,288 conclusions with the cut on.
+`ore_ont_12698` and `ore_ont_9540` miss 2,152 and 10 reference edges
+after fallback.
+
+The taxonomy check compares named signatures and mutual entailment of
+subclass and equivalence edges. HermiT 1.4.5.519 takes the original files for the
+original-input comparison and the exported filtered axioms for the
+ablation comparison.
+
+HermiT references are available for 15 of the 21 original files. Eight
+taxonomies match exactly, and seven leave out reference edges. Every
+available comparison has the same named signature and zero extra edges
+in both switch settings. The other six originals yield three HermiT
+timeouts, two heap failures and one refusal of SWRL built-in atoms.
+The ablated `ore_ont_9654` also times out in HermiT.
+
+The separate `ore_ont_7192` probe reaches a 120-second external deadline
+with either switch setting. It returns no taxonomy or internal-bound
+status.
+
 ## Agreement
 
 <a id="agreement"></a>

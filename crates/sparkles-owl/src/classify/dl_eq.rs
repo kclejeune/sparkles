@@ -29,7 +29,8 @@
 
 use super::dl_clause::{Lit, Lits, Made, RTerm, Rooted, XLit, admit_lit, rank, terms_of};
 use super::dl_rules::{
-    DlIx, Found, Side, dl, local, merge_parts, no_xy, side_exact_bytes, side_parts_bytes, unit,
+    DlIx, Found, Meter, Side, dl, local, merge_parts, no_xy, side_exact_bytes, side_parts_bytes,
+    unit,
 };
 use super::index::{BOTTOM, Ex, Index, Role, TOP};
 use super::saturate::{Guard, Sink, State};
@@ -376,12 +377,24 @@ impl Eqs<'_> {
                     let skip_known = guard.dl().skip_known_eq_atoms
                         && self.query.is_some()
                         && matches!((s1, t1), (RTerm::C(_), RTerm::X));
+                    // Known pairs do not reach literal admission, so poll their scan
+                    // even when it produces no conclusions.
+                    let scan = Meter::checks();
+                    if skip_known && guard.stopped() {
+                        return false;
+                    }
                     for &i in by.any.get(&s1).into_iter().flatten() {
+                        if skip_known && !scan.read(1, guard) {
+                            return false;
+                        }
                         let s = &d.store.clauses[i as usize];
                         if s.dead {
                             continue;
                         }
                         for &l2 in d.store.maxima(i) {
+                            if skip_known && !scan.read(1, guard) {
+                                return false;
+                            }
                             let v2 = self.view(&guard.dl().lits, l2);
                             if (skip_known && Self::known_atom_constant(st, v2) == Some(s1))
                                 || (v2 == v && side_eq(prem, s.c.body(), s.c.head(), Some(l2)))
@@ -457,6 +470,10 @@ impl Eqs<'_> {
         } else {
             None
         };
+        let scan = Meter::checks();
+        if known.is_some() && guard.stopped() {
+            return false;
+        }
         let (ts, n) = terms_of(v);
         let mut seen = [RTerm::X; 4];
         let mut seen_len = 0usize;
@@ -475,11 +492,17 @@ impl Eqs<'_> {
                 seen[seen_len] = s1;
                 seen_len += 1;
                 for &i in by.eqs.get(&s1).into_iter().flatten() {
+                    if known.is_some() && !scan.read(1, guard) {
+                        return false;
+                    }
                     let s = &d.store.clauses[i as usize];
                     if s.dead {
                         continue;
                     }
                     for &e in d.store.maxima(i) {
+                        if known.is_some() && !scan.read(1, guard) {
+                            return false;
+                        }
                         let ve = self.view(&guard.dl().lits, e);
                         let XLit::Eq(a, b) = ve else {
                             continue;
